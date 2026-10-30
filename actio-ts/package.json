@@ -1,0 +1,25 @@
+{
+  "name": "actio-ts",
+  "version": "0.1.0",
+  "description": "TypeScript implementation of the Actio protocol v0.1, core conformance profile",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "gen": "tsx scripts/gen-schemas.ts",
+    "typecheck": "npm run gen && tsc --noEmit",
+    "test": "npm run gen && node --import tsx --test \"test/**/*.test.ts\"",
+    "check": "npm run gen && tsc --noEmit && node --import tsx --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "ajv": "^8.17.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "json-schema-to-typescript": "^15.0.4",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
