@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "diarium.schema.json",
+  "title": "Actio diarium line (<agent folder>/diarium.jsonl)",
+  "description": "One JSON object per line. Implementations may define their own events; the events defined by the protocol have the event_data below.",
+  "type": "object",
+  "properties": {
+    "id": { "$ref": "common.schema.json#/$defs/agentId", "description": "ID of the agent that writes the diarium." },
+    "datetime": { "$ref": "common.schema.json#/$defs/datetime", "description": "Time of the event." },
+    "event": { "type": "string", "minLength": 1 },
+    "event_data": { "description": "Depends on the event; can be null." }
+  },
+  "required": ["id", "datetime", "event", "event_data"],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "event": { "const": "status" } } },
+      "then": { "properties": { "event_data": { "enum": ["inactive", "idle", "busy", "error"] } } }
+    },
+    {
+      "if": { "properties": { "event": { "const": "announce" } } },
+      "then": { "properties": { "event_data": { "const": null } } }
+    },
+    {
+      "if": { "properties": { "event": { "const": "inreq" } } },
+      "then": { "properties": { "event_data": { "type": "object", "$ref": "#/$defs/exchange", "properties": { "final_status": { "enum": ["cancelled", "completed", "confirmed", "dropped"] } } } } }
+    },
+    {
+      "if": { "properties": { "event": { "const": "outreq" } } },
+      "then": { "properties": { "event_data": { "type": "object", "$ref": "#/$defs/exchange", "properties": { "final_status": { "enum": ["confirmed", "cancelled", "abandoned", "sent"] } } } } }
+    },
+    {
+      "if": { "properties": { "event": { "const": "log" } } },
+      "then": { "properties": { "event_data": { "type": "string" } } }
+    }
+  ],
+  "$defs": {
+    "exchange": {
+      "description": "Final status and the four envelopes of an exchange, stored as exchanged (encrypted bodies stay encrypted); null when absent.",
+      "type": "object",
+      "properties": {
+        "final_status": { "type": "string" },
+        "req": { "anyOf": [{ "$ref": "request.schema.json" }, { "type": "null" }] },
+        "can": { "anyOf": [{ "$ref": "cancellation.schema.json" }, { "type": "null" }] },
+        "res": { "anyOf": [{ "$ref": "response.schema.json" }, { "type": "null" }] },
+        "con": { "anyOf": [{ "$ref": "confirmation.schema.json" }, { "type": "null" }] }
+      },
+      "required": ["final_status", "req", "can", "res", "con"],
+      "additionalProperties": false
+    }
+  }
+}

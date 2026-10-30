@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "common.schema.json",
+  "title": "Actio common definitions",
+  "description": "Shared definitions used by the other Actio schemas (protocol version 0.1).",
+  "$defs": {
+    "agentId": {
+      "description": "Agent ID: up to 32 characters, [a-zA-Z0-9_-].",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "pattern": "^[a-zA-Z0-9_-]+$"
+    },
+    "capabilityName": {
+      "description": "Capability ID, unique within an agent.",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-zA-Z0-9_-]+$"
+    },
+    "datetime": {
+      "description": "ISO 8601 date and time in UTC: YYYY-MM-DDThh:mm:ssZ.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "ts": {
+      "description": "Unix epoch time in seconds (UTC), 64-bit integer.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "duration": {
+      "description": "Duration in seconds.",
+      "type": "number",
+      "minimum": 0
+    },
+    "actioVersion": {
+      "description": "Version of the Actio protocol, \"<major>.<minor>\" (informative).",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "rid": {
+      "description": "Unique request ID: ULID in Crockford base32 (canonical upper-case form).",
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "nonce": {
+      "description": "128-bit random nonce as a hex string.",
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{32}$"
+    },
+    "signature": {
+      "description": "Base64 signature of the file by its writer; null when not needed (e.g. posture trusted).",
+      "type": ["string", "null"]
+    },
+    "base64": {
+      "description": "Base64 string; an encrypted body that decrypts to the JSON object of the body.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]*={0,2}$"
+    },
+    "attachments": {
+      "description": "Files/objects in the forum folder, as paths relative to forum. Can be empty, never null.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[^/]"
+      }
+    },
+    "header": {
+      "description": "Envelope header: the top-level fields of an envelope file (there is no nested \"header\" key), shared by all files of an exchange (only datetime changes). Applied to the whole file object. Public, never encrypted.",
+      "type": "object",
+      "properties": {
+        "rid": { "$ref": "#/$defs/rid" },
+        "src": { "$ref": "#/$defs/agentId" },
+        "dst": { "$ref": "#/$defs/agentId" },
+        "datetime": { "$ref": "#/$defs/datetime" },
+        "type": { "enum": ["cmd", "req"] },
+        "actio_version": { "$ref": "#/$defs/actioVersion" }
+      },
+      "required": ["rid", "src", "dst", "datetime", "type", "actio_version"]
+    },
+    "requestHeader": {
+      "description": "Header of the files that exist only for requests (cancellation, response, confirmation): type is always \"req\". Like header, it applies to the top-level fields of the whole file object; \"type\": \"object\" repeats the type of header because strict validators (Ajv strictTypes) do not infer it through $ref.",
+      "type": "object",
+      "allOf": [{ "$ref": "#/$defs/header" }],
+      "properties": { "type": { "const": "req" } }
+    }
+  }
+}
