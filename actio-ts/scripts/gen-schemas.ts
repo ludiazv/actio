@@ -149,7 +149,7 @@ function rewriteRefs(node: unknown, currentFile: string, where: string): void {
 // emitted: json-schema-to-typescript ignores if/then/else (known limit, §2.3).
 const targets: string[] = [
   "ActioMeta", "Spec", "Status", "Announce", "RequestFile", "CancellationFile", "ResponseFile",
-  "ConfirmationFile", "ErrorResult", "DiariumLine",
+  "ConfirmationFile", "ErrorResult", "DiariumLine", "Exchange",
   "RequestBody", "CancellationBody", "ResponseBody", "ConfirmationBody",
   "Capability", "CapabilityActio",
   "AgentId", "CapabilityName", "Datetime", "Ts", "Duration", "ActioVersion", "Rid", "Nonce",
