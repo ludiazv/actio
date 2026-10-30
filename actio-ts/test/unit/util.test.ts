@@ -33,11 +33,17 @@ test("ulid matches regex and encodes clock", () => {
 });
 
 test("ulid time part encodes injected clock value", () => {
-  const clock = fakeClock(Number(0x4123456789abn));
-  const id = ulid(clock);
-  // 0x4123456789ab is 47 bits; top 3 bits (47-45) are 010 = 2 => "2"
-  assert.equal(id[0], "2");
-  assert.match(id, /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+  const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  const decodeTime = (id: string): number => {
+    let ts = 0;
+    for (let i = 0; i < 10; i++) ts = ts * 32 + CROCKFORD.indexOf(id[i]);
+    return ts;
+  };
+  for (const ms of [0, 1, 1_700_000_000_000, 0x4123456789ab, 0xffffffffffff]) {
+    const id = ulid(fakeClock(ms));
+    assert.match(id, /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+    assert.equal(decodeTime(id), ms);
+  }
 });
 
 test("nonce is 32 lowercase hex chars", () => {
