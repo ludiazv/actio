@@ -9,7 +9,7 @@ import { test, type TestContext } from "node:test";
 import { append } from "../../src/diarium.js";
 import { Requestor, type RequestorHooks } from "../../src/requestor.js";
 import { sleep } from "../../src/util.js";
-import type { ActioConfig, AgentContext, DiariumLine } from "../../src/types.js";
+import type { ActioConfig, ActioEvent, AgentContext, DiariumLine } from "../../src/types.js";
 import { fakeClock, fastConfig, makeRoot, waitFor } from "../helpers/index.js";
 
 const NOP_SYNC = { fsync: false, delayMs: 0, notify(): void {}, flush: async () => {}, close: async () => {} };
@@ -27,10 +27,11 @@ interface Fixture {
   gammaInbox: string;
   watchErrors: Array<[string, Error]>;
   stateChanges: number[];
+  emitted: ActioEvent[];
 }
 
 /** Builds one agent's folders + context under `root`; `overrides` shrink the test timers. */
-async function makeAgent(t: TestContext, root: string, id: string, clock: () => number, overrides?: Partial<ActioConfig>): Promise<AgentContext> {
+async function makeAgent(t: TestContext, root: string, id: string, clock: () => number, overrides?: Partial<ActioConfig>, onEmit?: (e: ActioEvent) => void): Promise<AgentContext> {
   const cfg = fastConfig(root, clock, { cancelWaitTimeout: 200, ...overrides });
   const folders = {
     root,
@@ -50,7 +51,7 @@ async function makeAgent(t: TestContext, root: string, id: string, clock: () => 
       throw new Error("spec() is not used by the requestor tests");
     }) as AgentContext["spec"],
     state: () => "idle",
-    emit: () => undefined,
+    emit: (e) => onEmit?.(e),
     appendDiarium: (e) => append(folders.agent, e),
   };
   return ctx;
@@ -60,7 +61,8 @@ async function makeAgent(t: TestContext, root: string, id: string, clock: () => 
 async function makeFixture(t: TestContext): Promise<Fixture> {
   const root = await makeRoot(t);
   const clock = fakeClock();
-  const ctx = await makeAgent(t, root, "alpha", clock);
+  const emitted: ActioEvent[] = [];
+  const ctx = await makeAgent(t, root, "alpha", clock, undefined, (e) => emitted.push(e));
   await makeAgent(t, root, "beta", clock);
   await makeAgent(t, root, "gamma", clock);
   const watchErrors: Array<[string, Error]> = [];
@@ -82,23 +84,21 @@ async function makeFixture(t: TestContext): Promise<Fixture> {
     gammaInbox: path.join(root, "gamma", "inbox"),
     watchErrors,
     stateChanges,
+    emitted,
   };
 }
 
-/** The fake receiver: writes `<rid>.res.json` in `inbox` with a header matching the request. */
+/** The fake receiver: writes `<rid>.res.json` in `inbox` with the request header AS-IS (the real
+ * receiver copies the tracked header into the response, src/dst not swapped). */
 async function writeResponse(inbox: string, rid: string, body: Record<string, unknown>): Promise<void> {
   const reqFile = JSON.parse(await fsp.readFile(path.join(inbox, `${rid}.json`), "utf8"));
-  const res = {
-    rid: reqFile.rid,
-    src: reqFile.dst,
-    dst: reqFile.src,
-    datetime: "2026-10-24T10:01:10Z",
-    type: "req",
-    actio_version: "0.1",
-    response: body,
-  };
+  const { request: _request, ...reqHeader } = reqFile;
+  const res = { ...reqHeader, datetime: "2026-10-24T10:01:10Z", type: "req", response: body };
   await fsp.writeFile(path.join(inbox, `${rid}.res.json`), JSON.stringify(res));
 }
+
+/** A request file name (not a can/res/con envelope). */
+const isReqFile = (n: string): boolean => n.endsWith(".json") && !n.includes(".can.") && !n.includes(".res.") && !n.includes(".con.");
 
 const resBody = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
   ts: 1_792_836_070,
@@ -199,6 +199,66 @@ test("request: confirmed — response, confirmation, outreq matches the files, B
   assert.ok(fx.stateChanges.length >= 2, `onStateChange on 0<->nonzero transitions (got ${fx.stateChanges.length})`);
 });
 
+test("R1-1: two concurrent requests to the same dst, staggered responses, both confirmed", async (t) => {
+  const fx = await makeFixture(t);
+  const p1 = fx.requestor.request("beta", "summarize", { text: "a" }, {});
+  const p2 = fx.requestor.request("beta", "summarize", { text: "b" }, {});
+  await waitFor(async () => (await fsp.readdir(fx.betaInbox)).filter(isReqFile).length === 2, 2_000);
+  const rids = (await fsp.readdir(fx.betaInbox)).filter(isReqFile).map((n) => n.slice(0, -".json".length)).sort();
+  // the responses arrive at different times: the second only after the first completes
+  await writeResponse(fx.betaInbox, rids[0], resBody());
+  const o1 = await Promise.race([p1, p2]);
+  assert.equal(o1.finalStatus, "confirmed");
+  assert.equal(fx.requestor.outboundCount(), 1, "the second exchange is still in B2 — the watcher must stay open");
+  await writeResponse(fx.betaInbox, rids[1], resBody());
+  const [oa, ob] = await Promise.all([p1, p2]);
+  assert.equal(oa.finalStatus, "confirmed");
+  assert.equal(ob.finalStatus, "confirmed");
+  assert.equal(fx.requestor.outboundCount(), 0);
+});
+
+test("R1-1: the dst watcher is closed after the last exchange — deleting the folder fires no watch error", async (t) => {
+  const fx = await makeFixture(t);
+  const p = fx.requestor.request("beta", "summarize", { text: "a" }, {});
+  await waitFor(() => fsp.readdir(fx.betaInbox).then((n) => n.some(isReqFile)), 2_000);
+  const rid = await ridOf(fx.betaInbox);
+  await writeResponse(fx.betaInbox, rid, resBody());
+  assert.equal((await p).finalStatus, "confirmed");
+  // a still-open watcher would notice the deletion within milliseconds (the D-22 test proves it)
+  await sleep(200);
+  await fsp.rm(fx.betaInbox, { recursive: true });
+  await sleep(400);
+  assert.equal(fx.watchErrors.length, 0, "the watcher was released with the last exchange (D-18)");
+});
+
+test("R1-6: a response with a mismatched header is ignored and logged once (D-11); the exchange stays in B2", async (t) => {
+  const fx = await makeFixture(t);
+  const p = fx.requestor.request("beta", "summarize", { text: "a" }, {});
+  await waitFor(() => fsp.readdir(fx.betaInbox).then((n) => n.some(isReqFile)), 2_000);
+  const rid = await ridOf(fx.betaInbox);
+  // a schema-valid response whose header differs from the tracked request (src is not the requester)
+  const reqFile = JSON.parse(await fsp.readFile(path.join(fx.betaInbox, `${rid}.json`), "utf8"));
+  const { request: _request, ...reqHeader } = reqFile;
+  await fsp.writeFile(
+    path.join(fx.betaInbox, `${rid}.res.json`),
+    JSON.stringify({ ...reqHeader, src: "gamma", datetime: "2026-10-24T10:01:10Z", type: "req", response: resBody() }),
+  );
+  // the mismatch is logged once (deduplicated per (path, mtime)) — emit + diarium `log` line
+  await waitFor(async () => (await diariumLines(fx.diarium)).filter((l) => l.event === "log").length === 1, 2_000);
+  const logEmits = fx.emitted.filter((e) => e.event === "log" && e.message.includes("header mismatch (D-11)"));
+  assert.equal(logEmits.length, 1);
+  const logLine = (await diariumLines(fx.diarium)).find((l) => l.event === "log")!;
+  assert.match(logLine.event_data as unknown as string, /ignored .*header mismatch \(D-11\)/);
+  // the exchange stays in B2 (timers keep running) and is not resolved
+  assert.equal(fx.requestor.outboundCount(), 1);
+  // the correct response completes the exchange
+  await writeResponse(fx.betaInbox, rid, resBody());
+  assert.equal((await p).finalStatus, "confirmed");
+  // a second identical bad file (same path, new mtime) would log again; the same file does not
+  const logs = (await diariumLines(fx.diarium)).filter((l) => l.event === "log");
+  assert.equal(logs.length, 1);
+});
+
 test("request: cancelled before the response — timeout writes can, cancellation response, single res", async (t) => {
   const fx = await makeFixture(t);
   const p = fx.requestor.request("beta", "summarize", { text: "hello" }, { timeout: 0.15 });
@@ -279,7 +339,7 @@ test("request: D-13 — receiver archived before confirmation, no .con.json writ
   await fsp.rm(path.join(fx.betaInbox, `${rid}.json`));
   await fsp.writeFile(
     path.join(fx.betaInbox, `${rid}.res.json`),
-    JSON.stringify({ ...reqHeader, src: reqHeader.dst, dst: reqHeader.src, response: resBody() }),
+    JSON.stringify({ ...reqHeader, datetime: "2026-10-24T10:01:10Z", type: "req", response: resBody() }),
   );
   const outcome = await p;
   assert.equal(outcome.finalStatus, "confirmed");

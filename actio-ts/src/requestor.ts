@@ -1,11 +1,12 @@
 // Requestor (WP6): lane B — write request/command, watch the destination inbox (D-18),
 // cancellation (B4), confirmation (B3 with the D-13 guard), attachment cleanup (B5), abandon (D-6).
 import path from "node:path";
-import { outreqEvent } from "./diarium.js";
+import { stat } from "node:fs/promises";
+import { logEvent, outreqEvent } from "./diarium.js";
 import { copyFile, exists, readJson, remove, writeJsonAtomic } from "./io.js";
 import { nonce, toIso, ulid } from "./util.js";
 import { watchDir } from "./watch.js";
-import { validateCancellation, validateConfirmation, validateRequest, validateResponse } from "./validate.js";
+import { sameHeader, validateCancellation, validateConfirmation, validateRequest, validateResponse } from "./validate.js";
 import type {
   CancellationFile,
   ConfirmationFile,
@@ -55,6 +56,8 @@ interface DstWatcher {
 export class Requestor {
   private readonly exchanges = new Map<string, Outbound>();
   private readonly watchers = new Map<AgentId, DstWatcher>();
+  /** D-11 ignore dedup: one log per (path, mtime). */
+  private readonly ignoredSeen = new Set<string>();
 
   constructor(private readonly ctx: AgentContext, private readonly hooks: RequestorHooks) {}
 
@@ -179,16 +182,23 @@ export class Requestor {
     const ex = this.exchanges.get(rid);
     if (!ex || ex.done || ex.res !== null) return;
     void (async () => {
-      const file = await readJson(path.join(this.dstInbox(ex.dst), `${rid}.res.json`));
+      const full = path.join(this.dstInbox(ex.dst), `${rid}.res.json`);
+      const file = await readJson(full);
       if (typeof file !== "object" || file === null) return;
       const checked = validateResponse(file as ResponseFile);
       if (!checked.ok) return; // a broken peer file: stay in B2 until the give-up paths
+      if (!sameHeader(checked.value, ex.req)) {
+        // D-11: the header differs from the tracked request (except datetime): ignore + log once per (path, mtime)
+        await this.ignore(full, "header mismatch (D-11)");
+        return; // the exchange stays in B2 — its timers keep running
+      }
       if (ex.done || ex.res !== null) return;
       ex.res = checked.value;
       // an encrypted (base64) body cannot be presented as a ResponseBody; the envelope file stays in the inbox
       if (typeof checked.value.response !== "string") ex.responseBody = checked.value.response;
       this.clearTimers(ex);
-      this.releaseWatcher(ex.dst);
+      // capture does NOT release the dst watcher (D-18): it serves the other outstanding rids to the same dst.
+      // The release happens exactly once, in finish().
       void this.complete(ex, ex.cancelled ? "cancelled" : "confirmed");
     })();
   }
@@ -226,7 +236,7 @@ export class Requestor {
       }
       await this.deleteAttachments(ex); // B5
     } catch (err) {
-      console.error(`requestor: completion of ${ex.rid} failed:`, err);
+      this.ctx.emit({ event: "log", message: `requestor: completion of ${ex.rid} failed: ${err instanceof Error ? err.message : String(err)}` });
     } finally {
       this.finish(ex, finalStatus);
     }
@@ -241,10 +251,25 @@ export class Requestor {
       );
       await this.deleteAttachments(ex);
     } catch (err) {
-      console.error(`requestor: abandon of ${ex.rid} failed:`, err);
+      this.ctx.emit({ event: "log", message: `requestor: abandon of ${ex.rid} failed: ${err instanceof Error ? err.message : String(err)}` });
     } finally {
       this.finish(ex, "abandoned");
     }
+  }
+
+  /** D-11: `ignored <path>: <reason>` once per (path, mtime) — the receiver's `ignore()` pattern. */
+  private async ignore(full: string, reason: string): Promise<void> {
+    let key: string;
+    try {
+      key = `${full}:${(await stat(full)).mtimeMs}`;
+    } catch {
+      return; // vanished: nothing to ignore
+    }
+    if (this.ignoredSeen.has(key)) return;
+    this.ignoredSeen.add(key);
+    const message = `ignored ${full}: ${reason}`;
+    this.ctx.emit({ event: "log", message });
+    await this.ctx.appendDiarium(logEvent(this.ctx.id, this.ctx.now(), message));
   }
 
   /** B4: write `<rid>.can.json` (fresh datetime), then wait for the cancellation response up to
