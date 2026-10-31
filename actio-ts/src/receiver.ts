@@ -1,11 +1,13 @@
 // Receiver (WP5): lanes A (requests) and D (commands) — inbox dispatch, per-rid exchange
 // tracker, acceptance checks, work with AbortSignal, response, confirmation wait, archive.
-import type { AgentContext, CapabilityEntry, CommandHandler } from "./types.js";
+import type { AgentContext, AgentId, AgentView, CapabilityEntry, CommandHandler } from "./types.js";
 
 /** Lifecycle callbacks the receiver hands over to the ActioAgent (wired in WP7). */
 export interface ReceiverHooks {
   /** Watch error on the own inbox (D-22): the agent logs and fails itself. */
   onWatchError(dir: string, err: Error): void;
+  /** The Agmen view of a peer (D-7 code 106); undefined when the requestor is unknown. */
+  peerOf(src: AgentId): AgentView | undefined;
   /** A busy/idle-relevant exchange state changed (D-8). */
   onStateChange(): void;
   /** Built-in commands that change the lifecycle; the receiver archives first (D3). */

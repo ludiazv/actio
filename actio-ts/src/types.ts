@@ -1,4 +1,5 @@
 // Public API and internal types of actio-ts. Protocol shapes come from the generated types.
+import type { CompiledCapability } from "./validate.js";
 import type {
   AgentId,
   Capability,
@@ -155,9 +156,11 @@ export interface CommandContext {
 export type CapabilityHandler = (params: unknown, ctx: CapabilityContext) => Promise<unknown>;
 export type CommandHandler = (params: unknown, ctx: CommandContext) => Promise<void>;
 
-/** A registered capability plus its live state (receiver bookkeeping for `capability_status`). */
+/** A registered capability plus its live state (receiver bookkeeping for `capability_status`).
+ * `compiled` holds the D-19 validators the agent compiled at `capability()` registration. */
 export interface CapabilityEntry {
   capability: Capability;
+  compiled: CompiledCapability;
   handler: CapabilityHandler;
   running: number;
 }
