@@ -5,12 +5,14 @@
 // inreq/outreq final statuses, (d) attachments cleaned per the Envelope lifecycle.
 //
 // Notes on what the public API can express (documented in the report):
-// - 101/102/103/106 (E2 and the E3 sub-cases): the requestor's local callability gate
-//   (ActioAgent.request, rules 1/2/5.2) rejects with ActioCallError BEFORE anything is written, so
-//   the receiver-side 10x response is unreachable in e2e. The e2e assertion is the local rejection
-//   plus zero disk side effects; the responses themselves are unit-tested (receiver.test.ts).
-// - 100/105/107/108 produce real responses: 100 through a stale view (long nuntiumDebounce, the
-//   same trick as agent.test.ts), 108 through a request file written directly into beta's inbox.
+// - 101/102/103/106 (E2 and the E3 sub-cases) are REAL peer responses through the stale-view
+//   technique (the same one E3's 100 uses): alpha's nuntiumDebounce is 30 s, so its view stays
+//   stale while beta's state changes and its spec.json is republished; the request passes the
+//   local gate and beta's A0 answers the code. 101 uses a phantom capability that exists only in
+//   the spec file; 102/103 rewrite the live capability object (buildSpec carries it by reference);
+//   106 rewrites the live namespaces array in place, after a `restart` (D-10) established the view.
+// - 105/107/108 produce real responses: 108 through a request file written directly into
+//   beta's inbox.
 // - E7: the requestor cannot cancel after it captured a response (giveUp bails on ex.res !== null),
 //   so the e2e variant stops the requestor before the response is written; the receiver side is
 //   exactly A.4 (cancellation after the response, single response with cancellation=false).
@@ -24,11 +26,10 @@ import { test, type TestContext } from "node:test";
 import { ActioAgent } from "../../src/agent.js";
 import * as io from "../../src/io.js";
 import { nonce, toIso, ulid } from "../../src/util.js";
-import { ActioCallError } from "../../src/types.js";
 import { validateDiarium } from "../../src/validate.js";
 import { fastConfig, recordInbox, waitFor } from "../helpers/index.js";
 import type { ActioConfig, ActioEvent, AgentOptions, CapabilityHandler } from "../../src/types.js";
-import type { Capability, DiariumLine, Exchange, RequestFile, ResponseBody, Status } from "../../src/generated/types.js";
+import type { Capability, DiariumLine, Exchange, RequestFile, ResponseBody, Spec, Status } from "../../src/generated/types.js";
 
 /** A stuck exchange fails the test instead of hanging the suite. */
 const opts = { timeout: 30_000 };
@@ -53,7 +54,15 @@ const SLEEP: Capability = {
   },
 };
 
-/** Registered disabled from the start: E3's 102 sub-case (filtered out of the peer view, rule 5.2). */
+/** E2: a PHANTOM capability that exists only in beta's spec.json, never registered in memory. */
+const GHOST: Capability = {
+  name: "ghost",
+  description: "only in the spec file, never registered",
+  parameters: { type: "object", additionalProperties: false },
+  actio: { result: { type: "object", additionalProperties: false } },
+};
+
+/** Registered disabled from the start (fixture: rule 5.2 keeps it out of the peer views). */
 const OFF: Capability = {
   name: "off",
   description: "always disabled",
@@ -61,7 +70,7 @@ const OFF: Capability = {
   actio: { result: { ...OK_RESULT }, disabled: true },
 };
 
-/** Only gamma may call it: E3's 103 sub-case (filtered out of the peer view, rule 5.2). */
+/** Only gamma may call it (fixture: rule 5.2 keeps it out of the peer views). */
 const PRIVATE: Capability = {
   name: "private",
   description: "only gamma may call it",
@@ -194,6 +203,8 @@ const statusOf = (root: string, id: string): Promise<Status> =>
   fsp.readFile(path.join(root, id, "status.json"), "utf8").then((s) => JSON.parse(s) as Status);
 const specDisabled = (root: string, id: string): Promise<boolean | undefined> =>
   fsp.readFile(path.join(root, id, "spec.json"), "utf8").then((s) => (JSON.parse(s) as { disabled?: boolean }).disabled);
+const specOf = (root: string, id: string): Promise<Spec> =>
+  fsp.readFile(path.join(root, id, "spec.json"), "utf8").then((s) => JSON.parse(s) as Spec);
 
 const inboxNames = (root: string, id: string): Promise<string[]> => io.listDir(path.join(root, id, "inbox"));
 const forumNames = (root: string): Promise<string[]> => io.listDir(path.join(root, "forum"));
@@ -288,26 +299,58 @@ test("E1: a normal request — confirmed both sides, inbox order and empty after
   assert.deepEqual(await forumNames(h.root), []);
 });
 
-// --- E2 — unknown capability: the local gate rejects, nothing is written -------------------------
+// --- E2 — unknown capability (A.2): the peer's A0 answers 101 through a stale view --------------
 
-test("E2: an unknown capability is rejected locally (callability gate) and nothing is written", opts, async (t) => {
+test("E2: unknown capability — the peer's A0 answers 101, confirmed / confirmed", opts, async (t) => {
   const h = await harness(t);
-  const p = await pair(h);
+  const timers = { nuntiumDebounce: 30_000 };
+  const a = makeAgent(h, "alpha", { acceptsCommandsFrom: ["beta"] }, timers);
+  const b = makeAgent(h, "beta", { acceptsCommandsFrom: ["alpha"] }, timers);
+  b.agent.capability(ECHO, echoHandler);
+  await b.agent.start();
+  // Beta's spec.json is rewritten (a fresh `datetime`) with the PHANTOM capability `ghost`, which
+  // the agent never registered, and the announce file is touched: alpha's initial scan (below)
+  // sees `ghost` as usable, while beta's A0 has no such capability in memory. The 30 s
+  // nuntiumDebounce keeps alpha's view stale, so the request passes the local gate and A0 answers
+  // the real 101 (D-12: an error answer is the peer's protocol answer).
+  const spec = await specOf(h.root, "beta");
+  spec.capabilities.push(GHOST);
+  spec.datetime = toIso(Date.now());
+  await io.writeJsonAtomic(path.join(h.root, "beta", "spec.json"), spec, path.join(h.root, "beta"));
+  const nowMs = Date.now();
+  const announce = { id: "beta", datetime: toIso(nowMs), ts: Math.floor(nowMs / 1000), nuntium: "spec updated" };
+  await io.writeJsonAtomic(path.join(h.root, "nuntium", "beta.n.json"), announce, path.join(h.root, "beta"));
+  await a.agent.start();
+  await waitFor(() => a.agent.agmen().get("beta")?.capabilities.has("ghost") === true, 6_000);
   const rec = recordInbox(path.join(h.root, "beta", "inbox"));
-  await assert.rejects(
-    () => p.a.request("beta", "nope", {}),
-    (e: unknown) => e instanceof ActioCallError && /capability is not usable/.test(e.message),
-  );
+  const out = await a.agent.request("beta", "ghost", {});
+  assert.equal(out.finalStatus, "confirmed");
+  assert.ok(out.response !== undefined && out.response.error === true, "an error response");
+  const res = out.response.result as { code: number; msg: string };
+  assert.equal(res.code, 101, "unknown_capability");
+  assert.match(res.msg, /unknown_capability/);
+  // A4 completes when the inbox is empty (the inreq event is appended before the files are deleted)
+  await waitFor(() => inboxNames(h.root, "beta").then((n) => n.length === 0), 6_000);
   rec.stop();
-  // (a) the receiver inbox never saw a file
-  assert.deepEqual(rec.events(), []);
-  // (b) the inboxes are empty
+  // (a) the receiver inbox saw exactly req → res → con, in protocol order
+  const entries = [...byRid(rec).entries()];
+  assert.equal(entries.length, 1, "one exchange, one rid");
+  const [rid] = entries[0];
+  assert.equal(rid.length, 26, "one exchange, one rid");
+  assert.deepEqual(appearedSeq(rec, rid), ["req", "res", "con"]);
+  // (b) the inboxes are empty after the archive
   assert.deepEqual(await inboxNames(h.root, "beta"), []);
   assert.deepEqual(await inboxNames(h.root, "alpha"), []);
-  // (c) both diaria validate and carry no exchange lines
+  // (c) both diaria validate; `confirmed` / `confirmed` (A.2), and the archived res carries 101
   await assertDiariaValid(h.root, ["alpha", "beta"]);
-  assert.deepEqual(finalsOf(await diaries(h.root, "alpha"), "outreq"), []);
-  assert.deepEqual(finalsOf(await diaries(h.root, "beta"), "inreq"), []);
+  assert.deepEqual(finalsOf(await diaries(h.root, "alpha"), "outreq"), ["confirmed"]);
+  const bLines = await diaries(h.root, "beta");
+  assert.deepEqual(finalsOf(bLines, "inreq"), ["confirmed"]);
+  const inreq = bLines.find((l) => l.event === "inreq");
+  assert.ok(inreq !== undefined, "the 101 exchange was archived");
+  const body = resBody(exchangeOf(inreq));
+  assert.ok(body !== undefined && body.error === true, "the archived res is an error");
+  assert.equal((body!.result as { code: number }).code, 101);
   // (d) the forum is empty
   assert.deepEqual(await forumNames(h.root), []);
 });
@@ -319,9 +362,6 @@ test("E3: requests rejected 100, 102, 103, 105, 106, 107, 108 — matching code 
   // A long debounce keeps alpha's view of beta stale after `enable(false)`, so the 100 request
   // really reaches beta's A0 (the same trick as agent.test.ts).
   const p = await pair(h, { timers: { nuntiumDebounce: 30_000 } });
-  // 106 needs a requestor that shares no namespace with beta (distinct namespaces via AgentOptions).
-  const delta = makeAgent(h, "delta", { namespaces: ["blue"], acceptsCommandsFrom: [] }, { nuntiumDebounce: 30_000 });
-  await delta.agent.start();
   const rec = recordInbox(path.join(h.root, "beta", "inbox"));
 
   // 100 agent_disabled: beta is disabled via the `enable` command; alpha's stale view lets the
@@ -335,16 +375,85 @@ test("E3: requests rejected 100, 102, 103, 105, 106, 107, 108 — matching code 
   await p.a.command("beta", "enable", { enabled: true });
   await waitFor(() => specDisabled(h.root, "beta").then((d) => d === false), 6_000);
 
-  // 101 unknown capability / 102 disabled capability / 103 requestor not allowed: the requestor's
-  // local callability gate (rules 1/5.2) rejects before anything is written.
-  await assert.rejects(() => p.a.request("beta", "nope", {}), (e: unknown) => e instanceof ActioCallError);
-  await assert.rejects(() => p.a.request("beta", "off", {}), (e: unknown) => e instanceof ActioCallError);
-  await assert.rejects(() => p.a.request("beta", "private", {}), (e: unknown) => e instanceof ActioCallError);
-  // 106 namespace_mismatch: a requestor with a disjoint namespace never sees beta in its agmen.
-  await assert.rejects(
-    () => delta.agent.request("beta", "echo", { text: "x" }),
-    (e: unknown) => e instanceof ActioCallError && /peer is not callable/.test(e.message),
+  // 102 capability_disabled: beta flips the LIVE capability object — buildSpec carries the
+  // capability by reference into both the in-memory A0 entry and the published spec — and
+  // republishes via `ping`; alpha's 30 s debounce keeps its view stale (echo still usable), so
+  // the request passes the local gate and beta's A0 answers 102.
+  ECHO.actio.disabled = true;
+  await p.a.command("beta", "ping");
+  await waitFor(
+    () => specOf(h.root, "beta").then((s) => s.capabilities.find((c) => c.name === "echo")?.actio?.disabled === true),
+    6_000,
   );
+  const r102 = await p.a.request("beta", "echo", { text: "x" });
+  assert.equal(r102.finalStatus, "confirmed");
+  assert.ok(r102.response !== undefined && r102.response.error === true);
+  assert.equal((r102.response.result as { code: number }).code, 102, "capability_disabled");
+  ECHO.actio.disabled = false; // restore: the later sub-cases need a usable echo
+
+  // 103 requestor_not_allowed: the same stale-view technique on the live `accepts_from`.
+  ECHO.actio.accepts_from = ["gamma"];
+  await p.a.command("beta", "ping");
+  await waitFor(
+    () => specOf(h.root, "beta").then((s) => (s.capabilities.find((c) => c.name === "echo")?.actio?.accepts_from ?? []).includes("gamma")),
+    6_000,
+  );
+  const r103 = await p.a.request("beta", "echo", { text: "x" });
+  assert.equal(r103.finalStatus, "confirmed");
+  assert.ok(r103.response !== undefined && r103.response.error === true);
+  assert.equal((r103.response.result as { code: number }).code, 103, "requestor_not_allowed");
+  delete ECHO.actio.accepts_from; // restore
+
+  // 106 namespace_mismatch: its own root, both agents start with `namespaces: ["green"]`.
+  // buildSpec carries the options array by reference, so rewriting beta's array IN PLACE rewrites
+  // its in-memory spec (["blue"]) while alpha's stale view — and beta's own stale view of alpha —
+  // still say ["green"]; beta's A0 compares fresh self against stale peer → 106.
+  const h2 = await harness(t);
+  const timers6 = { nuntiumDebounce: 30_000 };
+  const alphaNs = ["green"];
+  const betaNs = ["green"];
+  const a6 = makeAgent(h2, "alpha", { acceptsCommandsFrom: ["beta"], namespaces: alphaNs }, timers6);
+  const b6 = makeAgent(h2, "beta", { acceptsCommandsFrom: ["alpha"], namespaces: betaNs }, timers6);
+  a6.agent.capability(ECHO, echoHandler);
+  b6.agent.capability(ECHO, echoHandler);
+  await a6.agent.start();
+  await b6.agent.start(); // beta's initial scan sees alpha: active, ["green"] (a parsed copy)
+  await waitFor(() => b6.agent.agmen().has("alpha"), 6_000);
+  // alpha's initial scan ran before beta existed; a `restart` (D-10) rescans at start and gives
+  // alpha its view of beta (["green"]) — the real lifecycle, not a test hack.
+  await b6.agent.command("alpha", "restart", {});
+  await waitFor(() => a6.agent.agmen().has("beta"), 6_000);
+  // Arm the recorder only now: the `restart` command envelope is transient in BETA's inbox and is
+  // archived and deleted (D3: the archive completes before the lifecycle hook) before the restart
+  // even begins, so it is already gone — and it is not part of the 106 exchange.
+  const rec6 = recordInbox(path.join(h2.root, "beta", "inbox"));
+  betaNs.splice(0, betaNs.length, "blue"); // in place: beta's currentSpec.namespaces is ["blue"]
+  await a6.agent.command("beta", "ping"); // beta republishes the spec (["blue"]) and re-announces
+  await waitFor(() => specOf(h2.root, "beta").then((s) => (s.namespaces ?? []).includes("blue")), 6_000);
+  const r106 = await a6.agent.request("beta", "echo", { text: "x" });
+  assert.equal(r106.finalStatus, "confirmed");
+  assert.ok(r106.response !== undefined && r106.response.error === true);
+  assert.equal((r106.response.result as { code: number }).code, 106, "namespace_mismatch");
+  await waitFor(() => inboxNames(h2.root, "beta").then((n) => n.length === 0), 6_000);
+  rec6.stop();
+  // (a) the 106 exchange: req → res → con; the only other rid is the transient `ping` command
+  // envelope (req only — commands are never answered, D3)
+  const e6 = [...byRid(rec6).entries()];
+  assert.equal(e6.length, 2, "the ping command and the 106 request");
+  const req6 = e6.filter(([, s]) => s.includes("res"));
+  assert.equal(req6.length, 1, "exactly one answered request");
+  assert.deepEqual(appearedSeq(rec6, req6[0][0]), ["req", "res", "con"]);
+  assert.deepEqual(appearedSeq(rec6, e6.find(([rid]) => rid !== req6[0][0])![0]), ["req"]);
+  // (b) the inboxes are empty
+  assert.deepEqual(await inboxNames(h2.root, "beta"), []);
+  assert.deepEqual(await inboxNames(h2.root, "alpha"), []);
+  // (c) both diaria validate. beta issued the restart command (`sent`; inreq `completed` on
+  // alpha's side); alpha issued the ping (`sent`) and the 106 request (`confirmed` on both sides).
+  await assertDiariaValid(h2.root, ["alpha", "beta"]);
+  assert.deepEqual(finalsOf(await diaries(h2.root, "alpha"), "inreq"), ["completed"]);
+  assert.deepEqual(finalsOf(await diaries(h2.root, "alpha"), "outreq").sort(), ["confirmed", "sent"]);
+  assert.deepEqual(finalsOf(await diaries(h2.root, "beta"), "inreq").sort(), ["completed", "confirmed"]);
+  assert.deepEqual(finalsOf(await diaries(h2.root, "beta"), "outreq"), ["sent"]);
 
   // 105 invalid_parameters: parameters violating the capability schema.
   const r105 = await p.a.request("beta", "strict", { n: 1 });
@@ -407,22 +516,35 @@ test("E3: requests rejected 100, 102, 103, 105, 106, 107, 108 — matching code 
     return (body.result as { code: number }).code;
   };
   const seqs = byRid(rec);
-  assert.equal(seqs.size, 7, "two commands, four answered requests, one 108 request");
+  assert.equal(seqs.size, 11, "four commands, six answered requests, one 108 request");
   for (const [rid] of seqs) {
     const appearances = appearedSeq(rec, rid);
     const expected = rid === rid108 ? ["req", "res"] : appearances.includes("con") ? ["req", "res", "con"] : ["req"];
     assert.deepEqual(appearances, expected, `rid ${rid}: ${appearances.join(">")}`);
   }
-  // the 108 rid really carries code 108, and the commands' rids are the two `enable`s
+  // the 108 rid really carries code 108, and the commands' rids are the two `enable`s and two `ping`s
   assert.equal(codeOf(rid108), 108);
 
-  // (c) both (three) diaria validate; the final statuses:
-  // beta inreq: the two commands `completed`, 100/105/107×2 `confirmed`, 108 `completed` (no con)
-  // alpha outreq: the two commands `sent`, four `confirmed`
-  await assertDiariaValid(h.root, ["alpha", "beta", "delta"]);
-  assert.deepEqual(finalsOf(bLines, "inreq").sort(), ["completed", "completed", "completed", "confirmed", "confirmed", "confirmed", "confirmed"]);
-  assert.deepEqual(finalsOf(await diaries(h.root, "alpha"), "outreq").sort(), ["confirmed", "confirmed", "confirmed", "confirmed", "sent", "sent"]);
-  assert.deepEqual(finalsOf(await diaries(h.root, "delta"), "outreq"), []);
+  // (c) both diaria validate; the final statuses:
+  // beta inreq: four commands `completed`, 100/102/103/105/107×2 `confirmed`, 108 `completed` (no con)
+  // alpha outreq: four commands `sent`, six `confirmed`
+  await assertDiariaValid(h.root, ["alpha", "beta"]);
+  assert.deepEqual(
+    finalsOf(bLines, "inreq").sort(),
+    ["completed", "completed", "completed", "completed", "completed", "confirmed", "confirmed", "confirmed", "confirmed", "confirmed", "confirmed"],
+  );
+  assert.deepEqual(
+    finalsOf(await diaries(h.root, "alpha"), "outreq").sort(),
+    ["confirmed", "confirmed", "confirmed", "confirmed", "confirmed", "confirmed", "sent", "sent", "sent", "sent"],
+  );
+  // every archived error response carries its code, and the multiset is exactly the six rejection codes
+  const codes = bLines
+    .filter((l) => l.event === "inreq")
+    .map((l) => resBody(exchangeOf(l)))
+    .filter((b): b is ResponseBody => b !== undefined && b.error === true)
+    .map((b) => (b.result as { code: number }).code)
+    .sort((x, y) => x - y);
+  assert.deepEqual(codes, [100, 102, 103, 105, 107, 108]);
 
   // (d) no attachments in any of these scenarios: the forum is empty
   assert.deepEqual(await forumNames(h.root), []);
