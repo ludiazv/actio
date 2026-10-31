@@ -79,21 +79,29 @@ export class ActioAgent {
   private enabledState: boolean | undefined;
   private running = false; // between `start()` and `stop()`
   private stopping = false;
+  /** R3-3: the namespaces we own: the caller's array is cloned at construction, so a later
+   * mutation of it cannot change what a rebuild (ping, enable) publishes. */
+  private readonly namespaces: (string | null)[] | null | undefined;
 
-  constructor(private readonly options: AgentOptions) {}
+  constructor(private readonly options: AgentOptions) {
+    this.namespaces = options.namespaces === undefined ? undefined : structuredClone(options.namespaces);
+  }
 
-  /** Registers a capability and its handler; throws on a duplicate name or a non-strict schema (D-19). */
+  /** Registers a capability and its handler; throws on a duplicate name or a non-strict schema (D-19).
+   * R3-3: the stored capability is a deep copy, so a caller mutating its object after registration
+   * cannot change a running agent's A0 decisions or its next published spec. */
   capability(capability: Capability, handler: CapabilityHandler): void {
     if (this.capabilities.has(capability.name)) {
       throw new Error(`agent: capability "${capability.name}" is already registered`);
     }
+    const copy = structuredClone(capability); // R3-3: own the registration, not the caller's object
     let compiled: CompiledCapability;
     try {
-      compiled = compileCapability(capability); // own side of D-19: a schema strict mode rejects is a bug
+      compiled = compileCapability(copy); // own side of D-19: a schema strict mode rejects is a bug
     } catch (err) {
       throw new Error(`agent: capability "${capability.name}" has a schema strict mode rejects: ${why(err)}`);
     }
-    this.capabilities.set(capability.name, { capability, compiled, handler, running: 0 });
+    this.capabilities.set(capability.name, { capability: copy, compiled, handler, running: 0 });
   }
 
   /** Registers a custom command handler; stop/enable/restart/ping are built in. */
@@ -382,7 +390,11 @@ export class ActioAgent {
 
   /** spec.json from the options and the registered capabilities, with a fresh `datetime` (I-2 self-validated). */
   private buildSpecNow(): void {
-    this.currentSpec = buildSpec(this.options, this.capabilityList(), this.now());
+    this.currentSpec = buildSpec(
+      { ...this.options, namespaces: this.namespaces }, // R3-3: our copy, not the caller's array
+      this.capabilityList(),
+      this.now(),
+    );
     // R2-1: the enabled state is agent state, not option state, so EVERY rebuild during a run (the `ping`
     // command above all) keeps it. `buildSpec` never writes `disabled` (WP7-B-1); this is the only writer.
     if (this.enabledState !== undefined) this.currentSpec.disabled = this.enabledState;

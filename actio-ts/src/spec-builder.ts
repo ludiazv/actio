@@ -34,7 +34,9 @@ export function buildSpec(options: AgentOptions, capabilities: Capability[], now
 
   // Optional fields appear only when given: absent, null and [] are three legal ways to say "the null
   // namespace" (*Namespaces*), so the builder must not invent a value the operator did not write.
-  if (options.namespaces !== undefined) spec.namespaces = options.namespaces;
+  // R3-3: `namespaces` is copied the way `depends`/`wants` already are — a later change to the
+  // options cannot alter what we publish.
+  if (options.namespaces !== undefined) spec.namespaces = structuredClone(options.namespaces);
   if (options.depends !== undefined) spec.depends = [...options.depends];
   if (options.wants !== undefined) spec.wants = [...options.wants];
   // `info` is free content: the schema only requires an object (the self-validation below rejects the

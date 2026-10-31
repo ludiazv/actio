@@ -498,6 +498,45 @@ test("a duplicate capability, a shadowed built-in command, and a non-strict sche
   assert.throws(() => a.onCommand("x", async () => undefined), /command "x" is already registered/);
 });
 
+test("R3-3: the library copies caller objects — a later mutation changes neither the spec nor A0", opts, async (t) => {
+  const h = await harness(t);
+  // Caller-owned objects: the capability and the options' namespaces array.
+  const cap: Capability = structuredClone(ECHO);
+  const ns = ["green"];
+  const { agent: a } = agent(h, "alpha", { acceptsCommandsFrom: ["beta"], namespaces: ns });
+  const { agent: b } = agent(h, "beta", { acceptsCommandsFrom: ["alpha"], namespaces: ["green"] });
+  a.capability(cap, echoHandler);
+  b.capability(ECHO, echoHandler);
+  await a.start();
+  await b.start();
+  await waitFor(() => b.agmen().has("alpha"), 6_000);
+  // The published spec carries the original values.
+  const specBefore = await specOf(h.root, "alpha");
+  assert.deepEqual(specBefore.namespaces, ["green"]);
+  assert.equal(specBefore.capabilities.find((c) => c.name === "echo")?.actio?.disabled, undefined);
+  // The caller mutates its own objects after capability()/start(): with R3-3 neither the agent's
+  // registration nor its options are aliased, so the mutation must reach nowhere.
+  cap.actio!.disabled = true;
+  ns.push("blue");
+  // A `ping` (a real protocol action) rebuilds and republishes alpha's spec from its own state.
+  // The spec's `datetime` has second resolution, so the sync point is the command's archive
+  // (D3 runs after D2's republish).
+  await b.command("alpha", "ping");
+  await waitFor(async () => finalsOf(await diaryOf(h.root, "alpha"), "inreq").length === 1, 6_000);
+  const specAfter = await specOf(h.root, "alpha");
+  assert.deepEqual(specAfter.namespaces, ["green"], "the published spec ignores the caller's mutation");
+  assert.equal(
+    specAfter.capabilities.find((c) => c.name === "echo")?.actio?.disabled,
+    undefined,
+    "the registered (cloned) capability is untouched",
+  );
+  // A0's decisions are unchanged too: alpha's echo is still accepted (not 102) and answers per the
+  // original schema.
+  const out = await b.request("alpha", "echo", { text: "x" });
+  assert.equal(out.finalStatus, "confirmed");
+  assert.deepEqual(out.response?.result, { text: "echo: x" });
+});
+
 test("start() twice throws; a bad sync value fails at start() and leaves nothing armed", opts, async (t) => {
   const h = await harness(t);
   const { agent: a } = agent(h, "alpha");

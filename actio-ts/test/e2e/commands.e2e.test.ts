@@ -15,11 +15,10 @@
 //   (R1-2: the archive completes before C1), so the res file's lifetime is milliseconds; (a)
 //   asserts the req → res appearances, and the 300 body is asserted from the archived envelope
 //   (the diarium) as well as from alpha's captured outcome.
-// - E12's "status inactive" is asserted from the DIARIUM `status` event and the announce file,
-//   not from the final status.json content: a syncBusy() triggered by the archive's state change
-//   (inside receiver.stop(), while the agent state is still `busy`) races C1's setStatus("inactive")
-//   and can leave status.json as `idle` after the stop (bug reported in the task report, open
-//   point). The C1 diarium event and the announce file are written deterministically.
+// - E12's "status inactive" is asserted from the DIARIUM `status` event, the announce file AND the
+//   final status.json content. The syncBusy/C1 race that used to leave status.json `idle` after the
+//   stop is fixed (f2eb08d), and the R3 probes (oracle/R3-probes.test.ts: 10/10 stops with a request
+//   in flight, 40/40 forced stops racing a 1 ms heartbeat) confirm it is gone.
 import assert from "node:assert/strict";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -367,7 +366,6 @@ test("E12: stop with a request in flight — error 300, inreq archived before C1
   // alpha commands the stop: D3 archives the command FIRST, then C1 (lane C) runs.
   const ridStop = await p.a.command("beta", "stop", {});
   // C1: the `status inactive` diarium event FIRST, then (rule 2) the announce file with a delay.
-  // (The final status.json content is not asserted: see the file header — the syncBusy/C1 race.)
   await waitFor(
     async () => (await diaries(h.root, "beta")).some((l) => l.event === "status" && String(l.event_data) === "inactive"),
     8_000,
@@ -376,6 +374,9 @@ test("E12: stop with a request in flight — error 300, inreq archived before C1
     () => announceOf(h.root, "beta").then((a) => a.nuntium === "agent beta is inactive"),
     8_000,
   );
+  // The final status.json content: `inactive` (§7 E12). The syncBusy/C1 race that used to leave it
+  // `idle` is gone (f2eb08d; the R3 probes in the file header).
+  assert.equal((await statusOf(h.root, "beta")).status, "inactive");
   // alpha's in-flight request resolves with the code-300 error outcome (B2 captured the 300 res).
   const out = await outP;
   assert.equal(out.finalStatus, "confirmed", "an error response is also confirmed (the error is in res)");
