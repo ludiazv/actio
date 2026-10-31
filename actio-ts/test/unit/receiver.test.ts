@@ -1,11 +1,13 @@
-// Tests of the receiver lane A (WP5-A-1): dispatch, acceptance (A0), work (A1/A3),
-// response + confirmation wait (A2), archive (A4), and the D-4/D-5/D-11/D-14/D-15 rules.
+// Tests of the receiver (WP5): lane A (dispatch, acceptance (A0), work (A1/A3), response +
+// confirmation wait (A2), archive (A4), the D-4/D-5/D-11/D-14/D-15 rules) and lane D (command
+// dispatch: D0–D4, the built-in commands and the archive around the agent lifecycle hooks).
 import assert from "node:assert/strict";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
 import * as diarium from "../../src/diarium.js";
 import { Receiver } from "../../src/receiver.js";
+import type { ReceiverHooks } from "../../src/receiver.js";
 import * as io from "../../src/io.js";
 import type {
   ActioEvent,
@@ -14,6 +16,8 @@ import type {
   CapabilityContext,
   CapabilityEntry,
   CapabilityHandler,
+  CommandContext,
+  CommandHandler,
 } from "../../src/types.js";
 import type {
   CancellationFile,
@@ -144,10 +148,13 @@ interface Env {
   agent: string;
   inbox: string;
   forum: string;
+  nuntium: string;
   ctx: AgentContext;
   receiver: Receiver;
   events: ActioEvent[];
   diariumLines: DiariumLine[];
+  /** The built-in command hooks that fired, in the order they fired (replaced per test). */
+  commandCalls: string[];
   stateChanges: number[];
   watchErrors: { dir: string; err: Error }[];
   peers: Map<string, AgentView>;
@@ -157,17 +164,29 @@ interface Env {
 
 async function makeEnv(
   t: TestContext,
-  opts: { spec?: Spec; confirmTimeout?: number; entries?: CapabilityEntry[] } = {},
+  opts: {
+    spec?: Spec;
+    /** The spec `D0` reads on every command: a test can change it between commands (`enable`). */
+    specOf?: () => Spec;
+    confirmTimeout?: number;
+    entries?: CapabilityEntry[];
+    /** Lane D: the custom commands of this agent (name → handler). */
+    commands?: Record<string, CommandHandler>;
+    /** Replace some built-in command hook; the default one records the call in `commandCalls`. */
+    hooks?: Partial<ReceiverHooks>;
+  } = {},
 ): Promise<Env> {
   const root = await makeRoot(t);
   const agent = path.join(root, "alpha");
   const inbox = path.join(agent, "inbox");
   const forum = path.join(root, "forum");
+  const nuntium = path.join(root, "nuntium");
   for (const dir of [inbox, forum]) await fsp.mkdir(dir, { recursive: true });
   const clock = fakeClock(T0);
-  const spec = opts.spec ?? makeSpec();
+  const specValue = opts.spec ?? makeSpec();
   const events: ActioEvent[] = [];
   const diariumLines: DiariumLine[] = [];
+  const commandCalls: string[] = [];
   const stateChanges: number[] = [];
   const watchErrors: { dir: string; err: Error }[] = [];
   const peers = new Map<string, AgentView>();
@@ -185,10 +204,10 @@ async function makeEnv(
       clock,
     },
     id: "alpha",
-    folders: { root, agent, inbox, forum, nuntium: path.join(root, "nuntium") },
+    folders: { root, agent, inbox, forum, nuntium },
     sync: { fsync: false, delayMs: 0, notify(): void {}, flush: () => Promise.resolve(), close: () => Promise.resolve() },
     now: () => clock(),
-    spec: () => spec,
+    spec: opts.specOf ?? (() => specValue),
     state: () => "idle",
     emit: (event) => events.push(event),
     appendDiarium: async (line) => {
@@ -202,16 +221,41 @@ async function makeEnv(
       onWatchError: (dir, err) => watchErrors.push({ dir, err }),
       peerOf: (src) => peers.get(src),
       onStateChange: () => stateChanges.push(stateChanges.length + 1),
-      onCommandStop: async () => assert.fail("commands are round B"),
-      onCommandRestart: async () => assert.fail("commands are round B"),
-      onCommandEnable: async () => assert.fail("commands are round B"),
-      onCommandPing: async () => assert.fail("commands are round B"),
+      onCommandStop: async (force) => {
+        commandCalls.push(`stop(force=${force})`);
+      },
+      onCommandRestart: async (force, delaySeconds) => {
+        commandCalls.push(`restart(force=${force},delay=${delaySeconds})`);
+      },
+      onCommandEnable: async (enabled) => {
+        commandCalls.push(`enable(${enabled})`);
+      },
+      onCommandPing: async () => {
+        commandCalls.push("ping");
+      },
+      ...opts.hooks,
     },
     new Map((opts.entries ?? []).map((e) => [e.capability.name, e])),
-    new Map(),
+    new Map(Object.entries(opts.commands ?? {})),
   );
   t.after(() => receiver.stop());
-  return { root, agent, inbox, forum, ctx, receiver, events, diariumLines, stateChanges, watchErrors, peers, fileEvents, clock };
+  return {
+    root,
+    agent,
+    inbox,
+    forum,
+    nuntium,
+    ctx,
+    receiver,
+    events,
+    diariumLines,
+    commandCalls,
+    stateChanges,
+    watchErrors,
+    peers,
+    fileEvents,
+    clock,
+  };
 }
 
 /** The `inreq` events of the diarium, with their exchange data. */
@@ -223,6 +267,34 @@ function inreqs(env: Env): { final_status: string; req: RequestFile | null; can:
 
 const logLines = (env: Env): string[] =>
   env.diariumLines.filter((l) => l.event === "log").map((l) => l.event_data as unknown as string);
+
+/** A schema-valid rid whose trailing letters fix the lexical order (the scan processes rids sorted). */
+const ridWith = (letter: string): string => `01${letter.repeat(24)}`;
+
+/** The final status of every archived exchange, by rid. */
+const statusByRid = (env: Env): Map<string, string> =>
+  new Map(inreqs(env).map((d) => [d.req!.rid, d.final_status]));
+
+/** The three files that tell peers what the agent is; lane D must not touch them on its own (D4). */
+async function writePublications(env: Env): Promise<void> {
+  await writeJson(env.agent, "spec.json", makeSpec({ accepts_commands_from: ["beta"] }));
+  await writeJson(env.agent, "status.json", { id: "alpha", status: "idle", datetime: ISO0, capability_status: [] });
+  await io.makeDir(env.nuntium);
+  await writeJson(env.nuntium, "alpha.n.json", { id: "alpha", status: "idle", datetime: ISO0, text: "before" });
+}
+
+/** A comparable snapshot of those files (`<absent>` when one is missing). */
+async function publicationState(env: Env): Promise<string[]> {
+  const names = [
+    path.join(env.agent, "spec.json"),
+    path.join(env.agent, "status.json"),
+    path.join(env.nuntium, "alpha.n.json"),
+  ];
+  return Promise.all(names.map((n) => fsp.readFile(n, "utf8").catch(() => "<absent>")));
+}
+
+const publishedFile = (env: Env, name: string): Promise<string> =>
+  fsp.readFile(path.join(env.agent, name), "utf8").catch(() => "<absent>");
 
 // --- Envelope lifecycle, final-status table (receiver side) ---
 
@@ -618,24 +690,382 @@ test("stop(): an accepted, unanswered request gets an error response with code 3
   assert.ok((await inboxNames(env.inbox)).includes(`${rid}.json`));
 });
 
-test("a validated command file is left in place untouched (round B scope)", async (t) => {
-  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
-  await env.receiver.start(() => {});
-  const rid = ulid();
-  const cmd = makeRequest(rid, { type: "cmd", name: "ping", parameters: null });
-  await writeJson(env.inbox, `${rid}.json`, cmd);
-  await env.receiver.processFile(`${rid}.json`);
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal(env.receiver.runningCount(), 0, "no state change");
-  assert.equal(await readRes(env.inbox, rid), undefined, "commands generate no response");
-  assert.equal(inreqs(env).length, 0, "no archive");
-  assert.ok((await inboxNames(env.inbox)).includes(`${rid}.json`), "left in place for round B");
-});
-
 test("a watch error on the own inbox reaches onWatchError (D-22)", async (t) => {
   const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
   await env.receiver.start(() => {});
   await fsp.rm(env.inbox, { recursive: true, force: true });
   await waitFor(() => env.watchErrors.length >= 1, 5_000);
   assert.equal(env.watchErrors[0].dir, env.inbox);
+});
+// --- Lane D: the command rows of the *Envelope lifecycle* table (*Workflow* D0–D4) ---
+
+test("D1 a custom command is executed with its parameters and {rid, src}, then archived as `completed`", async (t) => {
+  let env!: Env;
+  const seen: { params: unknown; ctx: CommandContext; running: number }[] = [];
+  env = await makeEnv(t, {
+    spec: makeSpec({ accepts_commands_from: ["beta"] }),
+    commands: {
+      translate: async (params, ctx) => {
+        seen.push({ params, ctx, running: env.receiver.runningCount() });
+      },
+    },
+  });
+  await writePublications(env);
+  const before = await publicationState(env);
+  await env.receiver.start(() => {});
+  const rid = ridWith("A");
+  const cmd = makeRequest(rid, { type: "cmd", name: "translate", parameters: { text: "hola" } });
+  await writeJson(env.inbox, `${rid}.json`, cmd);
+  await waitFor(() => inreqs(env).length === 1, 3_000);
+  assert.deepEqual(seen, [{ params: { text: "hola" }, ctx: { rid, src: "beta" }, running: 0 }]);
+  assert.deepEqual(env.commandCalls, [], "no built-in hook is involved");
+  const [data] = inreqs(env);
+  assert.equal(data!.final_status, "completed");
+  assert.deepEqual(data!.req, cmd, "the command envelope is archived as exchanged");
+  assert.equal(data!.can, null, "a command is never cancelled");
+  assert.equal(data!.res, null, "a command is never answered");
+  assert.equal(data!.con, null);
+  assert.deepEqual(await io.listDir(env.inbox), [], "D3 deletes the envelope");
+  assert.equal(await readRes(env.inbox, rid), undefined, "no response file for type=\"cmd\"");
+  assert.ok(env.events.some((e) => e.event === "inreq" && e.rid === rid && e.finalStatus === "completed"));
+  assert.equal(env.stateChanges.length, 0, "a command is not an A1/A2/A3 exchange: busy is unaffected (D-8)");
+  assert.deepEqual(
+    await publicationState(env),
+    before,
+    "the receiver publishes no spec/status/announce of its own (D2 is the agent's)",
+  );
+});
+
+test("stop() leaves a queued command in the inbox: it waits for the next start (D-4)", async (t) => {
+  let env!: Env;
+  const gate = deferred();
+  let started = false;
+  let secondRan = false;
+  env = await makeEnv(t, {
+    spec: makeSpec({ accepts_commands_from: ["beta"] }),
+    commands: {
+      first: async () => {
+        started = true;
+        await gate.promise; // holds the lane D drain
+      },
+      second: async () => {
+        secondRan = true;
+      },
+    },
+  });
+  await env.receiver.start(() => {});
+  const first = ridWith("A");
+  const second = ridWith("B");
+  await writeJson(env.inbox, `${first}.json`, makeRequest(first, { type: "cmd", name: "first" }));
+  await writeJson(env.inbox, `${second}.json`, makeRequest(second, { type: "cmd", name: "second" }));
+  await waitFor(() => started, 3_000);
+  await env.receiver.stop();
+  gate.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(secondRan, false, "the queued command never runs after stop()");
+  assert.deepEqual(await io.listDir(env.inbox), [`${second}.json`], "its envelope stays for the next start");
+  assert.deepEqual(inreqs(env).map((d) => d.req!.rid), [first], "only the executed command is archived");
+});
+
+test("D4 a command with an unknown name is dropped: diarium and deletion, nothing else", async (t) => {
+  const env = await makeEnv(t, { spec: makeSpec({ accepts_commands_from: ["beta"] }) });
+  await writePublications(env);
+  const before = await publicationState(env);
+  await env.receiver.start(() => {});
+  const rid = ridWith("A");
+  const cmd = makeRequest(rid, { type: "cmd", name: "reboot_router", parameters: null });
+  await writeJson(env.inbox, `${rid}.json`, cmd);
+  await waitFor(() => inreqs(env).length === 1, 3_000);
+  const [data] = inreqs(env);
+  assert.equal(data!.final_status, "dropped");
+  assert.deepEqual(data!.req, cmd);
+  assert.equal(data!.can, null);
+  assert.equal(data!.res, null);
+  assert.equal(data!.con, null);
+  assert.deepEqual(await io.listDir(env.inbox), [], "the envelope is deleted");
+  assert.equal(await readRes(env.inbox, rid), undefined, "never answered: a dropped command is silent");
+  assert.deepEqual(env.commandCalls, [], "nothing is executed");
+  assert.deepEqual(logLines(env), [], "the diarium holds the inreq event only");
+  assert.deepEqual(await publicationState(env), before, "status.json, spec.json and the announce file untouched");
+  assert.ok(env.events.some((e) => e.event === "log" && /dropped command/.test(e.message)));
+  assert.ok(env.events.some((e) => e.event === "inreq" && e.rid === rid && e.finalStatus === "dropped"));
+});
+
+test("D4 `stop` from a src nobody may command is dropped: the hook never fires", async (t) => {
+  const env = await makeEnv(t, { spec: makeSpec({ accepts_commands_from: [] }) });
+  await writePublications(env);
+  const before = await publicationState(env);
+  await env.receiver.start(() => {});
+  const rid = ridWith("A");
+  const cmd = makeRequest(rid, { type: "cmd", name: "stop", parameters: { force: true } });
+  await writeJson(env.inbox, `${rid}.json`, cmd);
+  await waitFor(() => inreqs(env).length === 1, 3_000);
+  assert.equal(statusByRid(env).get(rid), "dropped");
+  assert.deepEqual(env.commandCalls, [], "the agent is never told to stop");
+  assert.deepEqual(await publicationState(env), before);
+  assert.ok(env.events.some((e) => e.event === "log" && /not in accepts_commands_from/.test(e.message)));
+});
+
+test("D0 the src must be listed exactly: an empty list means nobody, a prefix does not count", async (t) => {
+  const commandedBy: string[] = [];
+  const env = await makeEnv(t, {
+    spec: makeSpec({ accepts_commands_from: ["gamma"] }),
+    commands: { work: async (_params, ctx) => { commandedBy.push(ctx.src); } },
+  });
+  await env.receiver.start(() => {});
+  const rows: { rid: string; src: string; accepted: boolean }[] = [
+    { rid: ridWith("A"), src: "beta", accepted: false }, // not listed
+    { rid: ridWith("B"), src: "gamma", accepted: true }, // listed
+    { rid: ridWith("C"), src: "gamma2", accepted: false }, // a longer id that starts with the listed one
+    { rid: ridWith("D"), src: "gam", accepted: false }, // a prefix of the listed id
+    { rid: ridWith("E"), src: "alpha", accepted: false }, // ourselves: only a listed src may command
+  ];
+  for (const row of rows) {
+    await writeJson(env.inbox, `${row.rid}.json`, makeRequest(row.rid, { type: "cmd", name: "work", src: row.src }));
+  }
+  await waitFor(() => inreqs(env).length === rows.length, 3_000);
+  assert.deepEqual(commandedBy, ["gamma"]);
+  const status = statusByRid(env);
+  for (const row of rows) assert.equal(status.get(row.rid), row.accepted ? "completed" : "dropped", `src ${row.src}`);
+});
+
+test("D0 reads the spec afresh: the same command is dropped before `enable` and executed after it", async (t) => {
+  let spec = makeSpec({ disabled: true, accepts_commands_from: ["gamma"] });
+  const executed: string[] = [];
+  const env = await makeEnv(t, {
+    specOf: () => spec,
+    hooks: {
+      // what the agent does in D2: rewrite spec.json (fresh datetime) and re-announce (WP7 does it for real)
+      onCommandEnable: async (enabled) => {
+        spec = {
+          ...spec,
+          disabled: !enabled,
+          accepts_commands_from: enabled ? ["beta", "gamma"] : [],
+          datetime: toIso(T0 + 60_000),
+        };
+      },
+    },
+    commands: { work: async (_params, ctx) => { executed.push(ctx.src); } },
+  });
+  await env.receiver.start(() => {});
+  const first = ridWith("A"); // "beta" is not listed yet
+  await writeJson(env.inbox, `${first}.json`, makeRequest(first, { type: "cmd", name: "work", src: "beta" }));
+  await waitFor(() => inreqs(env).length === 1, 3_000);
+  assert.equal(statusByRid(env).get(first), "dropped", "beta may not command us yet");
+  const enable = ridWith("B"); // "gamma" is listed, and a disabled agent still takes `enable`
+  const enableCmd = makeRequest(enable, { type: "cmd", name: "enable", parameters: { enabled: true }, src: "gamma" });
+  await writeJson(env.inbox, `${enable}.json`, enableCmd);
+  await waitFor(() => spec.disabled === false, 3_000); // the hook ran: `enable` changed the published spec
+  assert.equal(statusByRid(env).get(enable), "completed", "D3 archives before the hook fires");
+  const second = ridWith("C"); // the very same command as `first`, now from a listed src
+  await writeJson(env.inbox, `${second}.json`, makeRequest(second, { type: "cmd", name: "work", src: "beta" }));
+  await waitFor(() => inreqs(env).length === 3, 3_000);
+  assert.equal(statusByRid(env).get(second), "completed");
+  assert.deepEqual(executed, ["beta"]);
+});
+
+test("D0 a disabled agent still processes commands: enable, ping, restart, stop, custom", async (t) => {
+  const executed: string[] = [];
+  const env = await makeEnv(t, {
+    spec: makeSpec({ disabled: true, accepts_commands_from: ["beta"] }),
+    commands: { work: async () => { executed.push("work"); } },
+  });
+  await env.receiver.start(() => {});
+  const rows: [string, unknown][] = [
+    ["work", null],
+    ["enable", { enabled: false }],
+    ["ping", null],
+    ["restart", { delay: 2 }],
+    ["stop", { force: true }],
+  ];
+  for (const [index, [name, parameters]] of rows.entries()) {
+    const rid = ridWith("ABCDEFGHIJ"[index]!);
+    await writeJson(env.inbox, `${rid}.json`, makeRequest(rid, { type: "cmd", name, parameters }));
+  }
+  await waitFor(() => inreqs(env).length === rows.length, 3_000);
+  assert.deepEqual(executed, ["work"], "no 100-style rejection: a disabled agent still runs commands");
+  assert.deepEqual(env.commandCalls, ["enable(false)", "ping", "restart(force=false,delay=2)", "stop(force=true)"]);
+  assert.deepEqual(inreqs(env).map((d) => d.final_status), rows.map(() => "completed"));
+  assert.deepEqual(await io.listDir(env.inbox), []);
+  assert.ok(!(await io.listDir(env.inbox)).some((n) => n.endsWith(".res.json")));
+});
+
+test("stop: D3 archives before the lifecycle hook runs (the shutdown starts after the archive)", async (t) => {
+  let env!: Env;
+  const observed: { inbox: string[]; diarium: string }[] = [];
+  env = await makeEnv(t, {
+    spec: makeSpec({ accepts_commands_from: ["beta"] }),
+    hooks: {
+      onCommandStop: async (force) => {
+        observed.push({
+          inbox: await io.listDir(env.inbox),
+          diarium: await fsp.readFile(path.join(env.agent, "diarium.jsonl"), "utf8"),
+        });
+        assert.equal(force, true, "the parsed `force` flag");
+      },
+    },
+  });
+  await env.receiver.start(() => {});
+  const rid = ridWith("A");
+  const cmd = makeRequest(rid, { type: "cmd", name: "stop", parameters: { force: true } });
+  await writeJson(env.inbox, `${rid}.json`, cmd);
+  await waitFor(() => observed.length === 1, 3_000);
+  assert.deepEqual(observed[0]!.inbox, [], "the envelope is already deleted when the agent shuts down");
+  assert.match(observed[0]!.diarium, /"event":"inreq"/, "the diarium line is already on disk");
+  assert.match(observed[0]!.diarium, /"final_status":"completed"/);
+  await waitFor(() => inreqs(env).length === 1, 3_000);
+  assert.equal(statusByRid(env).get(rid), "completed");
+});
+
+test("restart: `force` and `delay` (seconds) reach the hook after the archive (D-10)", async (t) => {
+  let env!: Env;
+  const a = ridWith("A");
+  const b = ridWith("B");
+  /** The envelope of the command whose hook is running must already be gone (the other may stay). */
+  const seen: { force: boolean; delay: number; archivedFirst: boolean }[] = [];
+  env = await makeEnv(t, {
+    spec: makeSpec({ accepts_commands_from: ["beta"] }),
+    hooks: {
+      onCommandRestart: async (force, delaySeconds) => {
+        const rid = seen.length === 0 ? a : b; // the queue runs them in lexical rid order
+        const inbox = await io.listDir(env.inbox);
+        seen.push({ force, delay: delaySeconds, archivedFirst: !inbox.includes(`${rid}.json`) });
+      },
+    },
+  });
+  await env.receiver.start(() => {});
+  const withDelay = makeRequest(a, { type: "cmd", name: "restart", parameters: { force: true, delay: 5 } });
+  await writeJson(env.inbox, `${a}.json`, withDelay);
+  await writeJson(env.inbox, `${b}.json`, makeRequest(b, { type: "cmd", name: "restart", parameters: {} }));
+  await waitFor(() => seen.length === 2, 3_000);
+  assert.deepEqual(seen, [
+    { force: true, delay: 5, archivedFirst: true },
+    { force: false, delay: 0, archivedFirst: true },
+  ]);
+  assert.deepEqual(inreqs(env).map((d) => d.final_status), ["completed", "completed"]);
+});
+
+test("enable: the parsed boolean reaches the hook, for false and for true", async (t) => {
+  const env = await makeEnv(t, { spec: makeSpec({ accepts_commands_from: ["beta"] }) });
+  await env.receiver.start(() => {});
+  const off = ridWith("A");
+  const on = ridWith("B");
+  const offCmd = makeRequest(off, { type: "cmd", name: "enable", parameters: { enabled: false } });
+  const onCmd = makeRequest(on, { type: "cmd", name: "enable", parameters: { enabled: true } });
+  await writeJson(env.inbox, `${off}.json`, offCmd);
+  await writeJson(env.inbox, `${on}.json`, onCmd);
+  await waitFor(() => env.commandCalls.length === 2, 3_000);
+  assert.deepEqual(env.commandCalls, ["enable(false)", "enable(true)"]);
+  assert.deepEqual(inreqs(env).map((d) => d.final_status), ["completed", "completed"]);
+  assert.equal(await publishedFile(env, "spec.json"), "<absent>", "D2 is the agent's: the receiver rewrites no spec");
+});
+
+test("ping: the hook fires; its parameters must be null, so a non-null one never reaches D0", async (t) => {
+  const env = await makeEnv(t, { spec: makeSpec({ accepts_commands_from: ["beta"] }) });
+  await env.receiver.start(() => {});
+  const rid = ridWith("A");
+  await writeJson(env.inbox, `${rid}.json`, makeRequest(rid, { type: "cmd", name: "ping", parameters: null }));
+  await waitFor(() => env.commandCalls.length === 1, 3_000);
+  assert.deepEqual(env.commandCalls, ["ping"]);
+  assert.equal(statusByRid(env).get(rid), "completed");
+});
+
+test("a command envelope that breaks `commandRules` is ignored before D0: never archived, never deleted", async (t) => {
+  const env = await makeEnv(t, { spec: makeSpec({ accepts_commands_from: ["beta"] }) });
+  await env.receiver.start(() => {});
+  const rows: { rid: string; name: string; parameters: unknown }[] = [
+    { rid: ridWith("A"), name: "ping", parameters: {} }, // must be null
+    { rid: ridWith("B"), name: "stop", parameters: null }, // must be an object
+    { rid: ridWith("C"), name: "enable", parameters: {} }, // `enabled` is required
+    { rid: ridWith("D"), name: "restart", parameters: { wait: 3 } }, // unknown parameter
+  ];
+  for (const row of rows) {
+    const cmd = makeRequest(row.rid, { type: "cmd", name: row.name, parameters: row.parameters });
+    await writeJson(env.inbox, `${row.rid}.json`, cmd);
+  }
+  await waitFor(() => logLines(env).length === rows.length, 3_000);
+  assert.deepEqual(inreqs(env), [], "a non-conforming envelope is ignored, not dropped (D0 precondition)");
+  assert.deepEqual(env.commandCalls, []);
+  assert.deepEqual(
+    (await io.listDir(env.inbox)).sort(),
+    rows.map((r) => `${r.rid}.json`),
+    "the files stay in the inbox",
+  );
+  assert.ok(env.events.some((e) => e.event === "ignored"));
+});
+
+test("a rejecting command handler is logged and still archives as `completed`", async (t) => {
+  const executed: string[] = [];
+  const env = await makeEnv(t, {
+    spec: makeSpec({ accepts_commands_from: ["beta"] }),
+    commands: {
+      boom: async () => {
+        throw new Error("kaboom");
+      },
+      after: async () => {
+        executed.push("after");
+      },
+    },
+  });
+  await env.receiver.start(() => {});
+  const boom = ridWith("A");
+  await writeJson(env.inbox, `${boom}.json`, makeRequest(boom, { type: "cmd", name: "boom", parameters: { x: 1 } }));
+  await waitFor(() => inreqs(env).length === 1, 3_000);
+  assert.equal(
+    statusByRid(env).get(boom),
+    "completed",
+    "accepted and executed: the failure is internal, not a protocol state",
+  );
+  assert.ok(env.events.some((e) => e.event === "log" && /command "boom" from beta failed: kaboom/.test(e.message)));
+  assert.deepEqual(logLines(env), [], "an internal failure adds no diarium event: the protocol prescribes none");
+  assert.equal(await readRes(env.inbox, boom), undefined, "a failed command is not answered either");
+  const after = ridWith("B");
+  await writeJson(env.inbox, `${after}.json`, makeRequest(after, { type: "cmd", name: "after" }));
+  await waitFor(() => executed.length === 1, 3_000);
+  assert.equal(inreqs(env).length, 2, "the dispatcher kept working");
+});
+
+test("D-5: one command rid is executed once, while it is in flight and after the archive", async (t) => {
+  let runs = 0;
+  const env = await makeEnv(t, {
+    spec: makeSpec({ accepts_commands_from: ["beta"] }),
+    commands: {
+      work: async () => {
+        runs += 1;
+      },
+    },
+  });
+  await env.receiver.start(() => {});
+  const rid = ridWith("A");
+  const cmd = makeRequest(rid, { type: "cmd", name: "work" });
+  await writeJson(env.inbox, `${rid}.json`, cmd);
+  await env.receiver.processFile(`${rid}.json`); // second dispatch of the same rid, still in flight
+  await waitFor(() => inreqs(env).length === 1, 3_000);
+  await writeJson(env.inbox, `${rid}.json`, cmd); // the same envelope appears again after the archive
+  await env.receiver.processFile(`${rid}.json`);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(runs, 1, "never executed twice");
+  assert.equal(inreqs(env).length, 1, "never archived twice");
+});
+
+test("the initial scan runs pending commands one at a time in lexical rid order", async (t) => {
+  const order: string[] = [];
+  const env = await makeEnv(t, {
+    spec: makeSpec({ accepts_commands_from: ["beta"] }),
+    commands: {
+      slow: async (params) => {
+        const ms = (params as { ms: number }).ms;
+        await new Promise((resolve) => setTimeout(resolve, ms)); // longest first: concurrency would reorder
+        order.push(String(ms));
+      },
+    },
+  });
+  const rows: [string, number][] = [[ridWith("C"), 10], [ridWith("A"), 90], [ridWith("B"), 50]]; // written out of order
+  for (const [rid, ms] of rows) {
+    await writeJson(env.inbox, `${rid}.json`, makeRequest(rid, { type: "cmd", name: "slow", parameters: { ms } }));
+  }
+  await env.receiver.start(() => {}); // D-4: the initial scan hands over the pending envelopes
+  await waitFor(() => order.length === 3, 5_000);
+  assert.deepEqual(order, ["90", "50", "10"]);
+  assert.deepEqual(inreqs(env).map((d) => d.final_status), ["completed", "completed", "completed"]);
 });

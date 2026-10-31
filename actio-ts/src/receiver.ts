@@ -1,8 +1,6 @@
 // Receiver (WP5): lanes A (requests) and D (commands) — inbox dispatch, per-rid exchange
-// tracker, acceptance checks, work with AbortSignal, response, confirmation wait, archive.
-//
-// Round A (this file): lane A only. Validated `type="cmd"` files are left in place untouched
-// (no state change, no archive): lane D (D0–D4, built-ins) is the next round (WP5-B-1).
+// tracker, acceptance checks, work with AbortSignal, response, confirmation wait, archive,
+// and command dispatch (D0–D4) with the four built-ins handed to the agent lifecycle.
 import { open, readFile, rename, stat } from "node:fs/promises";
 import path from "node:path";
 import * as diarium from "./diarium.js";
@@ -56,6 +54,13 @@ export interface ReceiverHooks {
   onCommandEnable(enabled: boolean): Promise<void>;
   onCommandPing(): Promise<void>;
 }
+
+/** The commands every agent must implement (*Commands*, the mandatory set); custom commands are the
+ * keys of the `commands` map, and a command name is never advertised (*Callability*, D0). */
+const STANDARD_COMMANDS = new Set(["stop", "enable", "restart", "ping"]);
+
+/** What `D0` decided about one command envelope; `reason` is for the operator, never for the peer. */
+type CommandVerdict = { ok: true; name: string } | { ok: false; reason: string };
 
 /** The phases of one inbound request exchange (workflow A0 → A1 → A2 → A4). */
 type Phase = "accepting" | "working" | "responded";
@@ -113,6 +118,11 @@ export class Receiver {
   private readonly archived = new Set<Rid>();
   /** D-15: `(path, mtime)` markers already reported; a log is emitted once per marker. */
   private readonly ignoredSeen = new Set<string>();
+  /** D-5 for commands: the rids whose envelope this run has already dispatched (executed once). */
+  private readonly commandRids = new Set<Rid>();
+  /** Lane D: the envelopes handed over by `D0`, drained one at a time in rid order. */
+  private readonly commandQueue: { rid: Rid; run: () => Promise<void> }[] = [];
+  private commandDraining = false;
   private watcher: { close(): void } | null = null;
   private stopped = false;
 
@@ -121,9 +131,7 @@ export class Receiver {
     private readonly hooks: ReceiverHooks,
     private readonly capabilities: Map<string, CapabilityEntry>,
     private readonly commands: Map<string, CommandHandler>,
-  ) {
-    void commands; // lane D (D0–D4) is the next round (WP5-B-1)
-  }
+  ) {}
 
   /** Arms the inbox watcher and processes pending envelopes (D-4); every file event → `onFile`. */
   start(onFile: (name: string) => void): Promise<void> {
@@ -213,13 +221,9 @@ export class Receiver {
     return this.dispatchConfirmation(full, name, checked.value);
   }
 
-  /** A request file: `cmd` is round B; `req` tracks the exchange and starts A0 asynchronously. */
+  /** A request file: `cmd` goes to lane D; `req` tracks the exchange and starts A0 asynchronously. */
   private async dispatchRequest(file: RequestFile): Promise<void> {
-    if (file.type === "cmd") {
-      // Round B (WP5-B-1, D0–D4): a validated command file is left in place untouched —
-      // no state change, no archive, no answer (commands generate no response).
-      return;
-    }
+    if (file.type === "cmd") return this.dispatchCommand(file);
     if (this.archived.has(file.rid) || this.exchanges.has(file.rid)) return; // D-5: duplicate rid
     const ex: ExchangeState = {
       rid: file.rid,
@@ -234,6 +238,135 @@ export class Receiver {
     };
     this.exchanges.set(file.rid, ex); // tracked before A0 starts: a concurrent .can matches it
     this.guarded(file.rid, this.acceptAndRun(ex)); // A0 runs asynchronously: do not block the dispatcher
+  }
+
+  /** Lane D entry: a schema-valid `type="cmd"` envelope goes through `D0`, then `D1`–`D3` or `D4`. */
+  private async dispatchCommand(file: RequestFile): Promise<void> {
+    if (this.stopped) return; // stop() owns the inbox now: the file stays for the next start (D-4)
+    const rid = file.rid;
+    // D-5: one command is executed once per rid per run. A command archived by a previous run left
+    // no file behind, so a leftover envelope means a crash before the archive: it runs again.
+    if (this.archived.has(rid) || this.commandRids.has(rid)) return;
+    this.commandRids.add(rid);
+    const verdict = this.acceptCommand(file); // D0
+    if (!verdict.ok) {
+      this.queueCommand(file, () => this.archiveCommand(file, "dropped", verdict.reason)); // D4
+      return;
+    }
+    this.queueCommand(file, () => this.runCommand(file, verdict.name)); // D1–D3
+  }
+
+  /** Hands the envelope to the lane D queue; the drain that is already running picks it up. */
+  private queueCommand(file: RequestFile, run: () => Promise<void>): void {
+    this.commandQueue.push({ rid: file.rid, run });
+    void this.drainCommands();
+  }
+
+  /**
+   * Lane D runs one command at a time, sorted by rid (a ULID: the order the requestor created them),
+   * whatever order the watcher handed the files over — so the pending envelopes of the initial scan
+   * and a burst of arrivals are both processed in lexical-rid order. Nothing here blocks the inbox
+   * scan or lane A: a slow custom handler only delays the commands behind it. `stop()` leaves what
+   * is still queued untouched in the inbox for the next start (D-4).
+   */
+  private async drainCommands(): Promise<void> {
+    if (this.commandDraining) return; // one drain: a command arriving while it runs joins the queue
+    this.commandDraining = true;
+    try {
+      while (this.commandQueue.length > 0 && !this.stopped) {
+        this.commandQueue.sort((a, b) => (a.rid < b.rid ? -1 : a.rid > b.rid ? 1 : 0));
+        const next = this.commandQueue.shift()!;
+        try {
+          await next.run(); // the previous command settles (archive and hook) before the next one starts
+        } catch (err) {
+          this.reportInternal(next.rid, err); // a broken archive or agent hook never breaks the drain
+        }
+      }
+    } finally {
+      this.commandDraining = false;
+    }
+  }
+
+  /** `D0`: may this `src` command us at all, and do we know the name? Disabled agents still answer. */
+  private acceptCommand(file: RequestFile): CommandVerdict {
+    const body = file.request as RequestBody; // validated by `commandRules`: the shape of each name is fixed
+    // The spec is read fresh: `enable` may have changed `accepts_commands_from` since we started.
+    // An empty list means nobody, exactly as in the callability rules (5.1).
+    if (!this.ctx.spec().accepts_commands_from.includes(file.src)) {
+      return { ok: false, reason: `"${file.src}" is not in accepts_commands_from` };
+    }
+    if (!STANDARD_COMMANDS.has(body.name) && !this.commands.has(body.name)) {
+      return { ok: false, reason: `unknown command "${body.name}"` };
+    }
+    // `disabled` is NOT checked here: a disabled agent must still be able to answer `enable`,
+    // `ping` and `stop` (*D0*: "commands are processed even if the agent is disabled").
+    return { ok: true, name: body.name };
+  }
+
+  /** `D1`–`D2`: execute an accepted command. Built-ins archive first (`D3`), then hand over. */
+  private async runCommand(file: RequestFile, name: string): Promise<void> {
+    if (STANDARD_COMMANDS.has(name)) {
+      // The archive always completes BEFORE the lifecycle hook runs: "the archive is always completed
+      // before shutting down", and the restart `delay` only starts after the archive (D-10).
+      await this.archiveCommand(file, "completed");
+      return this.runStandardCommand(name, (file.request as RequestBody).parameters);
+    }
+    const handler = this.commands.get(name);
+    if (handler === undefined) return; // unreachable: `D0` only accepts known names
+    try {
+      await handler((file.request as RequestBody).parameters, { rid: file.rid, src: file.src });
+    } catch (err) {
+      // An internal failure, not a protocol state: commands are never answered and `D4` is already
+      // ruled out (`D0` accepted the envelope). It still archives as `completed`; the operator sees it.
+      const why = err instanceof Error ? err.message : String(err);
+      this.ctx.emit({ event: "log", message: `receiver: command "${name}" from ${file.src} failed: ${why}` });
+    }
+    await this.archiveCommand(file, "completed"); // executed: the envelope was accepted and run
+  }
+
+  /** `D1` for the four mandatory commands: the parsed parameters go to the agent lifecycle (WP7). */
+  private async runStandardCommand(name: string, parameters: unknown): Promise<void> {
+    // `commandRules` fixed the shape (`stop {force?}`, `enable {enabled}`, `restart {force?, delay?}`,
+    // `ping null`), so these reads cover every accepted envelope; anything else never reached here.
+    const params = (parameters ?? {}) as Record<string, unknown>;
+    switch (name) {
+      case "stop":
+        await this.hooks.onCommandStop(params.force === true); // the agent performs D-9 and C1/C2
+        return;
+      case "restart": {
+        const delay = params.delay;
+        // `delay` is a duration in seconds (*Timers and thresholds*); the agent waits it out after
+        // the archive and then starts again in-process (D-10).
+        await this.hooks.onCommandRestart(params.force === true, typeof delay === "number" ? delay : 0);
+        return;
+      }
+      case "enable":
+        await this.hooks.onCommandEnable(params.enabled === true); // the agent rewrites spec.json (D2)
+        return;
+      default:
+        await this.hooks.onCommandPing(); // "ping": `parameters` is null; the agent republishes (D2)
+    }
+  }
+
+  /** `D3`/`D4`: the `inreq` event with the command envelope alone, then delete the envelope. */
+  private async archiveCommand(
+    file: RequestFile,
+    finalStatus: "completed" | "dropped",
+    reason?: string,
+  ): Promise<void> {
+    // Commands are never cancelled and never answered: only `req` is ever filled (*Archive*, D3/D4).
+    const envelopes: Exchange = { final_status: finalStatus, req: file, can: null, res: null, con: null };
+    await this.ctx.appendDiarium(diarium.inreqEvent(this.ctx.id, this.ctx.now(), finalStatus, envelopes));
+    await io.remove(path.join(this.ctx.folders.inbox, `${file.rid}.json`));
+    this.archived.add(file.rid); // D-5: the same rid is never executed twice in this run
+    if (finalStatus === "dropped") {
+      // In-process observability only: `D4` touches no file but the envelope and the diarium.
+      this.ctx.emit({
+        event: "log",
+        message: `receiver: dropped command ${file.rid}: ${reason ?? "rejected at D0"}`,
+      });
+    }
+    this.ctx.emit({ event: "inreq", rid: file.rid, finalStatus });
   }
 
   /** A response file: ours (echoed by the watcher) or a leftover of a previous run (D-4). */
@@ -598,11 +731,14 @@ export class Receiver {
 
   /** Runs an internal async step; a rejection is a receiver bug — report it, never crash the loop. */
   private guarded(rid: Rid, step: Promise<void>): void {
-    void step.catch((err: unknown) => {
-      this.ctx.emit({
-        event: "log",
-        message: `receiver: internal error on ${rid}: ${err instanceof Error ? err.message : String(err)}`,
-      });
+    void step.catch((err: unknown) => this.reportInternal(rid, err));
+  }
+
+  /** The one report of an internal rejection (a bug or an agent hook failure), as a `log` event. */
+  private reportInternal(rid: Rid, err: unknown): void {
+    this.ctx.emit({
+      event: "log",
+      message: `receiver: internal error on ${rid}: ${err instanceof Error ? err.message : String(err)}`,
     });
   }
 }
