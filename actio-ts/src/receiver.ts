@@ -761,7 +761,7 @@ export class Receiver {
       this.startArchive(ex); // confirmed before this run started
       return;
     }
-    ex.confirmTimer = setTimeout(() => this.guarded(ex.rid, this.archive(ex)), this.ctx.config.confirmTimeout);
+    ex.confirmTimer = setTimeout(() => this.startArchive(ex), this.ctx.config.confirmTimeout); // P-6: tracked, so stop() awaits it
   }
 
   /** Starts one archive and tracks its promise (P-5: `stop()` awaits the in-flight ones). A second
