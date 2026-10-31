@@ -1,6 +1,46 @@
 // Receiver (WP5): lanes A (requests) and D (commands) — inbox dispatch, per-rid exchange
 // tracker, acceptance checks, work with AbortSignal, response, confirmation wait, archive.
-import type { AgentContext, AgentId, AgentView, CapabilityEntry, CommandHandler } from "./types.js";
+//
+// Round A (this file): lane A only. Validated `type="cmd"` files are left in place untouched
+// (no state change, no archive): lane D (D0–D4, built-ins) is the next round (WP5-B-1).
+import { open, readFile, rename, stat } from "node:fs/promises";
+import path from "node:path";
+import * as diarium from "./diarium.js";
+import * as io from "./io.js";
+import { ActioError } from "./types.js";
+import { nonce, toIso } from "./util.js";
+import { watchDir } from "./watch.js";
+import {
+  envelopeKind,
+  nameMatches,
+  sameHeader,
+  validateCancellation,
+  validateConfirmation,
+  validateRequest,
+  validateResponse,
+  type Validated,
+} from "./validate.js";
+import type {
+  AgentContext,
+  AgentId,
+  AgentView,
+  CapabilityEntry,
+  CommandHandler,
+  InreqFinalStatus,
+} from "./types.js";
+import type {
+  CancellationBody,
+  CancellationFile,
+  ConfirmationFile,
+  Exchange,
+  Header,
+  RequestBody,
+  RequestFile,
+  ResponseBody,
+  ResponseFile,
+  Rid,
+  Spec,
+} from "./generated/types.js";
 
 /** Lifecycle callbacks the receiver hands over to the ActioAgent (wired in WP7). */
 export interface ReceiverHooks {
@@ -17,34 +57,557 @@ export interface ReceiverHooks {
   onCommandPing(): Promise<void>;
 }
 
+/** The phases of one inbound request exchange (workflow A0 → A1 → A2 → A4). */
+type Phase = "accepting" | "working" | "responded";
+
+/** The per-rid tracker of one inbound exchange (in-memory only; D-4 re-arms from files at start). */
+interface ExchangeState {
+  rid: Rid;
+  /** The request header (D-11 compares it with every later file, `datetime` excluded). */
+  header: Header;
+  /** The request file as exchanged; null when re-tracked from a bare `.res.json` at start (D-4). */
+  request: RequestFile | null;
+  phase: Phase;
+  /** A cancellation was seen (before acceptance, during work, or after the response). */
+  canSeen: boolean;
+  can: CancellationFile | null;
+  res: ResponseFile | null;
+  con: ConfirmationFile | null;
+  /** Response attachments published to `forum`; deleted at A4. */
+  responseAttachments: string[];
+  abort?: AbortController;
+  confirmTimer?: NodeJS.Timeout;
+}
+
+/** The options of one response (the single response of the exchange, written only once). */
+interface ResponseOptions {
+  cancellation: boolean;
+  error: boolean;
+  /** null for a cancellation response; the capability result or an error result otherwise. */
+  result: unknown;
+  attachments: string[];
+  /** Optional `work_time` (seconds of actual work). */
+  workTime?: number;
+}
+
+/** The namespaced view of a spec (*Callability rules* 2): absent/null/[] → the null namespace. */
+function namespacesOf(spec: Spec): (string | null)[] {
+  const ns = spec.namespaces;
+  if (ns === undefined || ns === null || ns.length === 0) return [null];
+  return ns;
+}
+
+/** True when two agents share at least one namespace (`"*"` shares with everyone). */
+function sharesNamespace(a: Spec, b: Spec): boolean {
+  const na = namespacesOf(a);
+  const nb = namespacesOf(b);
+  if (na.includes("*") || nb.includes("*")) return true;
+  return na.some((n) => nb.includes(n));
+}
+
 /** The receiver of one agent: serves inbound requests and commands from its own inbox. */
 export class Receiver {
+  /** The tracked (accepted, not yet archived) inbound exchanges, by rid. */
+  private readonly exchanges = new Map<Rid, ExchangeState>();
+  /** D-5: rids archived in this run; a repeated request file is ignored (process lifetime). */
+  private readonly archived = new Set<Rid>();
+  /** D-15: `(path, mtime)` markers already reported; a log is emitted once per marker. */
+  private readonly ignoredSeen = new Set<string>();
+  private watcher: { close(): void } | null = null;
+  private stopped = false;
+
   constructor(
     private readonly ctx: AgentContext,
     private readonly hooks: ReceiverHooks,
     private readonly capabilities: Map<string, CapabilityEntry>,
     private readonly commands: Map<string, CommandHandler>,
   ) {
-    throw new Error("not implemented");
+    void commands; // lane D (D0–D4) is the next round (WP5-B-1)
   }
 
   /** Arms the inbox watcher and processes pending envelopes (D-4); every file event → `onFile`. */
   start(onFile: (name: string) => void): Promise<void> {
-    throw new Error("not implemented");
+    const inbox = this.ctx.folders.inbox;
+    this.watcher = watchDir(
+      inbox,
+      (name) => {
+        onFile(name); // the agent may fan out (e.g. the requestor's self-calls share this watcher)
+        void this.processFile(name);
+      },
+      (err) => this.hooks.onWatchError(inbox, err), // D-22
+    );
+    return this.initialScan(onFile);
+  }
+
+  /** D-4: one initial scan of the inbox; pending envelopes are processed in lexical order. */
+  private async initialScan(onFile: (name: string) => void): Promise<void> {
+    const names = (await io.listDir(this.ctx.folders.inbox)).filter((n) => n.endsWith(".json"));
+    names.sort();
+    for (const name of names) {
+      if (this.stopped) return;
+      onFile(name);
+      await this.processFile(name);
+    }
   }
 
   /** Dispatches one inbox file (schema validation first, D-15; header consistency, D-11). */
-  processFile(name: string): Promise<void> {
-    throw new Error("not implemented");
+  async processFile(name: string): Promise<void> {
+    if (this.stopped || !name.endsWith(".json")) return; // D-2: only *.json in an inbox
+    const full = path.join(this.ctx.folders.inbox, name);
+    let raw: string;
+    try {
+      raw = await readFile(full, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return; // vanished between event and read
+      throw err;
+    }
+    let obj: unknown;
+    try {
+      obj = JSON.parse(raw);
+    } catch (err) {
+      await this.ignore(full, name, `malformed JSON: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    const kind = envelopeKind(obj);
+    if (kind === undefined) {
+      // Not an envelope (no body key, or more than one): report the first ajv error (D-15).
+      const checked = validateRequest(obj);
+      await this.ignore(full, name, checked.ok ? "no envelope body key" : checked.errors[0]);
+      return;
+    }
+    const body = (obj as Record<string, unknown>)[kind];
+    if (typeof body === "string") {
+      // D-14: an encrypted body (base64) received by a core agent: ignored + logged, never answered.
+      await this.ignore(full, name, "base64 body (encryption is not supported)");
+      return;
+    }
+    if (kind === "request") {
+      const checked = validateRequest(obj);
+      if (!checked.ok) {
+        await this.ignore(full, name, checked.errors[0]); // D-15
+        return;
+      }
+      return this.dispatchRequest(checked.value);
+    }
+    if (kind === "cancellation") {
+      const checked = validateCancellation(obj);
+      if (!checked.ok) {
+        await this.ignore(full, name, checked.errors[0]); // D-15
+        return;
+      }
+      return this.dispatchCancellation(full, name, checked.value);
+    }
+    if (kind === "response") {
+      const checked = validateResponse(obj);
+      if (!checked.ok) {
+        await this.ignore(full, name, checked.errors[0]); // D-15
+        return;
+      }
+      return this.dispatchResponse(checked.value);
+    }
+    const checked = validateConfirmation(obj);
+    if (!checked.ok) {
+      await this.ignore(full, name, checked.errors[0]); // D-15
+      return;
+    }
+    return this.dispatchConfirmation(full, name, checked.value);
+  }
+
+  /** A request file: `cmd` is round B; `req` tracks the exchange and starts A0 asynchronously. */
+  private async dispatchRequest(file: RequestFile): Promise<void> {
+    if (file.type === "cmd") {
+      // Round B (WP5-B-1, D0–D4): a validated command file is left in place untouched —
+      // no state change, no archive, no answer (commands generate no response).
+      return;
+    }
+    if (this.archived.has(file.rid) || this.exchanges.has(file.rid)) return; // D-5: duplicate rid
+    const ex: ExchangeState = {
+      rid: file.rid,
+      header: pickHeader(file),
+      request: file,
+      phase: "accepting",
+      canSeen: false,
+      can: null,
+      res: null,
+      con: null,
+      responseAttachments: [],
+    };
+    this.exchanges.set(file.rid, ex); // tracked before A0 starts: a concurrent .can matches it
+    this.guarded(file.rid, this.acceptAndRun(ex)); // A0 runs asynchronously: do not block the dispatcher
+  }
+
+  /** A response file: ours (echoed by the watcher) or a leftover of a previous run (D-4). */
+  private async dispatchResponse(file: ResponseFile): Promise<void> {
+    const ex = this.exchanges.get(file.rid); // D-2: match exchanges by rid, never by file name
+    if (ex === undefined) {
+      // D-4: a `.res.json` left by a previous run without its confirmation → re-track it and
+      // restart the confirmation timer from now.
+      await this.retrackFromResponse(file);
+      return;
+    }
+    if (ex.res === null) ex.res = file; // our own write echoed back by the watcher
+  }
+
+  /** A cancellation file: matched by rid (D-2) with the header check (D-11) first. */
+  private async dispatchCancellation(full: string, name: string, file: CancellationFile): Promise<void> {
+    const ex = this.exchanges.get(file.rid);
+    if (ex === undefined) {
+      await this.ignore(full, name, `unmatched rid ${file.rid} (no tracked exchange)`);
+      return;
+    }
+    if (!sameHeader(file, ex.header)) {
+      await this.ignore(full, name, `header mismatch for rid ${file.rid} (D-11)`);
+      return;
+    }
+    if (ex.can !== null) return; // the cancellation file is written once; later ones are no-ops
+    if (
+      ex.request !== null &&
+      !nameMatches(ex.request.request as RequestBody, file.cancellation as CancellationBody)
+    ) {
+      await this.ignore(full, name, `cancellation name mismatch for rid ${file.rid}`);
+      return;
+    }
+    ex.can = file;
+    ex.canSeen = true;
+    if (ex.phase === "working") ex.abort?.abort(); // A3: stop the work
+    // "accepting": A0 checks canSeen before starting work; "responded": no second response —
+    // the exchange simply ends as `cancelled` at the archive.
+  }
+
+  /** A confirmation file: matched by rid (D-2) with the header check (D-11) first. */
+  private async dispatchConfirmation(full: string, name: string, file: ConfirmationFile): Promise<void> {
+    const ex = this.exchanges.get(file.rid);
+    if (ex === undefined) {
+      await this.ignore(full, name, `unmatched rid ${file.rid} (no tracked exchange)`);
+      return;
+    }
+    if (!sameHeader(file, ex.header)) {
+      await this.ignore(full, name, `header mismatch for rid ${file.rid} (D-11)`);
+      return;
+    }
+    if (ex.con !== null) return; // the confirmation file is written once; later ones are no-ops
+    ex.con = file;
+    if (ex.phase === "responded" && ex.res !== null) {
+      if (ex.confirmTimer) {
+        clearTimeout(ex.confirmTimer);
+        ex.confirmTimer = undefined;
+      }
+      this.guarded(ex.rid, this.archive(ex));
+    }
+    // a confirmation before the response (out of order) is stored: A2 archives immediately
   }
 
   /** Closes the watcher, aborts in-flight work per D-9 (stop semantics are the agent's). */
-  stop(): Promise<void> {
-    throw new Error("not implemented");
+  async stop(): Promise<void> {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.watcher?.close();
+    this.watcher = null;
+    for (const ex of [...this.exchanges.values()]) {
+      if (ex.confirmTimer) {
+        clearTimeout(ex.confirmTimer);
+        ex.confirmTimer = undefined;
+      }
+      if (ex.phase !== "working") continue; // "accepting" was not accepted; "responded" is answered
+      // D-9 (receiver side): an accepted, unanswered request → error response with code 300.
+      ex.abort?.abort();
+      await this.writeResponse(ex, {
+        cancellation: false,
+        error: true,
+        result: { code: 300, msg: "agent_stopping: the agent stops before answering" },
+        attachments: [],
+      });
+    }
   }
 
   /** Number of inbound exchanges in A1/A2/A3 (for busy, D-8) and capability_status. */
   runningCount(): number {
-    throw new Error("not implemented");
+    return this.exchanges.size;
   }
+
+  /** A0: the acceptance checks in table order (first failure found is answered) → A1 → A2. */
+  private async acceptAndRun(ex: ExchangeState): Promise<void> {
+    const request = ex.request?.request as RequestBody | undefined;
+    if (request === undefined) return;
+    if (!ex.canSeen) {
+      const pending = await this.findPendingCancellation(ex);
+      if (pending !== null) {
+        ex.can = pending;
+        ex.canSeen = true;
+      }
+    }
+    if (ex.canSeen) {
+      // A cancellation is already present: no work is started, a cancellation response (A0 row).
+      await this.respond(ex, { cancellation: true, error: false, result: null, attachments: [] });
+      return;
+    }
+    const verdict = this.accept(ex.header.src, request);
+    if (!verdict.ok) {
+      await this.respond(ex, {
+        cancellation: false,
+        error: true,
+        result: { code: verdict.code, msg: verdict.msg },
+        attachments: [],
+      });
+      return;
+    }
+    await this.run(ex, verdict.entry, request);
+  }
+
+  /** A0 checks in table order; the first failure found is reported (104 is not implemented). */
+  private accept(
+    src: AgentId,
+    request: RequestBody,
+  ): { ok: true; entry: CapabilityEntry } | { ok: false; code: number; msg: string } {
+    if (this.ctx.spec().disabled === true) {
+      return { ok: false, code: 100, msg: "agent_disabled: the agent is disabled" };
+    }
+    const entry = this.capabilities.get(request.name);
+    if (entry === undefined) {
+      return { ok: false, code: 101, msg: `unknown_capability: no capability named "${request.name}"` };
+    }
+    if (entry.capability.actio.disabled === true) {
+      return { ok: false, code: 102, msg: `capability_disabled: "${request.name}" is disabled` };
+    }
+    const acceptsFrom = entry.capability.actio.accepts_from;
+    if (acceptsFrom !== undefined && acceptsFrom.length > 0 && !acceptsFrom.includes(src)) {
+      return { ok: false, code: 103, msg: `requestor_not_allowed: "${request.name}" does not accept "${src}"` };
+    }
+    // `parameters: null` means "no parameters" (*Issue a request*): it is checked as the empty object.
+    if (!entry.compiled.validateParams(request.parameters ?? {})) {
+      return { ok: false, code: 105, msg: `invalid_parameters: parameters of "${request.name}" do not conform` };
+    }
+    const peer = this.hooks.peerOf(src);
+    if (peer !== undefined && !sharesNamespace(this.ctx.spec(), peer.spec)) {
+      return { ok: false, code: 106, msg: `namespace_mismatch: no shared namespace with "${src}"` };
+    }
+    const maxParallel = entry.capability.actio.max_parallel ?? 0; // 0 = unbounded
+    if (maxParallel > 0 && entry.running >= maxParallel) {
+      return { ok: false, code: 107, msg: `capacity_exceeded: "${request.name}" is at max_parallel ${maxParallel}` };
+    }
+    const nowSeconds = Math.floor(this.ctx.now() / 1000);
+    if (request.timeout !== 0 && request.ts + request.timeout < nowSeconds) {
+      return {
+        ok: false,
+        code: 108,
+        msg: `request_expired: the request timeout of ${request.timeout}s passed before acceptance`,
+      };
+    }
+    return { ok: true, entry };
+  }
+
+  /** A1: run the capability handler with an AbortSignal (A3 on cancellation) → A2. */
+  private async run(ex: ExchangeState, entry: CapabilityEntry, request: RequestBody): Promise<void> {
+    ex.phase = "working";
+    ex.abort = new AbortController();
+    entry.running += 1;
+    this.hooks.onStateChange();
+    const start = this.ctx.now();
+    let result: unknown;
+    let failure: unknown;
+    try {
+      result = await entry.handler(request.parameters, {
+        rid: ex.rid,
+        src: ex.header.src,
+        signal: ex.abort.signal,
+        attachments: request.attachments,
+        publishAttachment: (name: string, data: Uint8Array) => this.publishAttachment(ex, name, data),
+      });
+    } catch (err) {
+      failure = err;
+    } finally {
+      entry.running -= 1;
+      this.hooks.onStateChange();
+    }
+    if (ex.abort?.signal.aborted) {
+      // A3: the work was cancelled (the handler may have settled before the abort landed).
+      await this.respond(ex, { cancellation: true, error: false, result: null, attachments: [] });
+      return;
+    }
+    if (failure === undefined) {
+      await this.respond(ex, {
+        cancellation: false,
+        error: false,
+        result,
+        attachments: ex.responseAttachments,
+        workTime: Math.floor((this.ctx.now() - start) / 1000),
+      });
+      return;
+    }
+    const errorResult =
+      failure instanceof ActioError
+        ? {
+            code: failure.code,
+            msg: failure.message,
+            ...(failure.details !== undefined ? { details: String(failure.details) } : {}),
+          }
+        : { msg: failure instanceof Error ? failure.message : String(failure) };
+    await this.respond(ex, {
+      cancellation: false,
+      error: true,
+      result: errorResult,
+      attachments: ex.responseAttachments,
+      workTime: Math.floor((this.ctx.now() - start) / 1000),
+    });
+  }
+
+  /** A2: write the single response of the exchange and wait for the confirmation (or its timeout). */
+  private async respond(ex: ExchangeState, options: ResponseOptions): Promise<void> {
+    if (this.stopped || !this.exchanges.has(ex.rid)) return; // stop() owns the answer now
+    await this.writeResponse(ex, options);
+    if (ex.con !== null) {
+      this.guarded(ex.rid, this.archive(ex)); // the confirmation already arrived (out of order)
+      return;
+    }
+    ex.confirmTimer = setTimeout(() => this.guarded(ex.rid, this.archive(ex)), this.ctx.config.confirmTimeout);
+  }
+
+  /** A2 core: build the response, self-validate it (I-2), write it to the OWN inbox. */
+  private async writeResponse(ex: ExchangeState, options: ResponseOptions): Promise<void> {
+    const now = this.ctx.now();
+    const body: ResponseBody = {
+      ts: Math.floor(now / 1000),
+      nonce: nonce(),
+      signature: null,
+      error: options.error,
+      cancellation: options.cancellation,
+      result: options.result as ResponseBody["result"],
+      attachments: options.attachments,
+    };
+    if (options.workTime !== undefined) body.work_time = options.workTime;
+    // `type` is "req" for every tracked exchange (commands are round B): the literal narrows the header.
+    const file: ResponseFile = { ...ex.header, type: "req", datetime: toIso(now), response: body };
+    const checked = validateResponse(file);
+    if (!checked.ok) {
+      throw new Error(`receiver.ts: invalid response for ${ex.rid}: ${checked.errors.join("; ")}`);
+    }
+    await io.writeJsonAtomic(path.join(this.ctx.folders.inbox, `${ex.rid}.res.json`), checked.value, this.ctx.folders.agent);
+    ex.res = checked.value;
+    ex.responseAttachments = options.attachments;
+    ex.phase = "responded";
+  }
+
+  /** A4: the `inreq` diarium event, then delete all files of the rid and the response attachments. */
+  private async archive(ex: ExchangeState): Promise<void> {
+    if (this.stopped || !this.exchanges.has(ex.rid)) return;
+    if (ex.confirmTimer) {
+      clearTimeout(ex.confirmTimer);
+      ex.confirmTimer = undefined;
+    }
+    const finalStatus: InreqFinalStatus = ex.canSeen ? "cancelled" : ex.con !== null ? "confirmed" : "completed";
+    const envelopes: Exchange = { final_status: finalStatus, req: ex.request, can: ex.can, res: ex.res, con: ex.con }; // as exchanged
+    await this.ctx.appendDiarium(diarium.inreqEvent(this.ctx.id, this.ctx.now(), finalStatus, envelopes));
+    for (const suffix of [".json", ".can.json", ".res.json", ".con.json"]) {
+      await io.remove(path.join(this.ctx.folders.inbox, `${ex.rid}${suffix}`));
+    }
+    for (const name of ex.responseAttachments) {
+      await io.remove(path.join(this.ctx.folders.forum, name));
+    }
+    this.exchanges.delete(ex.rid);
+    this.archived.add(ex.rid); // D-5
+    this.ctx.emit({ event: "inreq", rid: ex.rid, finalStatus });
+    this.hooks.onStateChange();
+  }
+
+  /** D-4: re-track a pending `.res.json` (previous run) and restart the confirmation wait from now. */
+  private async retrackFromResponse(file: ResponseFile): Promise<void> {
+    if (this.stopped || this.archived.has(file.rid) || this.exchanges.has(file.rid)) return;
+    const header = pickHeader(file);
+    const ex: ExchangeState = {
+      rid: file.rid,
+      header,
+      request: null,
+      phase: "responded",
+      canSeen: false,
+      can: null,
+      res: file,
+      con: null,
+      responseAttachments: [],
+    };
+    const pendingCan = await this.readEnvelope(`${file.rid}.can.json`, validateCancellation, header);
+    if (pendingCan !== null) {
+      ex.can = pendingCan;
+      ex.canSeen = true;
+    }
+    const pendingCon = await this.readEnvelope(`${file.rid}.con.json`, validateConfirmation, header);
+    if (pendingCon !== null) ex.con = pendingCon;
+    this.exchanges.set(file.rid, ex);
+    if (ex.con !== null) {
+      this.guarded(file.rid, this.archive(ex)); // confirmed before this run started
+      return;
+    }
+    ex.confirmTimer = setTimeout(() => this.guarded(ex.rid, this.archive(ex)), this.ctx.config.confirmTimeout);
+  }
+
+  /** A0: a valid cancellation file already present for the rid (matching header and name). */
+  private async findPendingCancellation(ex: ExchangeState): Promise<CancellationFile | null> {
+    const file = await this.readEnvelope(`${ex.rid}.can.json`, validateCancellation, ex.header);
+    if (file === null) return null;
+    if (typeof file.cancellation === "string") return null; // D-14: not answered
+    if (ex.request !== null && !nameMatches(ex.request.request as RequestBody, file.cancellation as CancellationBody)) {
+      return null;
+    }
+    return file;
+  }
+
+  /** Reads `<inbox>/<name>`, schema-validates it and checks the header against `header` (D-11). */
+  private async readEnvelope<T>(name: string, validate: (x: unknown) => Validated<T>, header: Header): Promise<T | null> {
+    const obj = await io.readJson(path.join(this.ctx.folders.inbox, name));
+    if (obj === undefined) return null;
+    const checked = validate(obj);
+    if (!checked.ok) return null;
+    if (!sameHeader(checked.value as unknown as Header, header)) return null;
+    return checked.value;
+  }
+
+  /** CapabilityContext.publishAttachment: write to `forum` (atomic, tmpDir = agent folder). */
+  private async publishAttachment(ex: ExchangeState, name: string, data: Uint8Array): Promise<string> {
+    const target = path.join(this.ctx.folders.forum, name);
+    await io.makeDir(path.dirname(target));
+    const tmpDir = this.ctx.folders.agent;
+    const tmp = path.join(tmpDir, `.${path.basename(target)}.${nonce()}.tmp`);
+    const fh = await open(tmp, "w");
+    try {
+      await fh.writeFile(data);
+    } finally {
+      await fh.close();
+    }
+    try {
+      await rename(tmp, target);
+    } catch (err) {
+      await io.remove(tmp).catch(() => {});
+      throw err;
+    }
+    ex.responseAttachments.push(name);
+    return name;
+  }
+
+  /** D-14/D-15: `ignored <path>: <reason>` once per (path, mtime) + the `ignored` event. */
+  private async ignore(full: string, name: string, reason: string): Promise<void> {
+    let key: string;
+    try {
+      key = `${full}:${(await stat(full)).mtimeMs}`;
+    } catch {
+      return; // vanished: nothing to ignore
+    }
+    if (this.ignoredSeen.has(key)) return;
+    this.ignoredSeen.add(key);
+    this.ctx.emit({ event: "ignored", path: full, reason });
+    await this.ctx.appendDiarium(diarium.logEvent(this.ctx.id, this.ctx.now(), `ignored ${name}: ${reason}`));
+  }
+
+  /** Runs an internal async step; a rejection is a receiver bug — report it, never crash the loop. */
+  private guarded(rid: Rid, step: Promise<void>): void {
+    void step.catch((err: unknown) => {
+      this.ctx.emit({
+        event: "log",
+        message: `receiver: internal error on ${rid}: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    });
+  }
+}
+
+/** The header of a request/response file (D-11 compares everything but `datetime`). */
+function pickHeader(file: { rid: Rid; src: AgentId; dst: AgentId; datetime: string; type: "cmd" | "req"; actio_version: string }): Header {
+  return { rid: file.rid, src: file.src, dst: file.dst, datetime: file.datetime, type: file.type, actio_version: file.actio_version };
 }

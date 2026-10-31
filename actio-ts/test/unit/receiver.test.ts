@@ -1,0 +1,641 @@
+// Tests of the receiver lane A (WP5-A-1): dispatch, acceptance (A0), work (A1/A3),
+// response + confirmation wait (A2), archive (A4), and the D-4/D-5/D-11/D-14/D-15 rules.
+import assert from "node:assert/strict";
+import fsp from "node:fs/promises";
+import path from "node:path";
+import { test, type TestContext } from "node:test";
+import * as diarium from "../../src/diarium.js";
+import { Receiver } from "../../src/receiver.js";
+import * as io from "../../src/io.js";
+import type {
+  ActioEvent,
+  AgentContext,
+  AgentView,
+  CapabilityContext,
+  CapabilityEntry,
+  CapabilityHandler,
+} from "../../src/types.js";
+import type {
+  CancellationFile,
+  ConfirmationFile,
+  Capability,
+  DiariumLine,
+  RequestBody,
+  RequestFile,
+  ResponseBody,
+  ResponseFile,
+  Spec,
+  Status,
+} from "../../src/generated/types.js";
+import { compileCapability, validateResponse } from "../../src/validate.js";
+import { nonce, toIso, ulid } from "../../src/util.js";
+import { fakeClock, makeRoot, waitFor } from "../helpers/index.js";
+
+const T0 = 1_700_000_000_000;
+const ISO0 = toIso(T0);
+
+function makeSpec(over: Partial<Spec> = {}): Spec {
+  return {
+    id: "alpha",
+    actio_version: "0.1",
+    datetime: ISO0,
+    description: "test receiver",
+    namespaces: ["ns1"],
+    accepts_commands_from: [],
+    capabilities: [],
+    security_support: [],
+    security_posture: "trusted",
+    ...over,
+  };
+}
+
+/** A peer AgentView for the `peerOf` hook (code 106). */
+function makePeer(id: string, over: Partial<Spec> = {}): AgentView {
+  const spec = makeSpec({ id, ...over });
+  const status: Status = { id, status: "idle", datetime: ISO0, capability_status: [] };
+  return { id, folder: `/tmp/${id}`, spec, status, health: "healthy", commands: false, capabilities: new Map() };
+}
+
+/** A CapabilityEntry with a strict default parameters/result schema (D-19). */
+function makeEntry(
+  name: string,
+  handler: CapabilityHandler,
+  over: Partial<Capability["actio"]> = {},
+  parameters: unknown = { type: "object", properties: {}, additionalProperties: false },
+): CapabilityEntry {
+  const capability: Capability = {
+    name,
+    description: `${name} test capability`,
+    parameters: parameters as Capability["parameters"],
+    actio: { result: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] }, ...over },
+  };
+  return { capability, compiled: compileCapability(capability), handler, running: 0 };
+}
+
+function makeRequest(
+  rid: string,
+  over: { name?: string; parameters?: unknown; src?: string; type?: "req" | "cmd"; timeout?: number; ts?: number; attachments?: string[] } = {},
+): RequestFile {
+  return {
+    rid,
+    src: over.src ?? "beta",
+    dst: "alpha",
+    datetime: ISO0,
+    type: over.type ?? "req",
+    actio_version: "0.1",
+    request: {
+      ts: over.ts ?? 1_700_000_000,
+      nonce: nonce(),
+      signature: null,
+      name: over.name ?? "echo",
+      parameters: (over.parameters ?? null) as RequestBody["parameters"],
+      timeout: over.timeout ?? 0,
+      attachments: over.attachments ?? [],
+    },
+  };
+}
+
+function makeCancellation(req: RequestFile, over: { name?: string; src?: string } = {}): CancellationFile {
+  const body = req.request as RequestBody;
+  return {
+    rid: req.rid,
+    src: over.src ?? req.src,
+    dst: req.dst,
+    datetime: ISO0,
+    type: "req",
+    actio_version: req.actio_version,
+    cancellation: { ts: body.ts + 1, nonce: nonce(), signature: null, name: over.name ?? body.name, force: false },
+  };
+}
+function makeConfirmation(req: RequestFile, over: { src?: string } = {}): ConfirmationFile {
+  return {
+    rid: req.rid,
+    src: over.src ?? req.src,
+    dst: req.dst,
+    datetime: ISO0,
+    type: "req",
+    actio_version: req.actio_version,
+    confirmation: { ts: 1_700_000_010, nonce: nonce(), signature: null },
+  };
+}
+
+const writeJson = (dir: string, name: string, obj: unknown): Promise<void> =>
+  io.writeJsonAtomic(path.join(dir, name), obj, dir);
+
+/** A response file read back from the inbox; the body of a core response is always the object form. */
+type ResFile = ResponseFile & { response: ResponseBody };
+
+const readRes = (inbox: string, rid: string): Promise<ResFile | undefined> =>
+  io.readJson(path.join(inbox, `${rid}.res.json`)) as Promise<ResFile | undefined>;
+
+const inboxNames = (inbox: string): Promise<string[]> => io.listDir(inbox);
+
+/** A promise the test controls (held work). */
+function deferred<T = void>(): { promise: Promise<T>; resolve(v: T): void } {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+interface Env {
+  root: string;
+  agent: string;
+  inbox: string;
+  forum: string;
+  ctx: AgentContext;
+  receiver: Receiver;
+  events: ActioEvent[];
+  diariumLines: DiariumLine[];
+  stateChanges: number[];
+  watchErrors: { dir: string; err: Error }[];
+  peers: Map<string, AgentView>;
+  fileEvents: string[];
+  clock: ReturnType<typeof fakeClock>;
+}
+
+async function makeEnv(
+  t: TestContext,
+  opts: { spec?: Spec; confirmTimeout?: number; entries?: CapabilityEntry[] } = {},
+): Promise<Env> {
+  const root = await makeRoot(t);
+  const agent = path.join(root, "alpha");
+  const inbox = path.join(agent, "inbox");
+  const forum = path.join(root, "forum");
+  for (const dir of [inbox, forum]) await fsp.mkdir(dir, { recursive: true });
+  const clock = fakeClock(T0);
+  const spec = opts.spec ?? makeSpec();
+  const events: ActioEvent[] = [];
+  const diariumLines: DiariumLine[] = [];
+  const stateChanges: number[] = [];
+  const watchErrors: { dir: string; err: Error }[] = [];
+  const peers = new Map<string, AgentView>();
+  const fileEvents: string[] = [];
+  const ctx: AgentContext = {
+    config: {
+      root,
+      sync: "none",
+      heartbeatInterval: 200,
+      confirmTimeout: opts.confirmTimeout ?? 60_000,
+      cancelWaitTimeout: 1_000,
+      announceDelay: 10,
+      nuntiumDebounce: 50,
+      stopGrace: 1_000,
+      clock,
+    },
+    id: "alpha",
+    folders: { root, agent, inbox, forum, nuntium: path.join(root, "nuntium") },
+    sync: { fsync: false, delayMs: 0, notify(): void {}, flush: () => Promise.resolve(), close: () => Promise.resolve() },
+    now: () => clock(),
+    spec: () => spec,
+    state: () => "idle",
+    emit: (event) => events.push(event),
+    appendDiarium: async (line) => {
+      diariumLines.push(line);
+      await diarium.append(agent, line); // the real append: validates (I-2) and writes diarium.jsonl
+    },
+  };
+  const receiver = new Receiver(
+    ctx,
+    {
+      onWatchError: (dir, err) => watchErrors.push({ dir, err }),
+      peerOf: (src) => peers.get(src),
+      onStateChange: () => stateChanges.push(stateChanges.length + 1),
+      onCommandStop: async () => assert.fail("commands are round B"),
+      onCommandRestart: async () => assert.fail("commands are round B"),
+      onCommandEnable: async () => assert.fail("commands are round B"),
+      onCommandPing: async () => assert.fail("commands are round B"),
+    },
+    new Map((opts.entries ?? []).map((e) => [e.capability.name, e])),
+    new Map(),
+  );
+  t.after(() => receiver.stop());
+  return { root, agent, inbox, forum, ctx, receiver, events, diariumLines, stateChanges, watchErrors, peers, fileEvents, clock };
+}
+
+/** The `inreq` events of the diarium, with their exchange data. */
+function inreqs(env: Env): { final_status: string; req: RequestFile | null; can: CancellationFile | null; res: ResponseFile | null; con: ConfirmationFile | null }[] {
+  return env.diariumLines
+    .filter((l) => l.event === "inreq")
+    .map((l) => l.event_data as { final_status: string; req: RequestFile | null; can: CancellationFile | null; res: ResponseFile | null; con: ConfirmationFile | null });
+}
+
+const logLines = (env: Env): string[] =>
+  env.diariumLines.filter((l) => l.event === "log").map((l) => l.event_data as unknown as string);
+
+// --- Envelope lifecycle, final-status table (receiver side) ---
+
+test("normal exchange: request → response → confirmation → archive as `confirmed`", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
+  await env.receiver.start((name) => env.fileEvents.push(name));
+  const rid = ulid();
+  const req = makeRequest(rid);
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const res = await readRes(env.inbox, rid);
+  assert.ok(res);
+  assert.ok(validateResponse(res).ok, "the response is schema-valid (self-validated before writing, I-2)");
+  assert.equal(res.response.error, false);
+  assert.equal(res.response.cancellation, false);
+  assert.deepEqual(res.response.result, { ok: true });
+  assert.deepEqual(res.response.attachments, []);
+  assert.equal(res.rid, rid);
+  assert.equal(res.src, "beta"); // the header is the request's, including for the response
+  assert.equal(res.dst, "alpha");
+  assert.match(res.datetime, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/, "a fresh datetime (same header, only datetime changes)");
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req));
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 3_000);
+  assert.equal(env.receiver.runningCount(), 0);
+  const [data] = inreqs(env);
+  assert.ok(data);
+  assert.equal(data.final_status, "confirmed");
+  assert.deepEqual(data.req, req); // the envelopes are stored as exchanged (the request read back from disk)
+  assert.equal(data.can, null);
+  assert.deepEqual(data.res, res);
+  assert.ok(data.con);
+  assert.ok(env.events.some((e) => e.event === "inreq" && e.rid === rid && e.finalStatus === "confirmed"));
+  assert.ok(env.stateChanges.length >= 3, "state changes on accept, on settle and on archive");
+});
+
+test("confirmation timeout: no confirmation → archive as `completed`", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))], confirmTimeout: 80 });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  await writeJson(env.inbox, `${rid}.json`, makeRequest(rid));
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 5_000);
+  const [data] = inreqs(env);
+  assert.ok(data);
+  assert.equal(data.final_status, "completed");
+  assert.ok(data.res);
+  assert.equal(data.con, null);
+});
+
+test("rejected at A0: error response with the code, then `confirmed`", async (t) => {
+  const env = await makeEnv(t, { entries: [] }); // no capabilities at all
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const req = makeRequest(rid, { name: "nope" });
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const res = await readRes(env.inbox, rid);
+  assert.ok(res);
+  assert.equal(res.response.error, true);
+  assert.equal(res.response.cancellation, false);
+  assert.equal(res.response.result.code, 101);
+  assert.match(String(res.response.result.msg), /^unknown_capability/);
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req));
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 3_000);
+  const [data] = inreqs(env);
+  assert.equal(data.final_status, "confirmed");
+});
+
+test("cancelled before acceptance: startup sees req + can → cancellation response → `cancelled`", async (t) => {
+  let called = false;
+  const env = await makeEnv(t, {
+    entries: [makeEntry("echo", async () => {
+      called = true;
+      return { ok: true };
+    })],
+  });
+  const rid = ulid();
+  const req = makeRequest(rid);
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await writeJson(env.inbox, `${rid}.can.json`, makeCancellation(req));
+  await env.receiver.start(() => {});
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const res = await readRes(env.inbox, rid);
+  assert.ok(res);
+  assert.equal(res.response.error, false);
+  assert.equal(res.response.cancellation, true);
+  assert.equal(res.response.result, null);
+  assert.deepEqual(res.response.attachments, []);
+  assert.equal(called, false, "no work is started");
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req));
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 3_000);
+  const [data] = inreqs(env);
+  assert.equal(data.final_status, "cancelled");
+  assert.ok(data.can);
+});
+
+test("cancelled during the work: the signal aborts, cancellation response, `cancelled`", async (t) => {
+  const entry = makeEntry("slow", async (_params, ctx) => {
+    await new Promise<void>((resolve) => {
+      if (ctx.signal.aborted) return resolve();
+      ctx.signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+    return { ok: true };
+  });
+  const env = await makeEnv(t, { entries: [entry] });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const req = makeRequest(rid, { name: "slow" });
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await waitFor(() => env.receiver.runningCount() === 1, 3_000);
+  await writeJson(env.inbox, `${rid}.can.json`, makeCancellation(req));
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const res = await readRes(env.inbox, rid);
+  assert.ok(res);
+  assert.equal(res.response.cancellation, true);
+  assert.equal(res.response.error, false);
+  assert.equal(res.response.result, null);
+  assert.equal(entry.running, 0, "the handler slot is released");
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req));
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 3_000);
+  const [data] = inreqs(env);
+  assert.equal(data.final_status, "cancelled");
+});
+
+test("cancelled after the response: no second response, `cancelled`", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const req = makeRequest(rid);
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const first = await readRes(env.inbox, rid);
+  assert.ok(first);
+  assert.equal(first.response.cancellation, false);
+  await writeJson(env.inbox, `${rid}.can.json`, makeCancellation(req));
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req));
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 3_000);
+  const [data] = inreqs(env);
+  assert.equal(data.final_status, "cancelled");
+  assert.deepEqual(data.res, first, "the original response is kept: no second response is written");
+});
+
+// --- Acceptance codes (104 is intentionally absent) ---
+
+test("100 agent_disabled: a disabled spec rejects new requests", async (t) => {
+  const env = await makeEnv(t, {
+    spec: makeSpec({ disabled: true }),
+    entries: [makeEntry("echo", async () => ({ ok: true }))],
+  });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  await writeJson(env.inbox, `${rid}.json`, makeRequest(rid));
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const res = await readRes(env.inbox, rid);
+  assert.equal(res?.response.result.code, 100);
+  assert.match(String(res?.response.result.msg ?? ""), /^agent_disabled/);
+});
+
+test("102 capability_disabled: a disabled capability rejects", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }), { disabled: true })] });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  await writeJson(env.inbox, `${rid}.json`, makeRequest(rid));
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const res = await readRes(env.inbox, rid);
+  assert.equal(res?.response.result.code, 102);
+});
+
+test("103 requestor_not_allowed: accepts_from not listing the requestor rejects", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }), { accepts_from: ["gamma"] })] });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  await writeJson(env.inbox, `${rid}.json`, makeRequest(rid, { src: "beta" }));
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const res = await readRes(env.inbox, rid);
+  assert.equal(res?.response.result.code, 103);
+});
+
+test("105 invalid_parameters: parameters failing the capability schema reject", async (t) => {
+  const params = { type: "object", properties: { n: { type: "integer" } }, required: ["n"], additionalProperties: false };
+  const env = await makeEnv(t, { entries: [makeEntry("calc", async () => ({ ok: true }), {}, params)] });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  await writeJson(env.inbox, `${rid}.json`, makeRequest(rid, { name: "calc", parameters: { n: "x" } }));
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const res = await readRes(env.inbox, rid);
+  assert.equal(res?.response.result.code, 105);
+});
+
+test("106 namespace_mismatch: only when the requestor is known and shares no namespace", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
+  env.peers.set("beta", makePeer("beta", { namespaces: ["other"] }));
+  env.peers.set("gamma", makePeer("gamma", { namespaces: ["ns1"] }));
+  env.peers.set("delta", makePeer("delta", { namespaces: ["*"] }));
+  await env.receiver.start(() => {});
+  const r1 = ulid();
+  await writeJson(env.inbox, `${r1}.json`, makeRequest(r1, { src: "beta" }));
+  const r2 = ulid();
+  await writeJson(env.inbox, `${r2}.json`, makeRequest(r2, { src: "gamma" }));
+  const r3 = ulid();
+  await writeJson(env.inbox, `${r3}.json`, makeRequest(r3, { src: "delta" }));
+  const r4 = ulid(); // "epsilon" is unknown to peerOf: 106 is skipped
+  await writeJson(env.inbox, `${r4}.json`, makeRequest(r4, { src: "epsilon" }));
+  await waitFor(() =>
+    Promise.all([r1, r2, r3, r4].map((rid) => readRes(env.inbox, rid).then((r) => r !== undefined))).then(
+      (all) => all.every(Boolean),
+    ),
+    3_000,
+  );
+  assert.equal((await readRes(env.inbox, r1))?.response.result.code, 106);
+  assert.equal((await readRes(env.inbox, r2))?.response.error, false, "a shared namespace passes");
+  assert.equal((await readRes(env.inbox, r3))?.response.error, false, '"*" shares every namespace');
+  assert.equal((await readRes(env.inbox, r4))?.response.error, false, "an unknown requestor skips 106");
+});
+
+test("107 capacity_exceeded: at max_parallel the request is rejected, not queued", async (t) => {
+  const gate = deferred();
+  const entry = makeEntry("slot", async () => {
+    await gate.promise;
+    return { ok: true };
+  }, { max_parallel: 1 });
+  const env = await makeEnv(t, { entries: [entry] });
+  await env.receiver.start(() => {});
+  const r1 = ulid();
+  await writeJson(env.inbox, `${r1}.json`, makeRequest(r1, { name: "slot" }));
+  await waitFor(() => env.receiver.runningCount() === 1, 3_000);
+  const r2 = ulid();
+  await writeJson(env.inbox, `${r2}.json`, makeRequest(r2, { name: "slot" }));
+  await waitFor(() => readRes(env.inbox, r2).then((r) => r !== undefined), 3_000);
+  const res2 = await readRes(env.inbox, r2);
+  assert.equal(res2?.response.result.code, 107, "rejected, not queued (queue is always 0)");
+  gate.resolve();
+  await waitFor(() => readRes(env.inbox, r1).then((r) => r !== undefined), 3_000);
+  assert.equal((await readRes(env.inbox, r1))?.response.error, false);
+  assert.equal(entry.running, 0);
+});
+
+test("108 request_expired: a timeout that passed before acceptance rejects (and archives as `completed` on timeout)", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))], confirmTimeout: 80 });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  await writeJson(env.inbox, `${rid}.json`, makeRequest(rid, { ts: 1_600_000_000, timeout: 100 }));
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const res = await readRes(env.inbox, rid);
+  assert.equal(res?.response.result.code, 108);
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 5_000);
+  const [data] = inreqs(env);
+  assert.equal(data.final_status, "completed", "rejected requests archive as completed on confirmation timeout");
+});
+
+// --- Malformed files (D-15) and encrypted bodies (D-14) ---
+
+test("D-15: a schema-violating file is ignored with one log event per (path, mtime)", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
+  await env.receiver.start(() => {});
+  const bad = makeRequest(ulid());
+  delete (bad.request as unknown as Record<string, unknown>).nonce; // schema violation
+  await writeJson(env.inbox, "x.json", bad);
+  await env.receiver.processFile("x.json");
+  const logs = logLines(env);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /^ignored x\.json: /);
+  assert.ok(env.events.some((e) => e.event === "ignored" && e.path.endsWith("x.json")));
+  assert.equal(inreqs(env).length, 0, "no archive");
+  assert.equal(await readRes(env.inbox, "x"), undefined, "never answered");
+  assert.ok((await inboxNames(env.inbox)).includes("x.json"), "the file stays in the inbox");
+  await env.receiver.processFile("x.json"); // same (path, mtime): reported once
+  assert.equal(logLines(env).length, 1);
+  const file = path.join(env.inbox, "x.json");
+  await fsp.utimes(file, new Date(T0 + 10_000), new Date(T0 + 10_000)); // new mtime: a new write attempt
+  await env.receiver.processFile("x.json");
+  assert.equal(logLines(env).length, 2);
+});
+
+test("D-15: a malformed JSON file is ignored and logged", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
+  await env.receiver.start(() => {});
+  await fsp.writeFile(path.join(env.inbox, "bad.json"), "{not json");
+  await env.receiver.processFile("bad.json");
+  const logs = logLines(env);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /^ignored bad\.json: malformed JSON/);
+  assert.equal(inreqs(env).length, 0);
+  assert.ok((await inboxNames(env.inbox)).includes("bad.json"));
+});
+
+test("D-14: a base64 (encrypted) body is ignored and never answered", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const encrypted: RequestFile = {
+    ...makeRequest(rid),
+    request: Buffer.from(JSON.stringify({ ts: 1, nonce: "0".repeat(32), signature: null, name: "echo", parameters: null, timeout: 0, attachments: [] })).toString("base64"),
+  };
+  await writeJson(env.inbox, `${rid}.json`, encrypted);
+  await env.receiver.processFile(`${rid}.json`);
+  const logs = logLines(env);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], new RegExp(`^ignored ${rid}\\.json: base64 body`));
+  assert.equal(await readRes(env.inbox, rid), undefined);
+  assert.equal(inreqs(env).length, 0);
+});
+
+// --- Header consistency (D-11), duplicates (D-5), attachments, stop ---
+
+test("D-11: a confirmation with a mismatched header is ignored; the exchange keeps waiting", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const req = makeRequest(rid);
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req, { src: "gamma" }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(inreqs(env).length, 0, "the mismatched confirmation is not applied");
+  assert.match(logLines(env)[0] ?? "", new RegExp(`ignored ${rid}\\.con\\.json: header mismatch`));
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req));
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 3_000);
+  const [data] = inreqs(env);
+  assert.equal(data.final_status, "confirmed");
+});
+
+test("D-5: a repeated request file is ignored while tracked and after the archive", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const req = makeRequest(rid);
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await env.receiver.processFile(`${rid}.json`); // duplicate while tracked
+  assert.equal(env.receiver.runningCount(), 1);
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req));
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 3_000);
+  assert.equal(inreqs(env).length, 1);
+  await writeJson(env.inbox, `${rid}.json`, req); // seen again after the archive (this run)
+  await env.receiver.processFile(`${rid}.json`);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(inreqs(env).length, 1, "no second exchange");
+  assert.equal(await readRes(env.inbox, rid), undefined, "no second response");
+  assert.deepEqual(await inboxNames(env.inbox), [`${rid}.json`], "the repeated file is ignored, not archived");
+});
+
+test("response attachments: published to the forum, listed in the response, deleted at A4", async (t) => {
+  const seen: { rid?: string; src?: string; attachments?: string[] } = {};
+  const handler: CapabilityHandler = async (_params, ctx) => {
+    seen.rid = ctx.rid;
+    seen.src = ctx.src;
+    seen.attachments = ctx.attachments;
+    const name = await ctx.publishAttachment("art/payload.bin", new TextEncoder().encode("binary payload"));
+    return { ok: true, name };
+  };
+  const env = await makeEnv(t, { entries: [makeEntry("echo", handler)] });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const req = makeRequest(rid, { attachments: ["in/a.bin"] });
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const res = await readRes(env.inbox, rid);
+  assert.ok(res);
+  assert.deepEqual(seen, { rid, src: "beta", attachments: ["in/a.bin"] }, "the handler ctx contract");
+  assert.deepEqual(res.response.attachments, ["art/payload.bin"]);
+  const forumFile = path.join(env.forum, "art", "payload.bin");
+  assert.equal(await fsp.readFile(forumFile, "utf8"), "binary payload");
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req));
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 3_000);
+  await assert.rejects(fsp.access(forumFile), "response attachments are deleted at A4");
+});
+
+test("stop(): an accepted, unanswered request gets an error response with code 300", async (t) => {
+  const gate = deferred();
+  const env = await makeEnv(t, {
+    entries: [makeEntry("slow", async (_params, ctx) => {
+      await new Promise<void>((resolve) => {
+        if (ctx.signal.aborted) return resolve();
+        ctx.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return { ok: true };
+    })],
+  });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const req = makeRequest(rid, { name: "slow" });
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await waitFor(() => env.receiver.runningCount() === 1, 3_000);
+  await env.receiver.stop();
+  const res = await readRes(env.inbox, rid);
+  assert.ok(res);
+  assert.equal(res.response.error, true);
+  assert.equal(res.response.cancellation, false);
+  assert.equal(res.response.result.code, 300);
+  assert.match(String(res.response.result.msg), /^agent_stopping/);
+  assert.equal(inreqs(env).length, 0, "not archived: the files stay for the next start (D-4)");
+  assert.ok((await inboxNames(env.inbox)).includes(`${rid}.json`));
+});
+
+test("a validated command file is left in place untouched (round B scope)", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const cmd = makeRequest(rid, { type: "cmd", name: "ping", parameters: null });
+  await writeJson(env.inbox, `${rid}.json`, cmd);
+  await env.receiver.processFile(`${rid}.json`);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(env.receiver.runningCount(), 0, "no state change");
+  assert.equal(await readRes(env.inbox, rid), undefined, "commands generate no response");
+  assert.equal(inreqs(env).length, 0, "no archive");
+  assert.ok((await inboxNames(env.inbox)).includes(`${rid}.json`), "left in place for round B");
+});
+
+test("a watch error on the own inbox reaches onWatchError (D-22)", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
+  await env.receiver.start(() => {});
+  await fsp.rm(env.inbox, { recursive: true, force: true });
+  await waitFor(() => env.watchErrors.length >= 1, 5_000);
+  assert.equal(env.watchErrors[0].dir, env.inbox);
+});
