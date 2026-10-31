@@ -6,7 +6,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import * as diarium from "../../src/diarium.js";
 import * as io from "../../src/io.js";
 import { announce, buildStatus, health, publishSpec, publishStatus, startHeartbeat } from "../../src/status.js";
@@ -136,67 +136,97 @@ test("publishStatus creates the agent folder when it is missing (tmpDir is the f
   assert.ok(validateStatus((await io.readJson(path.join(root, "status.json"))) as Status).ok);
 });
 
-// --- announce ---
+// --- announce (I-5: the agent folder and the shared nuntium folder are different folders) ---
 
-test("announce writes nuntium/<id>.n.json with the four fields and validates it", async (t) => {
+/** A temp root standing for `.actio`: agent folders live directly at the root, `nuntium/` is shared. */
+async function makeLayout(t: TestContext): Promise<{ root: string; agent: string; nuntium: string }> {
   const root = await makeRoot(t);
-  await announce(root, ID, "agent is active", T0);
-  const file = (await io.readJson(path.join(root, "nuntium", `${ID}.n.json`))) as Announce;
+  const agent = path.join(root, ID);
+  await io.makeDir(agent);
+  return { root, agent, nuntium: path.join(root, "nuntium") };
+}
+
+const announceFile = (nuntium: string): string => path.join(nuntium, `${ID}.n.json`);
+
+test("announce writes <nuntium>/<id>.n.json with the four fields and validates it", async (t) => {
+  const { agent, nuntium } = await makeLayout(t);
+  await announce(agent, nuntium, ID, "agent is active", T0);
+  const file = (await io.readJson(announceFile(nuntium))) as Announce;
   assert.deepEqual(file, { id: ID, datetime: ISO, ts: 1_700_000_000, nuntium: "agent is active" });
   assert.ok(validateAnnounce(file).ok, errorText(validateAnnounce(file)));
   assert.equal(file.ts, Math.floor(T0 / 1000)); // ts is Unix epoch seconds
+  assert.deepEqual(await readLines(path.join(agent, "diarium.jsonl")), [diarium.announceEvent(ID, T0)]);
 });
 
 test("announce creates the nuntium folder and leaves no temp file in the agent folder", async (t) => {
-  const root = await makeRoot(t);
-  await announce(root, ID, "first", T0);
-  assert.deepEqual(await io.listDir(root), ["diarium.jsonl", "nuntium"]); // tmpDir = the agent folder (§2.5)
-  assert.deepEqual(await io.listDir(path.join(root, "nuntium")), ["alpha.n.json"]);
+  const { agent, nuntium } = await makeLayout(t);
+  assert.equal(await io.exists(nuntium), false); // announce creates it
+  await announce(agent, nuntium, ID, "first", T0);
+  assert.deepEqual(await io.listDir(nuntium), ["alpha.n.json"]); // the only content of the shared folder
+  assert.deepEqual(await io.listDir(agent), ["diarium.jsonl"]); // tmpDir = the agent folder (§2.5), no leftovers
+});
+
+test("announce writes the signal to the nuntium folder only, never into the agent folder", async (t) => {
+  const { agent, nuntium } = await makeLayout(t);
+  await publishStatus(agent, buildStatus(ID, "idle", T0));
+  await announce(agent, nuntium, ID, "first", T0);
+  assert.equal(await io.exists(announceFile(nuntium)), true); // where the peers' nuntium watcher looks
+  assert.equal(await io.exists(path.join(agent, `${ID}.n.json`)), false); // not in the agent folder
+  assert.equal(await io.exists(path.join(agent, "nuntium")), false); // no per-agent nuntium folder
+  assert.equal(await io.exists(path.join(agent, "nuntium", `${ID}.n.json`)), false);
+  assert.equal(await io.exists(path.join(agent, "diarium.jsonl")), true); // the event went to the agent folder
+  assert.deepEqual(await io.listDir(agent), ["diarium.jsonl", "status.json"]); // nothing else at all
 });
 
 test("announce appends the diarium announce event after the announce file", async (t) => {
-  const root = await makeRoot(t);
-  await announce(root, ID, "agent is active", T0);
-  await announce(root, ID, "agent is inactive", T0 + 5000);
-  const lines = await readLines(path.join(root, "diarium.jsonl"));
+  const { agent, nuntium } = await makeLayout(t);
+  await announce(agent, nuntium, ID, "agent is active", T0);
+  await announce(agent, nuntium, ID, "agent is inactive", T0 + 5000);
+  const lines = await readLines(path.join(agent, "diarium.jsonl")); // the event is per agent
   assert.deepEqual(lines, [diarium.announceEvent(ID, T0), diarium.announceEvent(ID, T0 + 5000)]);
   for (const line of lines) assert.ok(validateDiarium(line).ok, errorText(validateDiarium(line)));
-  const announceMtime = await mtimeMs(path.join(root, "nuntium", `${ID}.n.json`));
-  const diariumMtime = await mtimeMs(path.join(root, "diarium.jsonl"));
+  const announceMtime = await mtimeMs(announceFile(nuntium));
+  const diariumMtime = await mtimeMs(path.join(agent, "diarium.jsonl"));
   assert.ok(announceMtime <= diariumMtime, "the event records the completed announce, never before it");
 });
 
 test("announce rewrites the same announce file on every announcement", async (t) => {
-  const root = await makeRoot(t);
-  await announce(root, ID, "agent is active", T0);
-  await announce(root, ID, "spec updated", T0 + 60_000);
-  assert.deepEqual(await io.listDir(path.join(root, "nuntium")), ["alpha.n.json"]); // one file per agent
-  assert.deepEqual(await io.readJson(path.join(root, "nuntium", "alpha.n.json")), {
+  const { agent, nuntium } = await makeLayout(t);
+  await announce(agent, nuntium, ID, "agent is active", T0);
+  await announce(agent, nuntium, ID, "spec updated", T0 + 60_000);
+  assert.deepEqual(await io.listDir(nuntium), ["alpha.n.json"]); // one file per agent, rewritten
+  assert.deepEqual(await io.readJson(announceFile(nuntium)), {
     id: ID,
     datetime: "2023-11-14T22:14:20Z",
     ts: 1_700_000_060,
     nuntium: "spec updated",
   });
+  assert.deepEqual(await readLines(path.join(agent, "diarium.jsonl")), [
+    diarium.announceEvent(ID, T0),
+    diarium.announceEvent(ID, T0 + 60_000),
+  ]);
 });
 
 test("announce throws on an invalid announce document and writes nothing", async (t) => {
-  const root = await makeRoot(t);
-  await assert.rejects(() => announce(root, "bad id", "x", T0), /status\.ts: invalid announce file/); // agentId pattern
-  await assert.rejects(() => announce(root, ID, "x", -5000), /status\.ts: invalid announce file/); // negative ts
-  assert.deepEqual(await io.listDir(root), []); // no nuntium folder, no diarium line
+  const { agent, nuntium } = await makeLayout(t);
+  const invalidThrown = /status\.ts: invalid announce file/; // self-validation before any write (I-2)
+  await assert.rejects(() => announce(agent, nuntium, "bad id", "x", T0), invalidThrown); // agentId pattern
+  await assert.rejects(() => announce(agent, nuntium, ID, "x", -5000), invalidThrown); // negative ts
+  assert.equal(await io.exists(nuntium), false); // the nuntium folder was not even created
+  assert.deepEqual(await io.listDir(agent), []); // and no diarium line
 });
 
 test("rule 2 ordering: status.json is written before the announce file", async (t) => {
-  const root = await makeRoot(t);
+  const { agent, nuntium } = await makeLayout(t);
   const clock = fakeClock(T0);
-  await publishStatus(root, buildStatus(ID, "idle", clock())); // status first
+  await publishStatus(agent, buildStatus(ID, "idle", clock())); // status first, in the agent folder
   await sleep(50); // announceDelay, applied by the caller
-  await announce(root, ID, "agent is active", clock()); // then the announce file
-  const statusMtime = await mtimeMs(path.join(root, "status.json"));
-  const announceMtime = await mtimeMs(path.join(root, "nuntium", `${ID}.n.json`));
+  await announce(agent, nuntium, ID, "agent is active", clock()); // then the announce file, in nuntium
+  const statusMtime = await mtimeMs(path.join(agent, "status.json"));
+  const announceMtime = await mtimeMs(announceFile(nuntium));
   assert.ok(statusMtime < announceMtime, `status ${statusMtime} must precede announce ${announceMtime}`);
-  assert.ok(validateStatus((await io.readJson(path.join(root, "status.json"))) as Status).ok);
-  assert.ok(validateAnnounce((await io.readJson(path.join(root, "nuntium", `${ID}.n.json`))) as Announce).ok);
+  assert.ok(validateStatus((await io.readJson(path.join(agent, "status.json"))) as Status).ok);
+  assert.ok(validateAnnounce((await io.readJson(announceFile(nuntium))) as Announce).ok);
 });
 
 // --- health (*Agent's status* rules 4–8) ---
