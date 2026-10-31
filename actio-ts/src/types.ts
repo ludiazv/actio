@@ -112,8 +112,9 @@ export interface ActioConfig {
 export interface AgentOptions {
   id: AgentId;
   description: string;
-  /** Absent = not set in spec.json; null = explicit null; [] = empty; ["*"] = all namespaces. */
-  namespaces?: string[] | null;
+  /** Absent = not set in spec.json; null = explicit null; [] = empty; ["*"] = all namespaces.
+   * Items may be strings or the JSON literal null (the void namespace) — widened in I-9. */
+  namespaces?: (string | null)[] | null;
   depends?: string[];
   wants?: string[];
   acceptsCommandsFrom: string[];
