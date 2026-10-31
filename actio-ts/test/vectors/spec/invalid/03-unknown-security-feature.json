@@ -1,0 +1,13 @@
+{
+  "id": "summarizer",
+  "actio_version": "0.1",
+  "datetime": "2026-10-24T09:00:00Z",
+  "description": "x",
+  "accepts_commands_from": [],
+  "capabilities": [],
+  "security_support": [
+    "sign",
+    "magic"
+  ],
+  "security_posture": "trusted"
+}

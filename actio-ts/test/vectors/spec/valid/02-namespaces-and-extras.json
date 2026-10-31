@@ -1,0 +1,34 @@
+{
+  "id": "summarizer",
+  "actio_version": "0.1",
+  "datetime": "2026-10-24T09:00:00Z",
+  "description": "Summarizes texts",
+  "namespaces": [
+    null,
+    "*",
+    "team-a"
+  ],
+  "depends": [
+    "planner"
+  ],
+  "wants": [
+    "archiver"
+  ],
+  "disabled": false,
+  "accepts_commands_from": [],
+  "capabilities": [],
+  "security_support": [
+    "sign",
+    "encrypt"
+  ],
+  "security_posture": "untrusted",
+  "security": [
+    {
+      "key": "public_key",
+      "value": "spki-base64"
+    }
+  ],
+  "info": {
+    "url": "https://example.org/summarizer"
+  }
+}

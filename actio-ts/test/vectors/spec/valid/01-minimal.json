@@ -1,0 +1,12 @@
+{
+  "id": "summarizer",
+  "actio_version": "0.1",
+  "datetime": "2026-10-24T09:00:00Z",
+  "description": "Summarizes texts",
+  "accepts_commands_from": [
+    "planner"
+  ],
+  "capabilities": [],
+  "security_support": [],
+  "security_posture": "trusted"
+}

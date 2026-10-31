@@ -1,0 +1,13 @@
+{
+  "rid": "01JB7Q3W8K2M4N6P8R0S2T4V6X",
+  "src": "planner",
+  "dst": "summarizer",
+  "datetime": "2026-10-24T10:01:12Z",
+  "type": "req",
+  "actio_version": "0.1",
+  "confirmation": {
+    "ts": 1792836072,
+    "nonce": "050dd73f1237d5aea4583c515a3fe777",
+    "signature": null
+  }
+}

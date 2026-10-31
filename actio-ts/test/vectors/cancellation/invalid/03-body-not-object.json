@@ -1,0 +1,9 @@
+{
+  "rid": "01JB7Q3W8K2M4N6P8R0S2T4V6X",
+  "src": "planner",
+  "dst": "summarizer",
+  "datetime": "2026-10-24T10:00:05Z",
+  "type": "req",
+  "actio_version": "0.1",
+  "cancellation": 42
+}
