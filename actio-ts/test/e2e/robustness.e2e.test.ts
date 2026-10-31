@@ -884,12 +884,12 @@ test("E21: own inbox deleted → error; a dst inbox deleted in B2 → abandoned"
   await waitFor(() => statusOf(h.root, "beta").then((s) => s.status === "error"), 6_000);
   await waitFor(async () => (await announceOf(h.root, "beta")).nuntium.includes("failed"), 6_000);
   const betaStatusEvents = async (): Promise<string[]> => diaryStatuses(await diaries(h.root, "beta"));
-  assert.ok(streamLogs(p.eb).some((m) => /watch error/.test(m)), "the watch error is reported (D-22)");
+  assert.ok(streamLogs(p.eb).some((m) => /^watch lost /.test(m)), "the watch loss is reported (D-22 text, R2-5)");
   assert.deepEqual(await betaStatusEvents(), ["idle", "error"], "exactly one status change: idle → error");
   assert.ok(streamStatuses(p.eb).includes("error"), "status error is observable");
   const failed = await announceOf(h.root, "beta");
   assert.equal(failed.id, "beta");
-  assert.match(failed.nuntium, /^agent beta failed: watch error in /);
+  assert.match(failed.nuntium, /^agent beta failed: watch lost /);
   await sleep(700); // two heartbeat intervals: the heartbeat keeps status.json, it never recovers the state
   const stillError = (await statusOf(h.root, "beta")).status;
   assert.equal(stillError, "error", "no recovery transition (spec note after the workflow)");
@@ -917,7 +917,7 @@ test("E21: own inbox deleted → error; a dst inbox deleted in B2 → abandoned"
 
   const out = await outP;
   assert.equal(out.finalStatus, "abandoned", "the dst watch error abandons the exchanges waiting on that folder");
-  assert.ok(streamLogs(p.ea).some((m) => /watch error/.test(m)), "the dst watch error is logged");
+  assert.ok(streamLogs(p.ea).some((m) => /^watch lost /.test(m)), "the dst watch loss is logged (D-22 text)");
   await waitFor(() => statusOf(h.root, "alpha").then((s) => s.status === "idle"), 6_000);
   const aLines = await diaries(h.root, "alpha");
   assert.deepEqual(finalsOf(aLines, "outreq"), ["abandoned"]);

@@ -12,7 +12,8 @@
 //   the spec file; 102/103 rewrite the live capability object (buildSpec carries it by reference);
 //   106 rewrites the live namespaces array in place, after a `restart` (D-10) established the view.
 // - 105/107/108 produce real responses: 108 through a request file written directly into
-//   beta's inbox.
+//   beta's inbox. R2-4 (WP7-C-1) adds a second scenario that uses the same idiom for 106: the peer
+//   is a namespace-disjoint one, which the callability rules keep out of the Agmen view for good.
 // - E7: the requestor cannot cancel after it captured a response (giveUp bails on ex.res !== null),
 //   so the e2e variant stops the requestor before the response is written; the receiver side is
 //   exactly A.4 (cancellation after the response, single response with cancellation=false).
@@ -29,7 +30,9 @@ import { nonce, toIso, ulid } from "../../src/util.js";
 import { validateDiarium } from "../../src/validate.js";
 import { fastConfig, recordInbox, waitFor } from "../helpers/index.js";
 import type { ActioConfig, ActioEvent, AgentOptions, CapabilityHandler } from "../../src/types.js";
-import type { Capability, DiariumLine, Exchange, RequestFile, ResponseBody, Spec, Status } from "../../src/generated/types.js";
+import type {
+  Capability, DiariumLine, Exchange, RequestFile, ResponseBody, ResponseFile, Spec, Status,
+} from "../../src/generated/types.js";
 
 /** A stuck exchange fails the test instead of hanging the suite. */
 const opts = { timeout: 30_000 };
@@ -763,4 +766,61 @@ test("E9: receiver inactive — outreq `abandoned`, attachments removed, files s
   // (a) req and can appeared, in order, and (per (b) below) neither was ever removed
   const [rid9] = [...byRid(rec).keys()];
   assert.deepEqual(appearedSeq(rec, rid9), ["req", "can"]);
+});
+// --- R2-4 (WP7-C-1): a real 106, from a peer the callability rules discarded -----------------------
+
+test("R2-4: a discovered peer with no shared namespace is answered 106", opts, async (t) => {
+  const h = await harness(t);
+  // A0 judges the request against the spec the last scan DISCOVERED, not against the Agmen view (the
+  // view of WP4 is filtered by callability, so a namespace-disjoint peer is not in it at all). The
+  // envelope is written directly: gamma's own agent cannot send it, the local gate of request() (WP7)
+  // refuses a peer that is not in the view. The idiom is E3's 108.
+  const g = makeAgent(h, "gamma", { namespaces: ["blue"] }, { nuntiumDebounce: 30_000 });
+  await g.agent.start();
+  const b = makeAgent(h, "beta", { namespaces: ["red"], acceptsCommandsFrom: [] }, { nuntiumDebounce: 30_000 });
+  b.agent.capability(ECHO, echoHandler);
+  await b.agent.start();
+  assert.equal(b.agent.agmen().has("gamma"), false, "rule 2 of callability discards the peer");
+  const rec = recordInbox(path.join(h.root, "beta", "inbox"));
+  const rid = ulid();
+  const now = Date.now();
+  const req: RequestFile = {
+    rid,
+    src: "gamma",
+    dst: "beta",
+    datetime: toIso(now),
+    type: "req",
+    actio_version: "0.1",
+    request: {
+      ts: Math.floor(now / 1000),
+      nonce: nonce(),
+      signature: null,
+      name: "echo",
+      parameters: { text: "x" },
+      timeout: 0, // never expires: the answer must be 106, not 108
+      attachments: [],
+    },
+  };
+  await io.writeJsonAtomic(path.join(h.root, "beta", "inbox", `${rid}.json`), req, path.join(h.root, "gamma"));
+  await waitFor(() => io.exists(path.join(h.root, "beta", "inbox", `${rid}.res.json`)), 8_000);
+  const res = JSON.parse(
+    await fsp.readFile(path.join(h.root, "beta", "inbox", `${rid}.res.json`), "utf8"),
+  ) as ResponseFile;
+  const body = res.response as ResponseBody; // core profile: unencrypted (D-14)
+  assert.equal(res.rid, rid, "the response header comes from the request header (D-11)");
+  assert.equal(body.error, true);
+  assert.equal((body.result as { code: number }).code, 106, "namespace_mismatch");
+  assert.match(String((body.result as { msg: string }).msg), /^namespace_mismatch: no shared namespace/);
+  // (b) no requestor is alive for this rid, so the confirmation times out (D-13) and the archive
+  // empties the inbox.
+  await waitFor(() => inboxNames(h.root, "beta").then((n) => n.length === 0), 8_000);
+  rec.stop();
+  // (a) the receiver inbox saw req then res; no con ever appears
+  assert.deepEqual(appearedSeq(rec, rid), ["req", "res"], "appearances in protocol order");
+  // (c) the diaria validate, and beta archived the exchange as completed (never confirmed)
+  await assertDiariaValid(h.root, ["beta", "gamma"]);
+  assert.deepEqual(finalsOf(await diaries(h.root, "beta"), "inreq"), ["completed"]);
+  assert.deepEqual(finalsOf(await diaries(h.root, "gamma"), "outreq"), [], "gamma's agent never sent it");
+  // (d) no attachments were involved
+  assert.deepEqual(await forumNames(h.root), [], "the forum is untouched");
 });

@@ -1,6 +1,6 @@
 // Spec builder (WP7): turns the agent options and the registered capabilities into a valid spec.json.
 import { toIso } from "./util.js";
-import { uniqueCapabilityNames, validateSpec } from "./validate.js";
+import { validateSpec } from "./validate.js";
 import type { Capability, Spec } from "./generated/types.js";
 import type { AgentOptions } from "./types.js";
 
@@ -40,12 +40,9 @@ export function buildSpec(options: AgentOptions, capabilities: Capability[], now
   // `info` is free content: the schema only requires an object (the self-validation below rejects the
   // rest), it is not validated field by field, and it is carried by reference, like the capabilities.
   if (options.info !== undefined) spec.info = options.info as Spec["info"];
-  // `disabled` is never written here: the state lives in status.json (D-6); the `enable` command (D2)
-  // is what later rewrites this field. `security` stays absent too: the core profile has no keys.
+  // `disabled` is never written here: it lives in spec.json, the `enable` command (D2) is what rewrites
+  // it during a run, and a fresh start clears it again (D-10). `security` stays absent too: core has no keys.
 
-  if (!uniqueCapabilityNames(spec)) {
-    throw new Error(`spec-builder: capability names are not unique in agent "${options.id}"`); // belt and braces
-  }
   const checked = validateSpec(spec); // I-2: a failing build is our bug, and it must not reach the tree
   if (!checked.ok) {
     throw new Error(`spec-builder: invalid spec for agent "${options.id}": ${checked.errors.join("; ")}`);

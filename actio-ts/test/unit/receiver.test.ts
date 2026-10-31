@@ -12,7 +12,6 @@ import * as io from "../../src/io.js";
 import type {
   ActioEvent,
   AgentContext,
-  AgentView,
   CapabilityContext,
   CapabilityEntry,
   CapabilityHandler,
@@ -32,7 +31,7 @@ import type {
   Status,
 } from "../../src/generated/types.js";
 import { compileCapability, validateResponse } from "../../src/validate.js";
-import { nonce, toIso, ulid } from "../../src/util.js";
+import { nonce, sleep, toIso, ulid } from "../../src/util.js";
 import { fakeClock, makeRoot, waitFor } from "../helpers/index.js";
 
 const T0 = 1_700_000_000_000;
@@ -53,11 +52,9 @@ function makeSpec(over: Partial<Spec> = {}): Spec {
   };
 }
 
-/** A peer AgentView for the `peerOf` hook (code 106). */
-function makePeer(id: string, over: Partial<Spec> = {}): AgentView {
-  const spec = makeSpec({ id, ...over });
-  const status: Status = { id, status: "idle", datetime: ISO0, capability_status: [] };
-  return { id, folder: `/tmp/${id}`, spec, status, health: "healthy", commands: false, capabilities: new Map() };
+/** A peer spec for the `peerSpec` hook (D-7 code 106): what the last scan DISCOVERED, I-11. */
+function makePeerSpec(id: string, over: Partial<Spec> = {}): Spec {
+  return makeSpec({ id, ...over });
 }
 
 /** A CapabilityEntry with a strict default parameters/result schema (D-19). */
@@ -157,7 +154,7 @@ interface Env {
   commandCalls: string[];
   stateChanges: number[];
   watchErrors: { dir: string; err: Error }[];
-  peers: Map<string, AgentView>;
+  peers: Map<string, Spec>;
   fileEvents: string[];
   clock: ReturnType<typeof fakeClock>;
 }
@@ -174,6 +171,8 @@ async function makeEnv(
     commands?: Record<string, CommandHandler>;
     /** Replace some built-in command hook; the default one records the call in `commandCalls`. */
     hooks?: Partial<ReceiverHooks>;
+    /** Awaited inside `appendDiarium`, after the line: holds an archive in flight (D-5 test). */
+    diariumGate?: () => Promise<void>;
   } = {},
 ): Promise<Env> {
   // Registered BEFORE makeRoot's cleanup hook: node:test runs after-hooks in registration order,
@@ -195,7 +194,7 @@ async function makeEnv(
   const commandCalls: string[] = [];
   const stateChanges: number[] = [];
   const watchErrors: { dir: string; err: Error }[] = [];
-  const peers = new Map<string, AgentView>();
+  const peers = new Map<string, Spec>();
   const fileEvents: string[] = [];
   const ctx: AgentContext = {
     config: {
@@ -219,13 +218,14 @@ async function makeEnv(
     appendDiarium: async (line) => {
       diariumLines.push(line);
       await diarium.append(agent, line); // the real append: validates (I-2) and writes diarium.jsonl
+      if (opts.diariumGate) await opts.diariumGate(); // the archive stays in flight while the gate holds
     },
   };
   receiver = new Receiver(
     ctx,
     {
       onWatchError: (dir, err) => watchErrors.push({ dir, err }),
-      peerOf: (src) => peers.get(src),
+      peerSpec: (src) => peers.get(src),
       onStateChange: () => stateChanges.push(stateChanges.length + 1),
       onCommandStop: async (force) => {
         commandCalls.push(`stop(force=${force})`);
@@ -490,11 +490,13 @@ test("105 invalid_parameters: parameters failing the capability schema reject", 
   assert.equal(res?.response.result.code, 105);
 });
 
-test("106 namespace_mismatch: only when the requestor is known and shares no namespace", async (t) => {
+test("106 namespace_mismatch: only when the requestor was discovered and shares no namespace", async (t) => {
   const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
-  env.peers.set("beta", makePeer("beta", { namespaces: ["other"] }));
-  env.peers.set("gamma", makePeer("gamma", { namespaces: ["ns1"] }));
-  env.peers.set("delta", makePeer("delta", { namespaces: ["*"] }));
+  // I-11: the hook hands over the DISCOVERED spec (before the callability rules), which is what makes 106
+  // reachable at all: a peer whose namespaces are disjoint never reaches the Agmen view.
+  env.peers.set("beta", makePeerSpec("beta", { namespaces: ["other"] }));
+  env.peers.set("gamma", makePeerSpec("gamma", { namespaces: ["ns1"] }));
+  env.peers.set("delta", makePeerSpec("delta", { namespaces: ["*"] }));
   await env.receiver.start(() => {});
   const r1 = ulid();
   await writeJson(env.inbox, `${r1}.json`, makeRequest(r1, { src: "beta" }));
@@ -502,7 +504,7 @@ test("106 namespace_mismatch: only when the requestor is known and shares no nam
   await writeJson(env.inbox, `${r2}.json`, makeRequest(r2, { src: "gamma" }));
   const r3 = ulid();
   await writeJson(env.inbox, `${r3}.json`, makeRequest(r3, { src: "delta" }));
-  const r4 = ulid(); // "epsilon" is unknown to peerOf: 106 is skipped
+  const r4 = ulid(); // "epsilon" is unknown to peerSpec: 106 is skipped
   await writeJson(env.inbox, `${r4}.json`, makeRequest(r4, { src: "epsilon" }));
   await waitFor(() =>
     Promise.all([r1, r2, r3, r4].map((rid) => readRes(env.inbox, rid).then((r) => r !== undefined))).then(
@@ -511,6 +513,7 @@ test("106 namespace_mismatch: only when the requestor is known and shares no nam
     3_000,
   );
   assert.equal((await readRes(env.inbox, r1))?.response.result.code, 106);
+  assert.match(String((await readRes(env.inbox, r1))?.response.result.msg), /^namespace_mismatch: no shared namespace with "beta"$/);
   assert.equal((await readRes(env.inbox, r2))?.response.error, false, "a shared namespace passes");
   assert.equal((await readRes(env.inbox, r3))?.response.error, false, '"*" shares every namespace');
   assert.equal((await readRes(env.inbox, r4))?.response.error, false, "an unknown requestor skips 106");
@@ -1175,4 +1178,29 @@ test("D-4: the initial scan runs every pending command (all complete; the rid se
   // under load, so it is NOT asserted here (the deterministic order test above covers the property).
   assert.deepEqual(inreqs(env).map((d) => d.final_status).sort(), ["completed", "completed", "completed"]);
   assert.deepEqual([...inreqs(env).map((d) => d.req!.rid)].sort(), rows.map(([rid]) => rid).sort());
+});
+
+test("one archive per exchange: a confirmation landing mid-archive adds no second `inreq` (D-5, D-13)", async (t) => {
+  // A4 starts on the confirmTimeout and awaits; while it is in flight the confirmation of the same rid
+  // lands. The exchange is already closed (`completed`, D-13): a second attempt must not append a second
+  // `inreq` for one rid (D-5), and the archive's own file sweep takes the late confirmation with it.
+  let open!: () => void;
+  const gate = new Promise<void>((resolve) => { open = resolve; });
+  const env = await makeEnv(t, {
+    entries: [makeEntry("echo", async () => ({ ok: true }))],
+    confirmTimeout: 40,
+    diariumGate: () => gate, // holds the archive right after its diarium line
+  });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const req = makeRequest(rid);
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  await waitFor(() => inreqs(env).length > 0, 3_000); // the timeout archive has begun and is held
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req)); // lands inside the in-flight window
+  await sleep(30); // let the watcher deliver it while the gate still holds
+  open(); // the archive resumes and sweeps the files of the rid
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 3_000);
+  assert.equal(inreqs(env).length, 1, "one exchange, one archive (D-5)");
+  assert.equal(inreqs(env)[0]?.final_status, "completed", "the confirmTimeout ended it (D-13)");
 });

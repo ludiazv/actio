@@ -21,7 +21,6 @@ import {
 import type {
   AgentContext,
   AgentId,
-  AgentView,
   CapabilityEntry,
   CommandHandler,
   InreqFinalStatus,
@@ -44,8 +43,10 @@ import type {
 export interface ReceiverHooks {
   /** Watch error on the own inbox (D-22): the agent logs and fails itself. */
   onWatchError(dir: string, err: Error): void;
-  /** The Agmen view of a peer (D-7 code 106); undefined when the requestor is unknown. */
-  peerOf(src: AgentId): AgentView | undefined;
+  /** I-11: the requestor's spec as DISCOVERED by the last scan (before the callability rules, R2-4),
+   * or undefined when the scan did not find it: D-7's code 106 needs exactly this view, because a peer
+   * with no shared namespace is never in the Agmen view. */
+  peerSpec(src: AgentId): Spec | undefined;
   /** A busy/idle-relevant exchange state changed (D-8). */
   onStateChange(): void;
   /** Built-in commands that change the lifecycle; the receiver archives first (D3). */
@@ -585,8 +586,8 @@ export class Receiver {
     if (!entry.compiled.validateParams(request.parameters ?? {})) {
       return { ok: false, code: 105, msg: `invalid_parameters: parameters of "${request.name}" do not conform` };
     }
-    const peer = this.hooks.peerOf(src);
-    if (peer !== undefined && !sharesNamespace(this.ctx.spec(), peer.spec)) {
+    const peer = this.hooks.peerSpec(src); // I-11: the discovered spec, not the filtered Agmen view
+    if (peer !== undefined && !sharesNamespace(this.ctx.spec(), peer)) {
       return { ok: false, code: 106, msg: `namespace_mismatch: no shared namespace with "${src}"` };
     }
     const maxParallel = entry.capability.actio.max_parallel ?? 0; // 0 = unbounded
@@ -701,7 +702,11 @@ export class Receiver {
    * No `stopped` guard: `stop()` itself awaits these archives (R1-2); after `stop()` no other entry
    * point can trigger one (every dispatcher is `stopped`-guarded and the timers are cleared). */
   private async archive(ex: ExchangeState): Promise<void> {
-    if (!this.exchanges.has(ex.rid)) return;
+    // One archive per rid: `archived` is marked BEFORE the first await, so an envelope landing while
+    // this archive is still in flight (a confirmation after the confirmTimeout had already armed A4)
+    // cannot append a second `inreq` for the same exchange (D-5).
+    if (!this.exchanges.has(ex.rid) || this.archived.has(ex.rid)) return;
+    this.archived.add(ex.rid); // D-5: the same rid is never archived twice in this run
     if (ex.confirmTimer) {
       clearTimeout(ex.confirmTimer);
       ex.confirmTimer = undefined;
@@ -716,7 +721,6 @@ export class Receiver {
       await io.remove(path.join(this.ctx.folders.forum, name));
     }
     this.exchanges.delete(ex.rid);
-    this.archived.add(ex.rid); // D-5
     this.ctx.emit({ event: "inreq", rid: ex.rid, finalStatus });
     this.hooks.onStateChange();
   }

@@ -12,11 +12,12 @@ import { ActioAgent } from "../../src/agent.js";
 import * as io from "../../src/io.js";
 import { buildSpec } from "../../src/spec-builder.js";
 import { buildStatus } from "../../src/status.js";
-import { sleep, toIso } from "../../src/util.js";
+import { nonce, sleep, toIso, ulid } from "../../src/util.js";
 import { ActioCallError, ActioResultError } from "../../src/types.js";
 import { fastConfig, waitFor } from "../helpers/index.js";
 import type { ActioConfig, ActioEvent, AgentOptions, CapabilityHandler, CommandContext } from "../../src/types.js";
-import type { Announce, Capability, DiariumLine, Spec, Status } from "../../src/generated/types.js";
+import type { Announce, Capability, DiariumLine, RequestFile, Spec, Status }
+  from "../../src/generated/types.js";
 
 /** Each test gets a timeout: a stuck exchange fails the test instead of hanging the suite. */
 const opts = { timeout: 20_000 };
@@ -287,8 +288,8 @@ test("a deleted own inbox is a watch error: log event, status error, announce (D
   await fsp.rm(inbox, { recursive: true, force: true });
   await waitFor(async () => (await statusOf(h.root, "alpha")).status === "error", 6_000);
   const logs = ea.filter((e) => e.event === "log").map((e) => e.message);
-  assert.ok(logs.some((m) => m.includes("watch error") && m.includes(inbox)), JSON.stringify(logs));
-  assert.match((await announceOf(h.root, "alpha")).nuntium, /^agent alpha failed: watch error in /);
+  assert.ok(logs.some((m) => m === `watch lost ${inbox}: ENOENT`), JSON.stringify(logs)); // D-22 text
+  assert.match((await announceOf(h.root, "alpha")).nuntium, /^agent alpha failed: watch lost /);
   assert.ok(statusEvents(await diaryOf(h.root, "alpha")).includes("error"));
   await sleep(300); // beats and possible scans must not undo the error state
   assert.equal((await statusOf(h.root, "alpha")).status, "error", "error has no recovery transition");
@@ -528,4 +529,249 @@ test("a broadcast signal in nuntium triggers a full rescan (D-17)", opts, async 
   await waitFor(() => a.agmen().has("gamma"), 6_000);
   assert.equal(a.agmen().get("gamma")?.health, "healthy");
   assert.deepEqual([...(a.agmen().get("gamma")?.capabilities.keys()) ?? []], ["echo"]);
+});
+
+// --- the R2 regressions (WP7-C-1): one test per finding; the oracle's probes are separate -----------
+
+/** A request envelope as a peer would write it: the local gate of `request()` refuses to produce one. */
+function requestFile(
+  rid: string,
+  src: string,
+  dst: string,
+  name: string,
+  parameters: { [k: string]: unknown },
+): RequestFile {
+  const now = Date.now();
+  return {
+    rid,
+    src,
+    dst,
+    datetime: toIso(now),
+    type: "req",
+    actio_version: "0.1",
+    request: {
+      ts: Math.floor(now / 1000),
+      nonce: nonce(),
+      signature: null,
+      name,
+      parameters,
+      timeout: 0, // 0 = no timeout: nothing here has to expire
+      attachments: [],
+    },
+  };
+}
+
+/** Gamma (the delegate) and alpha (a handler that delegates to gamma); both started. */
+async function delegating(
+  h: Harness,
+  timers: Partial<ActioConfig>,
+  onInner: (finalStatus: string) => void,
+): Promise<{ a: ActioAgent; g: ActioAgent }> {
+  const g = agent(h, "gamma", { acceptsCommandsFrom: [] }, {
+    ...timers, stopGrace: 200, confirmTimeout: 30_000, // its own timeout must not compete with the stop
+  });
+  g.agent.capability(SLOW, slowHandler);
+  await g.agent.start();
+  const a = agent(h, "alpha", { acceptsCommandsFrom: [] }, timers);
+  const RELAY: Capability = { ...SLOW, name: "relay" };
+  a.agent.capability(RELAY, async (params) => {
+    const inner = await a.agent.request("gamma", "slow", params); // the delegation (planner.ts does this)
+    onInner(inner.finalStatus);
+    if (inner.finalStatus !== "confirmed") throw new Error(`relay: no result (${inner.finalStatus})`);
+    return inner.response!.result;
+  });
+  await a.agent.start();
+  return { a: a.agent, g: g.agent };
+}
+
+test("R2-1: enable(false) survives the heartbeat and ping; only a fresh start clears it (D-10)", opts, async (t) => {
+  const h = await harness(t);
+  const timers = { nuntiumDebounce: 10_000, heartbeatInterval: 100 };
+  const b = agent(h, "beta", { acceptsCommandsFrom: ["alpha"] }, timers);
+  b.agent.capability(ECHO, echoHandler);
+  await b.agent.start();
+  const a = agent(h, "alpha", { acceptsCommandsFrom: ["beta"] }, timers); // its view of beta stays as it is
+  a.agent.capability(ECHO, echoHandler);
+  await a.agent.start();
+  await a.agent.command("beta", "enable", { enabled: false });
+  await waitFor(async () => (await specOf(h.root, "beta")).disabled === true, 6_000);
+  const statusFile = path.join(h.root, "beta", "status.json");
+  const beaten = await mtimeOf(statusFile);
+  await sleep(400); // four beats: they rewrite status.json, they do not touch the enabled state
+  assert.ok((await mtimeOf(statusFile)) > beaten, "the heartbeat ran");
+  assert.equal((await specOf(h.root, "beta")).disabled, true, "a beat does not re-enable the agent");
+  await a.agent.command("beta", "ping"); // the rebuild that used to drop `disabled`: probe P1
+  await waitFor(async () => (await announceOf(h.root, "beta")).nuntium === "agent beta is alive", 6_000);
+  assert.equal((await specOf(h.root, "beta")).disabled, true, "ping must not change the enabled state");
+  const rejected = await a.agent.request("beta", "echo", { text: "x" });
+  assert.equal((rejected.response?.result as { code: number }).code, 100, "and A0 still answers 100");
+  await a.agent.command("beta", "restart", { force: false, delay: 0 });
+  await waitFor(async () => (await announceOf(h.root, "beta")).nuntium === "agent beta is active", 8_000);
+  assert.equal((await specOf(h.root, "beta")).disabled, undefined, "D-10: a restart rebuilds from the options");
+  const again = await a.agent.request("beta", "echo", { text: "fresh" });
+  assert.deepEqual(again.response?.result, { text: "echo: fresh" }, "the restarted agent serves again");
+});
+
+test("R2-2: a graceful stop lets a delegating handler finish inside stopGrace (D-9 order)", opts, async (t) => {
+  const h = await harness(t);
+  const timers = { nuntiumDebounce: 10_000, stopGrace: 3_000 };
+  let innerFinal = "";
+  const { a } = await delegating(h, timers, (s) => (innerFinal = s));
+  const c = agent(h, "client", { acceptsCommandsFrom: [] }, timers);
+  await c.agent.start();
+  await waitFor(() => c.agent.agmen().has("alpha") && a.agmen().has("gamma"), 6_000);
+  const pending = c.agent.request("alpha", "relay", { seconds: 0.4 }, { timeout: 0 });
+  await waitFor(async () => (await statusOf(h.root, "alpha")).status === "busy", 6_000);
+  await a.stop(); // force=false: the grace (3 s) is longer than the work (0.4 s)
+  const out = await pending;
+  assert.equal(out.response?.error, false, "the in-flight work finished inside the grace (probe P2)");
+  assert.deepEqual(out.response?.result, { slept: 0.4 }, "the client got the result, not code 300");
+  assert.equal(innerFinal, "confirmed", "and its inner request got its answer, the requestor stayed alive");
+  assert.deepEqual(finalsOf(await diaryOf(h.root, "alpha"), "outreq"), ["confirmed"], "alpha confirmed itself");
+  // The client's confirmation of the relay exchange cannot be awaited: lane C archives the inbound
+  // exchange as soon as the work is done, so whichever envelope existed at that moment decides it (D-13).
+  const inbound = finalsOf(await diaryOf(h.root, "alpha"), "inreq");
+  assert.equal(inbound.length, 1, "one archive for one exchange (D-5)");
+  assert.ok(inbound[0] === "confirmed" || inbound[0] === "completed", `the archive happened, ending: ${inbound[0]}`);
+  // gamma is served by the confirmation of alpha's requestor, which stayed alive for the whole grace: the
+  // line takes two watcher hops to appear, so it is waited for, then pinned.
+  await waitFor(async () => (await finalsOf(await diaryOf(h.root, "gamma"), "inreq")).length === 1, 6_000);
+  assert.deepEqual(finalsOf(await diaryOf(h.root, "gamma"), "inreq"), ["confirmed"], "gamma served it");
+});
+
+test("R2-2: force=true skips the wait: the client gets 300, the inner request is abandoned (D-9)", opts, async (t) => {
+  const h = await harness(t);
+  const timers = { nuntiumDebounce: 10_000, stopGrace: 3_000 };
+  let innerFinal = "";
+  const { a } = await delegating(h, timers, (s) => (innerFinal = s));
+  const c = agent(h, "client", { acceptsCommandsFrom: [] }, timers);
+  await c.agent.start();
+  await waitFor(() => c.agent.agmen().has("alpha") && a.agmen().has("gamma"), 6_000);
+  const pending = c.agent.request("alpha", "relay", { seconds: 3 }, { timeout: 0 }); // outlives the stop
+  await waitFor(async () => (await statusOf(h.root, "alpha")).status === "busy", 6_000);
+  await a.stop({ force: true }); // D-9: skip the wait; the abandon stays last
+  const out = await pending;
+  assert.equal(out.response?.error, true, "D-9: an accepted, unanswered request gets an error response");
+  assert.equal((out.response?.result as { code: number }).code, 300, "agent_stopping");
+  await waitFor(async () => finalsOf(await diaryOf(h.root, "alpha"), "outreq").join() === "abandoned", 6_000);
+  assert.equal(innerFinal, "abandoned", "the handler's own request ended through the abandon path (D-6)");
+  assert.deepEqual(finalsOf(await diaryOf(h.root, "alpha"), "inreq"), ["completed"], "answered with 300");
+  assert.equal((await statusOf(h.root, "alpha")).status, "inactive");
+});
+
+test("R2-3: a stop command pending at start ends with the agent inactive and nothing armed", opts, async (t) => {
+  const h = await harness(t);
+  const timers = { heartbeatInterval: 100, nuntiumDebounce: 10_000 };
+  // beta starts first so alpha's own initial scan (row 4) discovers it: the long debounce would
+  // otherwise hide it for the whole test (D-17).
+  const b = agent(h, "beta", { acceptsCommandsFrom: ["alpha"] }, timers);
+  const a = agent(h, "alpha", { acceptsCommandsFrom: [] }, timers);
+  await b.agent.start();
+  await a.agent.start();
+  await waitFor(() => a.agent.agmen().has("beta"), 6_000);
+  await b.agent.stop();
+  await a.agent.command("beta", "stop", { force: false }); // it waits in beta's inbox for the next start (D-4)
+  assert.equal((await inboxOf(h.root, "beta")).length, 1, "one pending envelope");
+  await b.agent.start(); // its initial scan delivers the pending stop: probe P3
+  await waitFor(async () => (await statusOf(h.root, "beta")).status === "inactive", 6_000);
+  assert.equal((await announceOf(h.root, "beta")).nuntium, "agent beta is inactive", "C1 of the pending stop");
+  const file = path.join(h.root, "beta", "status.json");
+  const written = await mtimeOf(file);
+  await sleep(500); // five heartbeat intervals: nothing may rewrite it
+  assert.equal(await mtimeOf(file), written, "no heartbeat and no watcher survived the stop (R2-3)");
+  assert.deepEqual(await inboxOf(h.root, "beta"), [], "the command was archived (D3)");
+  assert.equal(b.agent.agmen().size, 0, "C2 dropped the view");
+  // idle+inactive from the explicit stop() above, idle from this start(), inactive from the pending one.
+  assert.deepEqual(
+    statusEvents(await diaryOf(h.root, "beta")),
+    ["idle", "inactive", "idle", "inactive"],
+    "the pending stop wrote C1 of its own",
+  );
+  await b.agent.start(); // and the agent is startable again
+  await waitFor(async () => (await statusOf(h.root, "beta")).status === "idle", 6_000);
+});
+
+test("R2-3: a restart command pending at start leaves exactly one instance running", opts, async (t) => {
+  const h = await harness(t);
+  const timers = { heartbeatInterval: 150, nuntiumDebounce: 10_000 };
+  // beta starts first so alpha's own initial scan (row 4) discovers it: the long debounce would
+  // otherwise hide it for the whole test (D-17).
+  const b = agent(h, "beta", { acceptsCommandsFrom: ["alpha"] }, timers);
+  const a = agent(h, "alpha", { acceptsCommandsFrom: [] }, timers);
+  await b.agent.start();
+  await a.agent.start();
+  await waitFor(() => a.agent.agmen().has("beta"), 6_000);
+  await b.agent.stop();
+  await a.agent.command("beta", "restart", { force: true, delay: 0 });
+  await b.agent.start(); // the pending restart runs inside start(): it must not arm a second set
+  await waitFor(async () => (await statusOf(h.root, "beta")).status === "idle", 8_000);
+  // One heartbeat or two? Count the rewrites of one window: the interval gives the cadence, and a
+  // second armed heartbeat would roughly double it. (Gaps cannot be used: the restart's own writes
+  // land next to each other.)
+  const file = path.join(h.root, "beta", "status.json");
+  const interval = timers.heartbeatInterval!;
+  const window = 6 * interval;
+  const before = await mtimeOf(file);
+  const seen = new Set<number>();
+  const until = Date.now() + window;
+  while (Date.now() < until) {
+    await sleep(20);
+    const m = await mtimeOf(file);
+    if (m !== before) seen.add(m);
+  }
+  const rewrites = seen.size;
+  assert.ok(rewrites >= 4, `the heartbeat rewrote status.json ${rewrites} times in ${window} ms`);
+  assert.ok(
+    rewrites <= Math.round(window / (0.6 * interval)),
+    `two heartbeats armed: ${rewrites} rewrites in ${window} ms, cadence ${interval} ms`,
+  );
+  await b.agent.stop();
+  const stopped = await mtimeOf(file);
+  await sleep(500);
+  assert.equal(await mtimeOf(file), stopped, "and after the final stop() nothing is rewritten");
+});
+
+test("R2-4: a discovered peer with no shared namespace is answered 106 (A0, D-7)", opts, async (t) => {
+  const h = await harness(t);
+  const timers = { nuntiumDebounce: 10_000 };
+  const d = agent(h, "delta", { namespaces: ["blue"], acceptsCommandsFrom: [] }, timers);
+  await d.agent.start();
+  const b = agent(h, "beta", { namespaces: ["red"], acceptsCommandsFrom: [] }, timers);
+  b.agent.capability(ECHO, echoHandler);
+  await b.agent.start();
+  assert.equal(b.agent.agmen().has("delta"), false, "callability rule 2 keeps it out of the Agmen view");
+  // delta's own agent cannot send this: request() refuses a peer that is not in the view. The envelope
+  // arrives the way any peer's would, and beta's A0 judges it from the spec its scan DISCOVERED: probe P5.
+  const rid = ulid();
+  const target = path.join(h.root, "beta", "inbox", `${rid}.json`);
+  const tmp = path.join(h.root, "delta");
+  await io.writeJsonAtomic(target, requestFile(rid, "delta", "beta", "echo", { text: "x" }), tmp);
+  const resFile = path.join(h.root, "beta", "inbox", `${rid}.res.json`);
+  await waitFor(async () => (await io.exists(resFile)), 6_000);
+  const res = await json<{ rid: string; response: { error: boolean; result: unknown } }>(resFile);
+  assert.equal(res.rid, rid, "the response header carries the request header (D-11)");
+  assert.equal(res.response.error, true);
+  assert.equal((res.response.result as { code: number }).code, 106, "namespace_mismatch, not an echo");
+  assert.equal(b.events.filter((e) => e.event === "ignored").length, 0, "a well-formed envelope: not ignored");
+  // no requestor is alive for this rid, so it archives when the confirmation times out (D-13).
+  await waitFor(async () => finalsOf(await diaryOf(h.root, "beta"), "inreq").join() === "completed", 8_000);
+});
+
+test("R2-6: a bad environment value throws at start(), never at construction (D-21)", opts, async (t) => {
+  const h = await harness(t);
+  process.env["ACTIO_HEARTBEAT"] = "abc";
+  try {
+    const a = new ActioAgent({
+      id: "alpha",
+      description: "the constructor must not read the environment",
+      acceptsCommandsFrom: [],
+      config: fastConfig(h.root, Date.now),
+    });
+    h.agents.push(a); // the after-hook stops it: a NOP unless the start() below ever succeeds
+    await assert.rejects(() => a.start(), /ACTIO_HEARTBEAT/);
+    await assert.rejects(() => a.start(), /ACTIO_HEARTBEAT/, "a failed start() left it not running");
+    assert.deepEqual(await io.listDir(h.root), [], "and it created nothing");
+  } finally {
+    delete process.env["ACTIO_HEARTBEAT"];
+  }
 });

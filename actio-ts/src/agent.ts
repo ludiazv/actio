@@ -1,6 +1,6 @@
 // ActioAgent (WP7): lifecycle steps 1–5, lane C wiring, commands, and the public API of §2.7.
 import path from "node:path";
-import { loadConfig } from "./config.js";
+import { defaultConfig, loadConfig } from "./config.js";
 import * as diarium from "./diarium.js";
 import { callable, scan } from "./discovery.js";
 import * as io from "./io.js";
@@ -46,6 +46,11 @@ function why(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** D-22's wording (R2-5): the error's `code` when it has one, its message as the fallback. */
+function errCode(err: unknown): string {
+  return (err as NodeJS.ErrnoException).code ?? why(err);
+}
+
 /** A team member: publishes spec/status, serves requests and commands, issues requests. */
 export class ActioAgent {
   private readonly capabilities = new Map<string, CapabilityEntry>(); // registration order
@@ -53,7 +58,9 @@ export class ActioAgent {
   private readonly listeners: ((e: ActioEvent) => void)[] = [];
   /** D-19 (peer side): compiled peer capabilities, cached per (id, spec datetime, capability). */
   private readonly peerSchemas = new Map<string, CompiledCapability | null>();
-  private config: ActioConfig = loadConfig(); // replaced by `start()`: config of the last start wins
+  /** R2-6 (§2.6, D-21): nothing of the environment is read at construction; `start()` loads the config.
+   * `root: ""` is a placeholder: no path of the shared tree may be used before `start()`. */
+  private config: ActioConfig = { ...defaultConfig, root: "", clock: Date.now };
   private folders: AgentFolders = { root: "", agent: "", inbox: "", forum: "", nuntium: "" };
   private sync: SyncProvider = createSyncProvider("none");
   private receiver: Receiver | undefined;
@@ -64,6 +71,12 @@ export class ActioAgent {
   private currentSpec!: Spec; // the spec published by the current start (set by `buildSpecNow`)
   private current: StatusState = "inactive";
   private view = new Map<AgentId, AgentView>();
+  /** I-11 (R2-4): the specs of the last scan, unfiltered by the callability rules and keyed by id: D-7's
+   * code 106 must see a requestor that rule 2 threw out of `view`, so it cannot come from `view`. */
+  private discovered = new Map<AgentId, Spec>();
+  /** R2-1: the enabled state of the `enable` command (undefined = as the options say). Every spec built
+   * during a run carries it; only a fresh start clears it (D-10). */
+  private enabledState: boolean | undefined;
   private running = false; // between `start()` and `stop()`
   private stopping = false;
 
@@ -131,6 +144,7 @@ export class ActioAgent {
     await io.makeDir(this.folders.agent);
     await io.makeDir(this.folders.inbox);
     for (const entry of this.capabilities.values()) entry.running = 0; // fresh counters after a restart
+    this.enabledState = undefined; // D-10: a `disabled` set by `enable` does not survive a restart
     this.buildSpecNow(); // a bad registration fails here, before anything lands in the tree
     await publishSpec(this.folders.agent, this.currentSpec);
     await this.setStatus("idle"); // status.json (step 3) plus its diarium event (step 4)
@@ -138,10 +152,6 @@ export class ActioAgent {
 
     this.receiver = new Receiver(this.context(), this.receiverHooks(), this.capabilities, this.commands);
     this.requestor = new Requestor(this.context(), this.requestorHooks());
-    // The inbox watcher of WP5: its initial scan delivers the pending envelopes (D-4); the fan-out
-    // feeds the requestor, which uses it for the responses of self-calls (B2 on our own inbox).
-    await this.receiver.start((name) => this.requestor?.notifyFile(this.folders.inbox, name));
-
     // Nuntium watch (D-17): every event schedules one debounced full scan; the first discovery of the
     // workflow (row 4) runs now, not after the debounce.
     this.nuntiumWatcher = watchDir(
@@ -153,6 +163,11 @@ export class ActioAgent {
     );
     await this.rescan();
     this.heartbeat = startHeartbeat(config.heartbeatInterval, () => this.beat());
+    // LAST step, on purpose (R2-3): the inbox watcher of WP5, whose initial scan delivers the pending
+    // envelopes (D-4); the fan-out feeds the requestor, which uses it for the responses of self-calls
+    // (B2 on our own inbox). A pending `stop`/`restart` command now runs while everything is armed, so
+    // its `stop()` (or `restart()`) can tear it all down: nothing below arms anything afterwards.
+    await this.receiver.start((name) => this.requestor?.notifyFile(this.folders.inbox, name));
   }
 
   /** Drops what a failed `start()` armed: no event loop, no watchers, no heartbeat; not running. The
@@ -167,6 +182,7 @@ export class ActioAgent {
     this.receiver = undefined;
     this.requestor = undefined;
     this.view = new Map();
+    this.discovered = new Map();
     this.running = false;
   }
 
@@ -206,23 +222,29 @@ export class ActioAgent {
     await this.reannounceAfterDelay(`agent ${this.options.id} failed: ${message}`);
   }
 
-  /** Lane C (D-9): in-flight handling, error 300 for unanswered accepted requests, C1 → C2. */
+  /** Lane C, D-9 (v11) in that order: heartbeat + scan, grace, receiver, abandon B2, C1 → C2. */
   async stop(options?: { force?: boolean }): Promise<void> {
     if (!this.running || this.stopping) return; // idempotent: a second stop() resolves
     this.stopping = true;
+    // (1) the heartbeat and any pending discovery scan.
     this.heartbeat?.stop();
     this.heartbeat = undefined;
     if (this.scanTimer !== undefined) clearTimeout(this.scanTimer);
     this.scanTimer = undefined;
-    await this.requestor?.stop(); // B2 exchanges are abandoned (D-9)
+    // (2) the grace wait (R1-2: only in-flight WORK). The requestor is NOT stopped yet: a handler may
+    // still issue a request and receive its response inside `stopGrace` (R2-2). `force` skips the wait,
+    // it does not reorder the steps.
     if (options?.force !== true) {
-      // R1-2: the grace waits only for in-flight WORK; exchanges that already have a response are
-      // archived by `receiver.stop()`, which also answers the unanswered ones with code 300.
       const steps = Math.ceil(this.config.stopGrace / GRACE_STEP_MS);
       for (let i = 0; i < steps && (this.receiver?.workingCount() ?? 0) > 0; i++) await sleep(GRACE_STEP_MS);
     }
+    // (3) abort what remains: every accepted, unanswered request gets code 300, and the exchanges that
+    // already have a response are archived at once.
     await this.receiver?.stop();
-    await this.setStatus("inactive"); // C1: status first …
+    // (4) last, the outbound side: what is still in B2 is abandoned (D-9).
+    await this.requestor?.stop();
+    // (5) C1: status first …
+    await this.setStatus("inactive");
     await this.reannounceAfterDelay(`agent ${this.options.id} is inactive`); // … then, delayed, the announce
     await this.sync.flush(); // before C1 completes (§2.6): the last writes must reach the shared tree
     // C2: deinit. The watchers are gone, the in-memory view and the exchange bookkeeping are dropped.
@@ -231,6 +253,7 @@ export class ActioAgent {
     this.receiver = undefined;
     this.requestor = undefined;
     this.view = new Map();
+    this.discovered = new Map();
     await this.sync.close(); // only cancels a pending debounce (I-10)
     this.running = false;
     this.stopping = false;
@@ -256,7 +279,7 @@ export class ActioAgent {
   private receiverHooks(): ReceiverHooks {
     return {
       onWatchError: (dir, err) => void this.failWatch(dir, err), // D-22: own inbox
-      peerOf: (src) => this.view.get(src), // code 106 needs the peer's spec
+      peerSpec: (src) => this.discovered.get(src), // code 106 needs the DISCOVERED spec, not the view (R2-4)
       onStateChange: () => void this.syncBusy(),
       onCommandStop: (force) => this.stop({ force }),
       onCommandRestart: (force, delaySeconds) => this.restart(force, delaySeconds),
@@ -269,15 +292,15 @@ export class ActioAgent {
     return {
       // D-22 names only the own inbox and `nuntium` for `fail()`: a destination watch error has
       // already been answered by the requestor (its exchanges there are abandoned), so the agent stays up.
-      onWatchError: (dir, err) => this.emit({ event: "log", message: `watch error in "${dir}": ${why(err)}` }),
+      onWatchError: (dir, err) => this.emit({ event: "log", message: `watch lost ${dir}: ${errCode(err)}` }),
       onStateChange: () => void this.syncBusy(), // outbound B2 also makes us busy (D-8)
     };
   }
 
   /** D-22: a watch error on the own inbox or `nuntium` is fatal: log it and enter `error`. */
   private async failWatch(dir: string, err: Error): Promise<void> {
-    this.emit({ event: "log", message: `watch error in "${dir}": ${why(err)}` });
-    await this.fail(`watch error in ${dir}`);
+    this.emit({ event: "log", message: `watch lost ${dir}: ${errCode(err)}` }); // the plan's wording (R2-5)
+    await this.fail(`watch lost ${dir}`);
   }
 
   /** The observability fan-out; a listener's error is the listener's problem (§2.7). */
@@ -308,12 +331,15 @@ export class ActioAgent {
       return;
     }
     const next = new Map<AgentId, AgentView>();
+    const specs = new Map<AgentId, Spec>();
     const now = this.now();
     for (const peer of found.agents) {
+      specs.set(peer.spec.id, peer.spec); // unfiltered: the 106 check of A0 (R2-4)
       const view = callable(this.currentSpec, peer, now); // our own folder is included: self-calls work
       if (view !== undefined) next.set(view.id, view);
     }
     this.view = next;
+    this.discovered = specs;
     for (const folder of found.duplicates) {
       this.emit({ event: "log", message: `duplicate agent id: folder "${folder}" was skipped (D-3)` });
     }
@@ -331,8 +357,12 @@ export class ActioAgent {
 
   /** D-8: busy iff an inbound exchange (A1/A2/A3) or an outbound one (B2) is in flight. */
   private async syncBusy(): Promise<void> {
+    // The fields being gone means C2 ran; `stopping` means lane C began. Either way the status belongs
+    // to lane C now: a work settle landing after `stop()` must not resurrect the agent (R2-2), and with
+    // the fields gone the counts are 0, which would publish `idle` over the `inactive` of C1.
+    if (!this.receiver || !this.requestor || !this.running || this.stopping) return;
     if (this.current !== "idle" && this.current !== "busy") return; // inactive/error: no automatic transition
-    const busy = (this.receiver?.runningCount() ?? 0) > 0 || (this.requestor?.outboundCount() ?? 0) > 0;
+    const busy = this.receiver.runningCount() > 0 || this.requestor.outboundCount() > 0;
     await this.setStatus(busy ? "busy" : "idle"); // only on change; the heartbeat keeps freshness otherwise
   }
 
@@ -353,6 +383,9 @@ export class ActioAgent {
   /** spec.json from the options and the registered capabilities, with a fresh `datetime` (I-2 self-validated). */
   private buildSpecNow(): void {
     this.currentSpec = buildSpec(this.options, this.capabilityList(), this.now());
+    // R2-1: the enabled state is agent state, not option state, so EVERY rebuild during a run (the `ping`
+    // command above all) keeps it. `buildSpec` never writes `disabled` (WP7-B-1); this is the only writer.
+    if (this.enabledState !== undefined) this.currentSpec.disabled = this.enabledState;
   }
 
   private statusFor(state: StatusState): Status {
@@ -416,8 +449,9 @@ export class ActioAgent {
 
   /** `enable` (D2): `disabled` belongs to the built spec object, never to the options or the capabilities. */
   private async applyEnable(enabled: boolean): Promise<void> {
+    this.enabledState = !enabled; // R2-1: state of the run, not of the options: every later rebuild
+    // re-applies it (a `ping` used to clear `disabled`), and only a fresh start clears it (D-10).
     this.buildSpecNow();
-    this.currentSpec.disabled = !enabled; // our own built object: options and capabilities stay untouched
     await publishSpec(this.folders.agent, this.currentSpec);
     await this.reannounceAfterDelay(`agent ${this.options.id} is ${enabled ? "enabled" : "disabled"}`);
   }
