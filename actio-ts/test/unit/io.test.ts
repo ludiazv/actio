@@ -60,7 +60,8 @@ test("makeDir, exists, listDir, remove", async (t) => {
 
 test("delay provider: file is complete before the delay; resolves not earlier than delayMs", async (t) => {
   const root = await makeRoot(t);
-  io.setSyncProvider(createSyncProvider("delay:30"));
+  const delayMs = 30;
+  io.setSyncProvider(createSyncProvider(`delay:${delayMs}`));
   t.after(() => io.setSyncProvider(createSyncProvider("none")));
   const target = path.join(root, "d.json");
   const obj = { v: 1, pad: "y".repeat(500) };
@@ -79,9 +80,24 @@ test("delay provider: file is complete before the delay; resolves not earlier th
     2,
   );
   const resolvedAt = await writeP.then(() => Date.now());
+  // Why this cannot flake:
+  // - Visibility-before-delay is timing-independent: the file is read complete while writeP is
+  //   still pending, i.e. inside the delay window, so no clock margin is involved there.
+  // - The rename (when the file becomes visible) precedes the delayMs sleep, and the poller
+  //   stamps visibleAt at most one 2 ms interval plus event-loop lag after it.
+  //   elapsed = delayMs + tail - lag, so the floor of delayMs/2 only fails if the poll lags by
+  //   more than delayMs/2 - 2 ms; a stall that long also delays the sleep timer at least as
+  //   much, keeping elapsed safe (the old delayMs - 3 floor left just 3 ms of slack, which
+  //   real poll lag ate in a full-suite run).
+  // - The upper bound proves the delay really happened and is bounded (provider not skipped/hung).
+  const elapsed = resolvedAt - visibleAt;
   assert.ok(
-    resolvedAt - visibleAt >= 27,
-    `resolved only ${resolvedAt - visibleAt}ms after the file was visible (expected ~30ms delay)`,
+    elapsed >= Math.floor(delayMs / 2),
+    `resolved only ${elapsed}ms after the file was visible (expected a real ${delayMs}ms delay)`,
+  );
+  assert.ok(
+    elapsed < delayMs + 2_000,
+    `resolved ${elapsed}ms after the file was visible (delay not applied or hung)`,
   );
 });
 
