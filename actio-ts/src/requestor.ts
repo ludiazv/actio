@@ -110,7 +110,9 @@ export class Requestor {
   /** Lane B for `type="cmd"`: write the command; `outreq` "sent" right after (B1). */
   async command(dst: AgentId, name: string, params: unknown): Promise<string> {
     const { rid, req } = await this.beginOutbound(dst, name, params, "cmd", 0, []);
+    // §2.7: the diarium is the durable record — append it first, then the live signal (same order at all four outreq points).
     await this.ctx.appendDiarium(outreqEvent(this.ctx.id, this.ctx.now(), "sent", this.exchangeData("sent", req, null, null, null)));
+    this.ctx.emit({ event: "outreq", rid, finalStatus: "sent" });
     return rid;
   }
 
@@ -227,12 +229,14 @@ export class Requestor {
         await this.ctx.appendDiarium(
           outreqEvent(this.ctx.id, this.ctx.now(), finalStatus, this.exchangeData(finalStatus, ex.req, ex.can, ex.res, con)),
         );
+        this.ctx.emit({ event: "outreq", rid: ex.rid, finalStatus });
         await writeJsonAtomic(path.join(inbox, `${ex.rid}.con.json`), con, this.ctx.folders.agent);
       } else {
         // the receiver archived: record the final status without the confirmation envelope
         await this.ctx.appendDiarium(
           outreqEvent(this.ctx.id, this.ctx.now(), finalStatus, this.exchangeData(finalStatus, ex.req, ex.can, ex.res, null)),
         );
+        this.ctx.emit({ event: "outreq", rid: ex.rid, finalStatus });
       }
       await this.deleteAttachments(ex); // B5
     } catch (err) {
@@ -249,6 +253,7 @@ export class Requestor {
       await this.ctx.appendDiarium(
         outreqEvent(this.ctx.id, this.ctx.now(), "abandoned", this.exchangeData("abandoned", ex.req, ex.can, null, null)),
       );
+      this.ctx.emit({ event: "outreq", rid: ex.rid, finalStatus: "abandoned" });
       await this.deleteAttachments(ex);
     } catch (err) {
       this.ctx.emit({ event: "log", message: `requestor: abandon of ${ex.rid} failed: ${err instanceof Error ? err.message : String(err)}` });

@@ -168,6 +168,7 @@ test("command: writes the cmd file and diariums outreq sent (req only)", async (
   assert.equal(data!.can, null);
   assert.equal(data!.res, null);
   assert.equal(data!.con, null);
+  assert.ok(fx.emitted.some((e) => e.event === "outreq" && e.rid === rid && e.finalStatus === "sent"), "the stream carries outreq sent");
   assert.equal(fx.requestor.outboundCount(), 0);
 });
 
@@ -194,6 +195,7 @@ test("request: confirmed — response, confirmation, outreq matches the files, B
   assert.deepEqual(data!.res, JSON.parse(await fsp.readFile(path.join(fx.betaInbox, `${rid}.res.json`), "utf8")));
   assert.deepEqual(data!.con, JSON.parse(await fsp.readFile(path.join(fx.betaInbox, `${rid}.con.json`), "utf8")));
   assert.equal(data!.can, null);
+  assert.ok(fx.emitted.some((e) => e.event === "outreq" && e.rid === rid && e.finalStatus === "confirmed"), "the stream carries outreq confirmed");
   // B5: the request attachment is deleted from the forum
   await assert.rejects(fsp.access(path.join(fx.alphaForum, "input.txt")));
   assert.ok(fx.stateChanges.length >= 2, `onStateChange on 0<->nonzero transitions (got ${fx.stateChanges.length})`);
