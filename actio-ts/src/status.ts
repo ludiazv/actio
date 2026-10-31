@@ -41,15 +41,15 @@ export async function publishStatus(folder: string, status: Status): Promise<voi
   await writeJsonAtomic(path.join(folder, "status.json"), validated, folder);
 }
 
-/** Writes `nuntium/<id>.n.json` and appends the diarium announce event. The caller applies the
- * announceDelay between its status write and this call (*Agent's status* rule 2). */
-export async function announce(folder: string, id: AgentId, text: string, nowMs: number): Promise<void> {
+/** Writes `<nuntiumDir>/<id>.n.json` (the shared signal folder at the `.actio` root) and appends the
+ * diarium announce event to `<agentFolder>/diarium.jsonl` (I-5: two folders, one call). The caller
+ * applies the announceDelay between its status write and this call (*Agent's status* rule 2). */
+export async function announce(agentFolder: string, nuntiumDir: string, id: AgentId, text: string, nowMs: number): Promise<void> {
   const file: Announce = { id, datetime: toIso(nowMs), ts: Math.floor(nowMs / 1000), nuntium: text };
   const validated = mustValidate(`announce file for "${id}"`, validateAnnounce(file));
-  const nuntium = path.join(folder, "nuntium"); // the shared signal folder, a sibling of the agent folders
-  await makeDir(nuntium); // idempotent; writeJsonAtomic only creates its tmpDir
-  await writeJsonAtomic(path.join(nuntium, `${id}.n.json`), validated, folder);
-  await diarium.append(folder, diarium.announceEvent(id, nowMs)); // records the completed announce
+  await makeDir(nuntiumDir); // idempotent; writeJsonAtomic only creates its tmpDir
+  await writeJsonAtomic(path.join(nuntiumDir, `${id}.n.json`), validated, agentFolder);
+  await diarium.append(agentFolder, diarium.announceEvent(id, nowMs)); // records the completed announce
 }
 
 /** Health of a status at `nowMs`: healthy|online|degraded|zombie; undefined for inactive/error. */
