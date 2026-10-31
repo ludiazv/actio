@@ -1204,3 +1204,75 @@ test("one archive per exchange: a confirmation landing mid-archive adds no secon
   assert.equal(inreqs(env).length, 1, "one exchange, one archive (D-5)");
   assert.equal(inreqs(env)[0]?.final_status, "completed", "the confirmTimeout ended it (D-13)");
 });
+
+// --- Carry-overs (WP5-E-1: P-3, P-5) ---
+
+test("P-3: a deferred can for an ignored request is dropped and logged once; the files stay (D-15, D-16)", async (t) => {
+  const env = await makeEnv(t); // no capabilities: the (valid-shape) request can never be tracked
+  const rid = ulid();
+  // The request file is present but schema-invalid (no `attachments`): it is ignored (D-15) and
+  // the rid is never tracked, so a can for it would otherwise stay deferred for the run lifetime.
+  const bad = makeRequest(rid);
+  delete (bad.request as { attachments?: string[] }).attachments;
+  await writeJson(env.inbox, `${rid}.json`, bad);
+  await writeJson(env.inbox, `${rid}.can.json`, makeCancellation(bad));
+  // Deterministic delivery (no watcher): the can first — deferred (the request file is present,
+  // the rid not tracked) — then the request, which is ignored and drops the deferred can.
+  await env.receiver.processFile(`${rid}.can.json`);
+  await env.receiver.processFile(`${rid}.json`);
+  const canFull = path.join(env.inbox, `${rid}.can.json`);
+  const reqFull = path.join(env.inbox, `${rid}.json`);
+  const ignoredEvents = env.events.filter((e) => e.event === "ignored");
+  assert.equal(ignoredEvents.length, 2, "the request and the deferred can are each reported once");
+  assert.ok(ignoredEvents.some((e) => e.event === "ignored" && e.path === reqFull), "the request is `ignored`");
+  const canEvent = ignoredEvents.find((e) => e.event === "ignored" && e.path === canFull);
+  assert.ok(canEvent, "the deferred can is reported");
+  assert.match(canEvent!.reason, /the request of rid .* was ignored \(D-15\)/);
+  const logs = logLines(env);
+  assert.ok(logs.some((l) => l.startsWith(`ignored ${rid}.json:`)), "the request's ignore line");
+  assert.ok(
+    logs.some((l) => l === `deferred ${canFull}: the request of rid ${rid} was ignored (D-15)`),
+    "the deferred drop line (the brief's format)",
+  );
+  assert.deepEqual(
+    (await inboxNames(env.inbox)).sort(),
+    [`${rid}.can.json`, `${rid}.json`].sort(),
+    "the orphan files stay in the inbox (D-16: no housekeeping beyond the protocol)",
+  );
+  // "Once": redelivering both files adds no second report (D-15 dedup by (path, mtime); the
+  // deferred map no longer holds the rid).
+  await env.receiver.processFile(`${rid}.can.json`);
+  await env.receiver.processFile(`${rid}.json`);
+  assert.equal(env.events.filter((e) => e.event === "ignored").length, 2, "still two reports after redelivery");
+  assert.equal(logLines(env).length, 2, "still two log lines after redelivery");
+});
+
+test("P-5: stop() resolves only after an archive that is already in flight (the lane-C order, E12)", async (t) => {
+  let open!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  const env = await makeEnv(t, {
+    entries: [makeEntry("echo", async () => ({ ok: true }))],
+    diariumGate: () => gate, // holds every archive right after its diarium line
+  });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const req = makeRequest(rid);
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req)); // confirmation → the archive starts
+  await waitFor(() => inreqs(env).length === 1, 3_000); // the inreq line is in; the archive is held
+  const stopP = env.receiver.stop(); // the archive is in flight: stop() must wait for it (P-5)
+  let stopped = false;
+  void stopP.then(() => {
+    stopped = true;
+  });
+  await sleep(30); // the gate still holds: stop() must NOT have resolved
+  assert.equal(stopped, false, "stop() is waiting for the in-flight archive (P-5)");
+  open(); // the archive resumes and removes the envelopes
+  await stopP;
+  assert.equal(stopped, true);
+  assert.equal(inreqs(env).length, 1, "one exchange, one inreq line (D-5)");
+  assert.deepEqual(await inboxNames(env.inbox), [], "the envelope removals landed before stop() resolved");
+});

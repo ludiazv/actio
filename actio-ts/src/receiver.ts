@@ -121,6 +121,9 @@ export class Receiver {
   private readonly ignoredSeen = new Set<string>();
   /** R1-5: a `.can`/`.con`/`.res` whose request file is still pending delivery, by rid. */
   private readonly deferred = new Map<Rid, { kind: "can" | "res" | "con"; file: CancellationFile | ResponseFile | ConfirmationFile }[]>();
+  /** P-5: the promise of every archive in flight, by rid; `stop()` awaits them all, so that when
+   * it resolves EVERY archive has landed (the inreq line and the envelope removals precede C1). */
+  private readonly archiving = new Map<Rid, Promise<void>>();
   /** D-5 for commands: the rids whose envelope this run has already dispatched (executed once). */
   private readonly commandRids = new Set<Rid>();
   /** Lane D: the envelopes handed over by `D0`, drained one at a time in rid order. */
@@ -416,10 +419,10 @@ export class Receiver {
     if (ex.phase === "responded") return; // our own echo: `respond()` already armed the wait
     ex.phase = "responded";
     if (ex.con !== null) {
-      this.guarded(ex.rid, this.archive(ex)); // the confirmation already arrived (out of order)
+      this.startArchive(ex); // the confirmation already arrived (out of order)
       return;
     }
-    ex.confirmTimer = setTimeout(() => this.guarded(ex.rid, this.archive(ex)), this.ctx.config.confirmTimeout);
+    ex.confirmTimer = setTimeout(() => this.startArchive(ex), this.ctx.config.confirmTimeout);
   }
 
   /** The effect of one matched cancellation, by phase. Returns the ignore reason when the envelope
@@ -467,7 +470,7 @@ export class Receiver {
         clearTimeout(ex.confirmTimer);
         ex.confirmTimer = undefined;
       }
-      this.guarded(ex.rid, this.archive(ex));
+      this.startArchive(ex);
     }
     // a confirmation before the response (out of order) is stored: A2 archives immediately
     return null;
@@ -488,10 +491,11 @@ export class Receiver {
     if (reason !== null) await this.ignore(full, name, reason);
   }
 
-  /** D-9 (receiver side), fully archiving: `stop()` awaits every archive before it resolves (E12 —
-   * the agent's C1 runs after `stop()`). Accepted-and-unanswered requests get the code 300 response
-   * first; every exchange that has a response is then archived with the normal A4 rule. Exchanges
-   * still in `accepting` stay in the inbox for the next start (D-4). */
+  /** D-9 (receiver side), fully archiving: `stop()` awaits every archive before it resolves — the
+   * stop-archives and the ones already in flight (P-5; E12: the agent's C1 runs after `stop()`).
+   * Accepted-and-unanswered requests get the code 300 response first; every exchange that has a
+   * response is then archived with the normal A4 rule. Exchanges still in `accepting` stay in the
+   * inbox for the next start (D-4). */
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
@@ -518,7 +522,12 @@ export class Receiver {
       }
       if (ex.res !== null) toArchive.push(ex); // waiting for confirmation, or answered with 300
     }
-    for (const ex of toArchive) await this.archive(ex);
+    for (const ex of toArchive) this.startArchive(ex);
+    // P-5: the map now holds the stop-archives together with every archive that was already in
+    // flight (confirmation-triggered, started before stop()); no new one can start (the dispatchers
+    // are stopped-guarded and the timers are cleared). Awaiting them all: when stop() resolves,
+    // EVERY archive has landed.
+    await Promise.all(this.archiving.values());
   }
 
   /** Number of inbound exchanges in A1/A2/A3 (for busy, D-8) and capability_status. */
@@ -665,10 +674,10 @@ export class Receiver {
     if (this.stopped || !this.exchanges.has(ex.rid)) return; // stop() owns the answer now
     await this.writeResponse(ex, options);
     if (ex.con !== null) {
-      this.guarded(ex.rid, this.archive(ex)); // the confirmation already arrived (out of order)
+      this.startArchive(ex); // the confirmation already arrived (out of order)
       return;
     }
-    ex.confirmTimer = setTimeout(() => this.guarded(ex.rid, this.archive(ex)), this.ctx.config.confirmTimeout);
+    ex.confirmTimer = setTimeout(() => this.startArchive(ex), this.ctx.config.confirmTimeout);
   }
 
   /** A2 core: build the response, self-validate it (I-2), write it to the OWN inbox. */
@@ -749,10 +758,22 @@ export class Receiver {
     if (pendingCon !== null) ex.con = pendingCon;
     this.exchanges.set(file.rid, ex);
     if (ex.con !== null) {
-      this.guarded(file.rid, this.archive(ex)); // confirmed before this run started
+      this.startArchive(ex); // confirmed before this run started
       return;
     }
     ex.confirmTimer = setTimeout(() => this.guarded(ex.rid, this.archive(ex)), this.ctx.config.confirmTimeout);
+  }
+
+  /** Starts one archive and tracks its promise (P-5: `stop()` awaits the in-flight ones). A second
+   * start for the same rid is a no-op: the D-5 guard makes the second `archive()` return at once,
+   * so tracking only the first never loses an in-flight archive. Failures are reported, not thrown. */
+  private startArchive(ex: ExchangeState): void {
+    if (this.archiving.has(ex.rid)) return;
+    const p = this.archive(ex).catch((err: unknown) => this.reportInternal(ex.rid, err));
+    this.archiving.set(ex.rid, p);
+    void p.finally(() => {
+      if (this.archiving.get(ex.rid) === p) this.archiving.delete(ex.rid);
+    });
   }
 
   /** A0: a valid cancellation file already present for the rid (matching header and name). */
@@ -810,6 +831,27 @@ export class Receiver {
     this.ignoredSeen.add(key);
     this.ctx.emit({ event: "ignored", path: full, reason });
     await this.ctx.appendDiarium(diarium.logEvent(this.ctx.id, this.ctx.now(), `ignored ${name}: ${reason}`));
+    // P-3: an ignored request file is never tracked — the envelopes deferred for its rid are
+    // orphans: drop them from `deferred` and log each once (the files stay in the inbox; D-16).
+    if (!/\.(can|res|con)\.json$/.test(name)) {
+      await this.dropDeferredFor(name.slice(0, -".json".length));
+    }
+  }
+
+  /** P-3: the request of `rid` was ignored (D-15) and will never be tracked — drop the envelopes
+   * deferred for it and log each once (the same `ignore()` pattern: one event + one diarium line). */
+  private async dropDeferredFor(rid: Rid): Promise<void> {
+    const list = this.deferred.get(rid);
+    if (list === undefined) return;
+    this.deferred.delete(rid);
+    for (const d of list) {
+      const name = `${rid}.${d.kind}.json`;
+      const full = path.join(this.ctx.folders.inbox, name);
+      this.ctx.emit({ event: "ignored", path: full, reason: `the request of rid ${rid} was ignored (D-15)` });
+      await this.ctx.appendDiarium(
+        diarium.logEvent(this.ctx.id, this.ctx.now(), `deferred ${full}: the request of rid ${rid} was ignored (D-15)`),
+      );
+    }
   }
 
   /** Runs an internal async step; a rejection is a receiver bug — report it, never crash the loop. */
