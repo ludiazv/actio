@@ -46,13 +46,18 @@ function parseDelayMs(value: string, raw: string | undefined): number {
  * (200 ms); `flush()` runs one immediately; `close()` cancels a pending run. The binary path is
  * read from `ACTIO_MUTAGEN_BIN` (default `mutagen`) at run time. Failures (spawn error or
  * non-zero exit) call `onError` once per failed run and never throw.
+ *
+ * R1-4: a request is never absorbed by the run already in flight. While a run is going, at most ONE
+ * follow-up run is promised (`pendingRun`): a `notify()` or `flush()` arriving mid-run coalesces into
+ * it, and `flush()` resolves only once a run that started after the call has finished — so the writes
+ * made during a flush are still covered by the next one.
  */
 function mutagenProvider(session: string, onError?: (err: Error) => void): SyncProvider {
   let timer: NodeJS.Timeout | null = null;
   let running: Promise<void> | null = null;
+  let pendingRun: Promise<void> | null = null; // the single promised follow-up, never two
 
-  const run = (): Promise<void> => {
-    if (running) return running;
+  const spawn = (): Promise<void> => {
     const bin = process.env.ACTIO_MUTAGEN_BIN || "mutagen";
     const p = new Promise<void>((resolve) => {
       execFile(bin, ["sync", "flush", session], (err) => {
@@ -74,6 +79,21 @@ function mutagenProvider(session: string, onError?: (err: Error) => void): SyncP
     return p;
   };
 
+  // The run the caller is entitled to. Idle: start it now. Mid-run: the single promised follow-up,
+  // which starts only after the in-flight run settles and resolves when that follow-up ends.
+  const run = (): Promise<void> => {
+    if (!running) return spawn();
+    if (!pendingRun) {
+      const inFlight = running;
+      pendingRun = inFlight.then(() => {
+        pendingRun = null; // free the slot first: the follow-up becomes the new in-flight run
+        running = null; // `inFlight` is what `running` holds here; no other spawn can race this
+        return spawn();
+      });
+    }
+    return pendingRun;
+  };
+
   return {
     fsync: false,
     delayMs: 0,
@@ -81,20 +101,21 @@ function mutagenProvider(session: string, onError?: (err: Error) => void): SyncP
       if (timer) return;
       timer = setTimeout(() => {
         timer = null;
-        void run();
+        void run(); // mid-run: this becomes the coalesced follow-up instead of being swallowed (R1-4)
       }, MUTAGEN_DEBOUNCE_MS);
     },
     flush(): Promise<void> {
       if (timer) {
         clearTimeout(timer);
-        timer = null;
+        timer = null; // the forced run below covers whatever the debounced one would have flushed
       }
       return run();
     },
     close(): Promise<void> {
       if (timer) {
         clearTimeout(timer);
-        timer = null;
+        timer = null; // only the debounced run is cancelled: a promised follow-up still executes,
+        // because a caller of `flush()` is already waiting on it (R1-4); close() is idempotent.
       }
       return Promise.resolve();
     },
