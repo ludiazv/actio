@@ -5,12 +5,16 @@
 // inreq/outreq final statuses, (d) attachments cleaned per the Envelope lifecycle.
 //
 // Notes on what the public API can express (documented in the report):
-// - 101/102/103/106 (E2 and the E3 sub-cases) are REAL peer responses through the stale-view
-//   technique (the same one E3's 100 uses): alpha's nuntiumDebounce is 30 s, so its view stays
-//   stale while beta's state changes and its spec.json is republished; the request passes the
-//   local gate and beta's A0 answers the code. 101 uses a phantom capability that exists only in
-//   the spec file; 102/103 rewrite the live capability object (buildSpec carries it by reference);
-//   106 rewrites the live namespaces array in place, after a `restart` (D-10) established the view.
+// - 101/102/103/106 are reachable in e2e: 101/102/103 through request files written DIRECTLY into
+//   beta's inbox (no requestor involved; A0 answers from its in-memory registry), and 102/103/106
+//   also through the stale-view technique (alpha's nuntiumDebounce is 30 s, so its view stays stale
+//   while beta's state changes and its spec.json is republished; the request passes the local gate
+//   and beta's A0 answers the code). 101 direct: a capability beta never registered; 101 stale (E2):
+//   a phantom capability in the spec file; 102/103 rewrite the live capability object (buildSpec
+//   carries it by reference); 106 rewrites the live namespaces array in place, after a `restart`
+//   (D-10) established the view.
+// - The requestor's local gate (§2.7, ActioCallError) is a separate contract, unit-tested in
+//   agent.test.ts: it is why a normal request() never sends an uncallable request in the first place.
 // - 105/107/108 produce real responses: 108 through a request file written directly into
 //   beta's inbox. R2-4 (WP7-C-1) adds a second scenario that uses the same idiom for 106: the peer
 //   is a namespace-disjoint one, which the callability rules keep out of the Agmen view for good.
@@ -458,6 +462,44 @@ test("E3: requests rejected 100, 102, 103, 105, 106, 107, 108 — matching code 
   assert.deepEqual(finalsOf(await diaries(h2.root, "beta"), "inreq").sort(), ["completed", "confirmed"]);
   assert.deepEqual(finalsOf(await diaries(h2.root, "beta"), "outreq"), ["sent"]);
 
+  // --- R2-9: 101/102/103 via direct inbox writes — no requestor involved; A0 answers from its
+  // in-memory registry. The idiom is the 108 one below: write `<rid>.json` into beta's inbox and
+  // wait for the archive (the file is gone).
+  const directReq = (name: string, parameters: unknown): Promise<string> => {
+    const rid = ulid();
+    const req: RequestFile = {
+      rid,
+      src: "alpha",
+      dst: "beta",
+      datetime: toIso(Date.now()),
+      type: "req",
+      actio_version: "0.1",
+      request: {
+        ts: Math.floor(Date.now() / 1000),
+        nonce: nonce(),
+        signature: null,
+        name,
+        parameters: parameters as Record<string, unknown>,
+        timeout: 60, // fresh: the answer must be the A0 code, not 108
+        attachments: [],
+      },
+    };
+    return io
+      .writeJsonAtomic(path.join(h.root, "beta", "inbox", `${rid}.json`), req, path.join(h.root, "beta"))
+      .then(() => waitFor(() => inboxNames(h.root, "beta").then((n) => !n.includes(`${rid}.json`)), 8_000))
+      .then(() => rid);
+  };
+  // 101 unknown_capability (direct): a capability beta never registered.
+  const rid101d = await directReq("ghost", {});
+  // 102 capability_disabled (direct): the live `echo` entry is flipped before the file lands.
+  ECHO.actio.disabled = true;
+  const rid102d = await directReq("echo", { text: "x" });
+  ECHO.actio.disabled = false; // restore: the file is archived, so A0 already ran with the flip
+  // 103 requestor_not_allowed (direct): `accepts_from` excludes the sender.
+  ECHO.actio.accepts_from = ["gamma"];
+  const rid103d = await directReq("echo", { text: "x" });
+  delete ECHO.actio.accepts_from; // restore
+
   // 105 invalid_parameters: parameters violating the capability schema.
   const r105 = await p.a.request("beta", "strict", { n: 1 });
   assert.equal(r105.finalStatus, "confirmed");
@@ -518,36 +560,56 @@ test("E3: requests rejected 100, 102, 103, 105, 106, 107, 108 — matching code 
     if (body === undefined || body.error !== true) return null;
     return (body.result as { code: number }).code;
   };
+  const finalOf = (rid: string): string | null => {
+    const line = bLines.find((l) => l.event === "inreq" && exchangeOf(l).req?.rid === rid);
+    return line === undefined ? null : (line.event_data as unknown as Exchange).final_status;
+  };
   const seqs = byRid(rec);
-  assert.equal(seqs.size, 11, "four commands, six answered requests, one 108 request");
+  assert.equal(seqs.size, 14, "four commands, six answered requests, one 108 request, three direct writes");
   for (const [rid] of seqs) {
     const appearances = appearedSeq(rec, rid);
-    const expected = rid === rid108 ? ["req", "res"] : appearances.includes("con") ? ["req", "res", "con"] : ["req"];
+    const expected =
+      rid === rid108 || rid === rid101d || rid === rid102d || rid === rid103d
+        ? ["req", "res"]
+        : appearances.includes("con")
+          ? ["req", "res", "con"]
+          : ["req"];
     assert.deepEqual(appearances, expected, `rid ${rid}: ${appearances.join(">")}`);
   }
   // the 108 rid really carries code 108, and the commands' rids are the two `enable`s and two `ping`s
   assert.equal(codeOf(rid108), 108);
+  // the direct-write rids carry their codes and archive as `completed`: they are A.0-answered
+  // rows with no requestor, so no confirmation ever arrives (protocol table: `confirmed`
+  // (`completed` on timeout)) — exactly like the 108 row above
+  assert.equal(codeOf(rid101d), 101);
+  assert.equal(finalOf(rid101d), "completed");
+  assert.equal(codeOf(rid102d), 102);
+  assert.equal(finalOf(rid102d), "completed");
+  assert.equal(codeOf(rid103d), 103);
+  assert.equal(finalOf(rid103d), "completed");
 
   // (c) both diaria validate; the final statuses:
-  // beta inreq: four commands `completed`, 100/102/103/105/107×2 `confirmed`, 108 `completed` (no con)
+  // beta inreq: four commands `completed`, 100/102/103/105/107×2 `confirmed`, the three direct
+  // 101/102/103 `completed` (no con — no requestor), 108 `completed` (no con)
   // alpha outreq: four commands `sent`, six `confirmed`
   await assertDiariaValid(h.root, ["alpha", "beta"]);
   assert.deepEqual(
     finalsOf(bLines, "inreq").sort(),
-    ["completed", "completed", "completed", "completed", "completed", "confirmed", "confirmed", "confirmed", "confirmed", "confirmed", "confirmed"],
+    ["completed", "completed", "completed", "completed", "completed", "completed", "completed", "completed", "confirmed", "confirmed", "confirmed", "confirmed", "confirmed", "confirmed"],
   );
   assert.deepEqual(
     finalsOf(await diaries(h.root, "alpha"), "outreq").sort(),
     ["confirmed", "confirmed", "confirmed", "confirmed", "confirmed", "confirmed", "sent", "sent", "sent", "sent"],
   );
-  // every archived error response carries its code, and the multiset is exactly the six rejection codes
+  // every archived error response carries its code: the six rejection codes plus the direct
+  // 101/102/103
   const codes = bLines
     .filter((l) => l.event === "inreq")
     .map((l) => resBody(exchangeOf(l)))
     .filter((b): b is ResponseBody => b !== undefined && b.error === true)
     .map((b) => (b.result as { code: number }).code)
     .sort((x, y) => x - y);
-  assert.deepEqual(codes, [100, 102, 103, 105, 107, 108]);
+  assert.deepEqual(codes, [100, 101, 102, 102, 103, 103, 105, 107, 108]);
 
   // (d) no attachments in any of these scenarios: the forum is empty
   assert.deepEqual(await forumNames(h.root), []);
