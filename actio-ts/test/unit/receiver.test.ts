@@ -176,6 +176,12 @@ async function makeEnv(
     hooks?: Partial<ReceiverHooks>;
   } = {},
 ): Promise<Env> {
+  // Registered BEFORE makeRoot's cleanup hook: node:test runs after-hooks in registration order,
+  // and D-9's archives (stop) must happen while the root still exists (teardown = D-9 then C2).
+  let receiver: Receiver | undefined;
+  t.after(async () => {
+    await receiver?.stop();
+  });
   const root = await makeRoot(t);
   const agent = path.join(root, "alpha");
   const inbox = path.join(agent, "inbox");
@@ -215,7 +221,7 @@ async function makeEnv(
       await diarium.append(agent, line); // the real append: validates (I-2) and writes diarium.jsonl
     },
   };
-  const receiver = new Receiver(
+  receiver = new Receiver(
     ctx,
     {
       onWatchError: (dir, err) => watchErrors.push({ dir, err }),
@@ -238,7 +244,6 @@ async function makeEnv(
     new Map((opts.entries ?? []).map((e) => [e.capability.name, e])),
     new Map(Object.entries(opts.commands ?? {})),
   );
-  t.after(() => receiver.stop());
   return {
     root,
     agent,
@@ -363,7 +368,7 @@ test("rejected at A0: error response with the code, then `confirmed`", async (t)
   assert.equal(data.final_status, "confirmed");
 });
 
-test("cancelled before acceptance: startup sees req + can → cancellation response → `cancelled`", async (t) => {
+test("request + cancellation both pending at start → cancellation response, `inreq cancelled`, no `log` line (R1-5)", async (t) => {
   let called = false;
   const env = await makeEnv(t, {
     entries: [makeEntry("echo", async () => {
@@ -375,7 +380,7 @@ test("cancelled before acceptance: startup sees req + can → cancellation respo
   const req = makeRequest(rid);
   await writeJson(env.inbox, `${rid}.json`, req);
   await writeJson(env.inbox, `${rid}.can.json`, makeCancellation(req));
-  await env.receiver.start(() => {});
+  await env.receiver.start(() => {}); // the watcher's initial scan delivers both (can before json, lexical)
   await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
   const res = await readRes(env.inbox, rid);
   assert.ok(res);
@@ -389,6 +394,7 @@ test("cancelled before acceptance: startup sees req + can → cancellation respo
   const [data] = inreqs(env);
   assert.equal(data.final_status, "cancelled");
   assert.ok(data.can);
+  assert.deepEqual(logLines(env), [], "the valid pending cancellation is matched, never reported as ignored");
 });
 
 test("cancelled during the work: the signal aborts, cancellation response, `cancelled`", async (t) => {
@@ -663,8 +669,7 @@ test("response attachments: published to the forum, listed in the response, dele
   await assert.rejects(fsp.access(forumFile), "response attachments are deleted at A4");
 });
 
-test("stop(): an accepted, unanswered request gets an error response with code 300", async (t) => {
-  const gate = deferred();
+test("stop(): a request in work → code 300 + `inreq completed` + inbox deleted, ALL before stop() resolves (R1-2)", async (t) => {
   const env = await makeEnv(t, {
     entries: [makeEntry("slow", async (_params, ctx) => {
       await new Promise<void>((resolve) => {
@@ -678,16 +683,90 @@ test("stop(): an accepted, unanswered request gets an error response with code 3
   const rid = ulid();
   const req = makeRequest(rid, { name: "slow" });
   await writeJson(env.inbox, `${rid}.json`, req);
-  await waitFor(() => env.receiver.runningCount() === 1, 3_000);
+  await waitFor(() => env.receiver.workingCount() === 1, 3_000);
+  assert.equal(env.receiver.runningCount(), 1);
   await env.receiver.stop();
-  const res = await readRes(env.inbox, rid);
-  assert.ok(res);
+  // Everything below already holds: stop() resolved only after the archive (E12).
+  const [data] = inreqs(env);
+  assert.ok(data, "the inreq event was archived before stop() resolved");
+  assert.equal(data.final_status, "completed", "no cancellation, no confirmation: the A4 rule");
+  const res = data.res as (ResponseFile & { response: ResponseBody }) | null;
+  assert.ok(res, "the code 300 response is the archived one (A4 deleted the inbox files)");
   assert.equal(res.response.error, true);
   assert.equal(res.response.cancellation, false);
   assert.equal(res.response.result.code, 300);
   assert.match(String(res.response.result.msg), /^agent_stopping/);
-  assert.equal(inreqs(env).length, 0, "not archived: the files stay for the next start (D-4)");
-  assert.ok((await inboxNames(env.inbox)).includes(`${rid}.json`));
+  assert.equal(data.con, null);
+  assert.deepEqual(await inboxNames(env.inbox), [], "the inbox files are deleted at A4");
+  assert.equal(env.receiver.runningCount(), 0);
+  assert.equal(env.receiver.workingCount(), 0);
+});
+
+test("stop(): an exchange waiting for confirmation is archived at once (R1-2)", async (t) => {
+  const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const req = makeRequest(rid);
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const res = await readRes(env.inbox, rid);
+  assert.ok(res);
+  assert.equal(res.response.error, false);
+  assert.equal(env.receiver.runningCount(), 1, "still tracked: waiting for the confirmation");
+  assert.equal(env.receiver.workingCount(), 0, "...but no in-flight work (stopGrace waits only for that)");
+  await env.receiver.stop();
+  const [data] = inreqs(env);
+  assert.ok(data, "archived before stop() resolved");
+  assert.equal(data.final_status, "completed", "D-9: `completed`, or `cancelled` if a cancellation was seen");
+  assert.deepEqual(data.res, res);
+  assert.equal(data.con, null);
+  assert.deepEqual(await inboxNames(env.inbox), []);
+});
+
+test("a published attachment is deleted at A4 even when the exchange is cancelled (R1-3)", async (t) => {
+  const handler: CapabilityHandler = async (_params, ctx) => {
+    await ctx.publishAttachment("art/leak.bin", new TextEncoder().encode("leak"));
+    await new Promise<void>((resolve) => {
+      if (ctx.signal.aborted) return resolve();
+      ctx.signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  };
+  const env = await makeEnv(t, { entries: [makeEntry("slow", handler)] });
+  await env.receiver.start(() => {});
+  const rid = ulid();
+  const req = makeRequest(rid, { name: "slow" });
+  await writeJson(env.inbox, `${rid}.json`, req);
+  const forumFile = path.join(env.forum, "art", "leak.bin");
+  await waitFor(() => fsp.access(forumFile).then(() => true, () => false), 3_000);
+  await writeJson(env.inbox, `${rid}.can.json`, makeCancellation(req));
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  const res = await readRes(env.inbox, rid);
+  assert.ok(res);
+  assert.equal(res.response.cancellation, true);
+  assert.deepEqual(res.response.attachments, [], "the cancellation response body carries no attachments");
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req));
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 3_000);
+  await assert.rejects(fsp.access(forumFile), "the file the handler published is deleted at A4");
+});
+
+test("a pending request is processed exactly once: the watcher's initial scan is the single delivery path (R1-5)", async (t) => {
+  let runs = 0;
+  const env = await makeEnv(t, {
+    entries: [makeEntry("echo", async () => {
+      runs += 1;
+      return { ok: true };
+    })],
+  });
+  const rid = ulid();
+  const req = makeRequest(rid);
+  await writeJson(env.inbox, `${rid}.json`, req);
+  await env.receiver.start(() => {});
+  await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
+  assert.equal(runs, 1, "the handler ran exactly once (no double delivery)");
+  await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req));
+  await waitFor(() => inboxNames(env.inbox).then((n) => n.length === 0), 3_000);
+  assert.equal(runs, 1);
+  assert.equal(inreqs(env).length, 1);
 });
 
 test("a watch error on the own inbox reaches onWatchError (D-22)", async (t) => {

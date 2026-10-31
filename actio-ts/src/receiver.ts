@@ -118,6 +118,8 @@ export class Receiver {
   private readonly archived = new Set<Rid>();
   /** D-15: `(path, mtime)` markers already reported; a log is emitted once per marker. */
   private readonly ignoredSeen = new Set<string>();
+  /** R1-5: a `.can`/`.con`/`.res` whose request file is still pending delivery, by rid. */
+  private readonly deferred = new Map<Rid, { kind: "can" | "res" | "con"; file: CancellationFile | ResponseFile | ConfirmationFile }[]>();
   /** D-5 for commands: the rids whose envelope this run has already dispatched (executed once). */
   private readonly commandRids = new Set<Rid>();
   /** Lane D: the envelopes handed over by `D0`, drained one at a time in rid order. */
@@ -133,8 +135,10 @@ export class Receiver {
     private readonly commands: Map<string, CommandHandler>,
   ) {}
 
-  /** Arms the inbox watcher and processes pending envelopes (D-4); every file event → `onFile`. */
-  start(onFile: (name: string) => void): Promise<void> {
+  /** Arms the inbox watcher. The watcher's initial scan (WP1 contract) is the SINGLE delivery path
+   * for the pending envelopes (D-4): every present file is reported exactly once, in lexical order.
+   * `start` resolves after arming; the delivery itself is asynchronous. Every file event → `onFile`. */
+  async start(onFile: (name: string) => void): Promise<void> {
     const inbox = this.ctx.folders.inbox;
     this.watcher = watchDir(
       inbox,
@@ -144,18 +148,6 @@ export class Receiver {
       },
       (err) => this.hooks.onWatchError(inbox, err), // D-22
     );
-    return this.initialScan(onFile);
-  }
-
-  /** D-4: one initial scan of the inbox; pending envelopes are processed in lexical order. */
-  private async initialScan(onFile: (name: string) => void): Promise<void> {
-    const names = (await io.listDir(this.ctx.folders.inbox)).filter((n) => n.endsWith(".json"));
-    names.sort();
-    for (const name of names) {
-      if (this.stopped) return;
-      onFile(name);
-      await this.processFile(name);
-    }
   }
 
   /** Dispatches one inbox file (schema validation first, D-15; header consistency, D-11). */
@@ -237,6 +229,7 @@ export class Receiver {
       responseAttachments: [],
     };
     this.exchanges.set(file.rid, ex); // tracked before A0 starts: a concurrent .can matches it
+    this.drainDeferred(ex); // R1-5: the envelopes that were delivered before the request was tracked
     this.guarded(file.rid, this.acceptAndRun(ex)); // A0 runs asynchronously: do not block the dispatcher
   }
 
@@ -369,56 +362,104 @@ export class Receiver {
     this.ctx.emit({ event: "inreq", rid: file.rid, finalStatus });
   }
 
+  /** R1-5: park one envelope until the request of its rid is tracked (the request file is present
+   * in the inbox but its delivery has not happened yet — the watcher delivers in lexical order, so
+   * a `.can.json` reaches us before its `.json`). */
+  private defer(rid: Rid, kind: "can" | "res" | "con", file: CancellationFile | ResponseFile | ConfirmationFile): void {
+    const list = this.deferred.get(rid);
+    if (list === undefined) this.deferred.set(rid, [{ kind, file }]);
+    else list.push({ kind, file });
+  }
+
+  /** R1-5: deliver the envelopes deferred for this rid — cancellation first, then response and
+   * confirmation in arrival order. Runs synchronously in `dispatchRequest`, before A0 starts. */
+  private drainDeferred(ex: ExchangeState): void {
+    const list = this.deferred.get(ex.rid);
+    if (list === undefined) return;
+    this.deferred.delete(ex.rid);
+    const cans = list.filter((d) => d.kind === "can");
+    const rest = list.filter((d) => d.kind !== "can");
+    for (const d of [...cans, ...rest]) {
+      const name = `${ex.rid}.${d.kind}.json`;
+      const full = path.join(this.ctx.folders.inbox, name);
+      if (d.kind === "can") {
+        const reason = this.applyCancellation(ex, d.file as CancellationFile);
+        if (reason !== null) void this.ignore(full, name, reason);
+      } else if (d.kind === "res") {
+        this.applyResponse(ex, d.file as ResponseFile);
+      } else {
+        const reason = this.applyConfirmation(ex, d.file as ConfirmationFile);
+        if (reason !== null) void this.ignore(full, name, reason);
+      }
+    }
+  }
+
   /** A response file: ours (echoed by the watcher) or a leftover of a previous run (D-4). */
   private async dispatchResponse(file: ResponseFile): Promise<void> {
     const ex = this.exchanges.get(file.rid); // D-2: match exchanges by rid, never by file name
     if (ex === undefined) {
-      // D-4: a `.res.json` left by a previous run without its confirmation → re-track it and
-      // restart the confirmation timer from now.
-      await this.retrackFromResponse(file);
+      if (await io.exists(path.join(this.ctx.folders.inbox, `${file.rid}.json`))) {
+        this.defer(file.rid, "res", file); // R1-5: the request file is still pending delivery
+        return;
+      }
+      await this.retrackFromResponse(file); // D-4: a bare `.res.json` left by a previous run
       return;
     }
-    if (ex.res === null) ex.res = file; // our own write echoed back by the watcher
+    if (ex.res === null) this.applyResponse(ex, file);
+  }
+
+  /** The effect of one matched response, by phase. A response for an exchange that has not
+   * responded yet (a deferred D-4 leftover) puts it in `responded` and arms the confirmation wait. */
+  private applyResponse(ex: ExchangeState, file: ResponseFile): void {
+    ex.res = file;
+    if (ex.phase === "responded") return; // our own echo: `respond()` already armed the wait
+    ex.phase = "responded";
+    if (ex.con !== null) {
+      this.guarded(ex.rid, this.archive(ex)); // the confirmation already arrived (out of order)
+      return;
+    }
+    ex.confirmTimer = setTimeout(() => this.guarded(ex.rid, this.archive(ex)), this.ctx.config.confirmTimeout);
+  }
+
+  /** The effect of one matched cancellation, by phase. Returns the ignore reason when the envelope
+   * does not belong to this exchange (D-11 header, name match); the caller reports it (D-15). */
+  private applyCancellation(ex: ExchangeState, file: CancellationFile): string | null {
+    if (!sameHeader(file, ex.header)) return `header mismatch for rid ${ex.rid} (D-11)`;
+    if (ex.can !== null) return null; // the cancellation file is written once; later ones are no-ops
+    if (
+      ex.request !== null &&
+      !nameMatches(ex.request.request as RequestBody, file.cancellation as CancellationBody)
+    ) {
+      return `cancellation name mismatch for rid ${ex.rid}`;
+    }
+    ex.can = file;
+    ex.canSeen = true;
+    if (ex.phase === "working") ex.abort?.abort(); // A3: stop the work
+    // "accepting": A0 checks canSeen before starting work (and re-reads the can file);
+    // "responded": no second response — the exchange simply ends as `cancelled` at the archive.
+    return null;
   }
 
   /** A cancellation file: matched by rid (D-2) with the header check (D-11) first. */
   private async dispatchCancellation(full: string, name: string, file: CancellationFile): Promise<void> {
     const ex = this.exchanges.get(file.rid);
     if (ex === undefined) {
+      if (await io.exists(path.join(this.ctx.folders.inbox, `${file.rid}.json`))) {
+        this.defer(file.rid, "can", file); // R1-5: matched once the request is tracked
+        return;
+      }
       await this.ignore(full, name, `unmatched rid ${file.rid} (no tracked exchange)`);
       return;
     }
-    if (!sameHeader(file, ex.header)) {
-      await this.ignore(full, name, `header mismatch for rid ${file.rid} (D-11)`);
-      return;
-    }
-    if (ex.can !== null) return; // the cancellation file is written once; later ones are no-ops
-    if (
-      ex.request !== null &&
-      !nameMatches(ex.request.request as RequestBody, file.cancellation as CancellationBody)
-    ) {
-      await this.ignore(full, name, `cancellation name mismatch for rid ${file.rid}`);
-      return;
-    }
-    ex.can = file;
-    ex.canSeen = true;
-    if (ex.phase === "working") ex.abort?.abort(); // A3: stop the work
-    // "accepting": A0 checks canSeen before starting work; "responded": no second response —
-    // the exchange simply ends as `cancelled` at the archive.
+    const reason = this.applyCancellation(ex, file);
+    if (reason !== null) await this.ignore(full, name, reason);
   }
 
-  /** A confirmation file: matched by rid (D-2) with the header check (D-11) first. */
-  private async dispatchConfirmation(full: string, name: string, file: ConfirmationFile): Promise<void> {
-    const ex = this.exchanges.get(file.rid);
-    if (ex === undefined) {
-      await this.ignore(full, name, `unmatched rid ${file.rid} (no tracked exchange)`);
-      return;
-    }
-    if (!sameHeader(file, ex.header)) {
-      await this.ignore(full, name, `header mismatch for rid ${file.rid} (D-11)`);
-      return;
-    }
-    if (ex.con !== null) return; // the confirmation file is written once; later ones are no-ops
+  /** The effect of one matched confirmation, by phase. Returns the ignore reason on a D-11
+   * header mismatch; the caller reports it (D-15). */
+  private applyConfirmation(ex: ExchangeState, file: ConfirmationFile): string | null {
+    if (!sameHeader(file, ex.header)) return `header mismatch for rid ${ex.rid} (D-11)`;
+    if (ex.con !== null) return null; // the confirmation file is written once; later ones are no-ops
     ex.con = file;
     if (ex.phase === "responded" && ex.res !== null) {
       if (ex.confirmTimer) {
@@ -428,9 +469,28 @@ export class Receiver {
       this.guarded(ex.rid, this.archive(ex));
     }
     // a confirmation before the response (out of order) is stored: A2 archives immediately
+    return null;
   }
 
-  /** Closes the watcher, aborts in-flight work per D-9 (stop semantics are the agent's). */
+  /** A confirmation file: matched by rid (D-2) with the header check (D-11) first. */
+  private async dispatchConfirmation(full: string, name: string, file: ConfirmationFile): Promise<void> {
+    const ex = this.exchanges.get(file.rid);
+    if (ex === undefined) {
+      if (await io.exists(path.join(this.ctx.folders.inbox, `${file.rid}.json`))) {
+        this.defer(file.rid, "con", file); // R1-5: matched once the request is tracked
+        return;
+      }
+      await this.ignore(full, name, `unmatched rid ${file.rid} (no tracked exchange)`);
+      return;
+    }
+    const reason = this.applyConfirmation(ex, file);
+    if (reason !== null) await this.ignore(full, name, reason);
+  }
+
+  /** D-9 (receiver side), fully archiving: `stop()` awaits every archive before it resolves (E12 —
+   * the agent's C1 runs after `stop()`). Accepted-and-unanswered requests get the code 300 response
+   * first; every exchange that has a response is then archived with the normal A4 rule. Exchanges
+   * still in `accepting` stay in the inbox for the next start (D-4). */
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
@@ -441,21 +501,36 @@ export class Receiver {
         clearTimeout(ex.confirmTimer);
         ex.confirmTimer = undefined;
       }
-      if (ex.phase !== "working") continue; // "accepting" was not accepted; "responded" is answered
-      // D-9 (receiver side): an accepted, unanswered request → error response with code 300.
-      ex.abort?.abort();
-      await this.writeResponse(ex, {
-        cancellation: false,
-        error: true,
-        result: { code: 300, msg: "agent_stopping: the agent stops before answering" },
-        attachments: [],
-      });
     }
+    const toArchive: ExchangeState[] = [];
+    for (const ex of this.exchanges.values()) {
+      if (ex.phase === "working" && ex.res === null) {
+        // D-9: an accepted, unanswered request → error response with code 300 (the single response;
+        // the `ex.res === null` check keeps the rule even if the work settled in this very moment).
+        ex.abort?.abort();
+        await this.writeResponse(ex, {
+          cancellation: false,
+          error: true,
+          result: { code: 300, msg: "agent_stopping: the agent stops before answering" },
+          attachments: [],
+        });
+      }
+      if (ex.res !== null) toArchive.push(ex); // waiting for confirmation, or answered with 300
+    }
+    for (const ex of toArchive) await this.archive(ex);
   }
 
   /** Number of inbound exchanges in A1/A2/A3 (for busy, D-8) and capability_status. */
   runningCount(): number {
     return this.exchanges.size;
+  }
+
+  /** The exchanges whose handler is running (phase `working`): the agent's `stopGrace` wait (D-9
+   * `force=false`) waits only for these, not for the confirmations. */
+  workingCount(): number {
+    let n = 0;
+    for (const ex of this.exchanges.values()) if (ex.phase === "working") n += 1;
+    return n;
   }
 
   /** A0: the acceptance checks in table order (first failure found is answered) → A1 → A2. */
@@ -616,13 +691,17 @@ export class Receiver {
     }
     await io.writeJsonAtomic(path.join(this.ctx.folders.inbox, `${ex.rid}.res.json`), checked.value, this.ctx.folders.agent);
     ex.res = checked.value;
-    ex.responseAttachments = options.attachments;
+    // R1-3: `ex.responseAttachments` is NOT touched here — it is grown ONLY by `publishAttachment`,
+    // so A4 deletes every file the handler published, whatever THIS response body carried
+    // (a cancellation or a code 300 response carries `attachments: []` by schema rule).
     ex.phase = "responded";
   }
 
-  /** A4: the `inreq` diarium event, then delete all files of the rid and the response attachments. */
+  /** A4: the `inreq` diarium event, then delete all files of the rid and the response attachments.
+   * No `stopped` guard: `stop()` itself awaits these archives (R1-2); after `stop()` no other entry
+   * point can trigger one (every dispatcher is `stopped`-guarded and the timers are cleared). */
   private async archive(ex: ExchangeState): Promise<void> {
-    if (this.stopped || !this.exchanges.has(ex.rid)) return;
+    if (!this.exchanges.has(ex.rid)) return;
     if (ex.confirmTimer) {
       clearTimeout(ex.confirmTimer);
       ex.confirmTimer = undefined;
