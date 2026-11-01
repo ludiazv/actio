@@ -230,7 +230,7 @@ export class ActioAgent {
     await this.reannounceAfterDelay(`agent ${this.options.id} failed: ${message}`);
   }
 
-  /** Lane C, D-9 (v11) in that order: heartbeat + scan, grace, receiver, abandon B2, C1 → C2. */
+  /** Lane C, D-9 in that order: heartbeat + scan, grace, receiver, abandon B2, C1 → C2. */
   async stop(options?: { force?: boolean }): Promise<void> {
     if (!this.running || this.stopping) return; // idempotent: a second stop() resolves
     this.stopping = true;
