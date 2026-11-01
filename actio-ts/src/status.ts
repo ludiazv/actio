@@ -1,4 +1,4 @@
-// Self-publication (WP3): spec.json/status.json publication, the announce file, the heartbeat
+// Self-publication: spec.json/status.json publication, the announce file, the heartbeat
 // timer and the health derivation (*Agent's status*).
 import path from "node:path";
 import * as diarium from "./diarium.js";

@@ -1,4 +1,4 @@
-// `actio` CLI (WP8, §2.8): ls, diarium, call, cmd, broadcast, validate. Reads ACTIO_DIR/ACTIO_SYNC.
+// `actio` CLI (§2.8): ls, diarium, call, cmd, broadcast, validate. Reads ACTIO_DIR/ACTIO_SYNC.
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -36,7 +36,7 @@ interface Call {
 }
 
 /** `call`'s own default wait in seconds: a CLI process has no heartbeat to keep it alive, so it
- * must not send `timeout: 0` — that is what a started agent may afford (Q3 §2, plan v10). */
+ * must not send `timeout: 0` — that is what only a started agent may afford. */
 const DEFAULT_TIMEOUT = 60;
 
 const USAGE =
@@ -76,7 +76,7 @@ function num(opt: Record<string, string>, flag: string, def: number): number {
   return value;
 }
 
-/** `--timeout`: seconds, strictly above 0, else the usage error that states the rule (Q3 §2). */
+/** `--timeout`: seconds, strictly above 0, else the usage error that states the rule. */
 function timeoutOf(opt: Record<string, string>): number {
   const raw = opt["--timeout"];
   if (raw === undefined) return DEFAULT_TIMEOUT;
@@ -236,7 +236,7 @@ async function send(c: Call, mode: "call" | "cmd"): Promise<number> {
   try {
     if (mode === "cmd") {
       // Only the rid: the envelope is delivered, not executed. A command is never answered, so a
-      // peer-side D4 `dropped` is the peer's decision and the CLI cannot know it (Q3 §3).
+      // peer-side D4 `dropped` is the peer's decision and the CLI cannot know it.
       c.out(`rid: ${await requestor.command(dst, name, params)}`); // written; the peer archives it (D3)
       return 0;
     }

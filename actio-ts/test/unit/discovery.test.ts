@@ -1,10 +1,10 @@
-// Tests of the discovery scan, the callability rules 1–8 and the Agmen view (WP4).
+// Tests of the discovery scan and the callability rules 1–8 (the Agmen view of one peer).
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { test } from "node:test";
 import * as io from "../../src/io.js";
-import { buildAgmen, callable, scan } from "../../src/discovery.js";
+import { callable, scan } from "../../src/discovery.js";
 import type { DiscoveredAgent, ScanResult } from "../../src/discovery.js";
 import { toIso } from "../../src/util.js";
 import { validateSpec, validateStatus } from "../../src/validate.js";
@@ -347,6 +347,53 @@ test("scan of a folder whose only material is an unparsable status.json says so"
   assert.deepEqual((await scan(root)).ignored, [{ path: path.join(dir, "status.json"), reason: "not valid JSON" }]);
 });
 
+// A capability list that repeats a name is schema-valid (JSON Schema cannot express uniqueness across
+// array elements), so the scan has to reject it as rule 3 does, and say which name it repeats.
+test("scan ignores a peer spec that repeats a capability name, and names the repetition", async (t) => {
+  const root = await makeRoot(t);
+  const twice = peerSpec({ capabilities: [capOf("work"), capOf("play"), capOf("work"), capOf("play")] });
+  assert.ok(validateSpec(twice).ok, "the schema accepts it: it is the rules outside the schema that reject it");
+  await writeAgent(root, PEER, twice, statusOf(PEER, "idle"));
+  assert.deepEqual(await scan(root), {
+    agents: [],
+    duplicates: [],
+    ignored: [{ path: path.join(root, PEER, "spec.json"), reason: `duplicate capability name "work"` }],
+  }); // the FIRST repeated name, and the offending file as the path
+});
+
+test("a duplicate-name peer does not disturb the discovery of a valid peer", async (t) => {
+  const root = await makeRoot(t);
+  await writeAgent(root, "01-good", peerSpec({ capabilities: [capOf("work"), capOf("play")] }), statusOf(PEER, "idle"));
+  await writeAgent(root, "02-dup", peerSpec({ id: "dup", capabilities: [capOf("x"), capOf("x")] }), statusOf("dup", "idle"));
+  const result = await scan(root);
+  assert.deepEqual(result.agents.map((a) => a.spec.id), [PEER]);
+  assert.deepEqual(result.duplicates, []);
+  assert.deepEqual(result.ignored, [
+    { path: path.join(root, "02-dup", "spec.json"), reason: `duplicate capability name "x"` },
+  ]);
+});
+
+test("the duplicate-name rejection comes before the D-3 ID match: reported, never a duplicate", async (t) => {
+  const root = await makeRoot(t);
+  await writeAgent(root, "01-first", peerSpec(), statusOf(PEER, "idle")); // the ID "beta" is taken here
+  await writeAgent(root, "02-twin-dup", peerSpec({ capabilities: [capOf("work"), capOf("work")] }), statusOf(PEER, "busy"));
+  const result = await scan(root); // same ID, but an unusable spec: rule 3 decides first
+  assert.deepEqual(result.agents.map((a) => a.folder), [path.join(root, "01-first")]);
+  assert.deepEqual(result.duplicates, [], "an unusable spec never reaches the D-3 duplicate list");
+  assert.deepEqual(result.ignored, [
+    { path: path.join(root, "02-twin-dup", "spec.json"), reason: `duplicate capability name "work"` },
+  ]);
+});
+
+test("a duplicate-name spec is reported once: the bad status adds no second entry", async (t) => {
+  const root = await makeRoot(t);
+  const dup = peerSpec({ capabilities: [capOf("work"), capOf("work")] });
+  await writeAgent(root, PEER, dup, { ...statusOf(PEER, "idle"), status: "sleeping" });
+  assert.deepEqual((await scan(root)).ignored, [
+    { path: path.join(root, PEER, "spec.json"), reason: `duplicate capability name "work"` },
+  ]); // the spec decides, as it does for a schema failure
+});
+
 test("D-3: the first folder in lexical order keeps a duplicated ID, the rest are reported", async (t) => {
   const root = await makeRoot(t);
   const order = ["03-third", "01-first", "02-second"]; // listed out of order to prove the scan sorts
@@ -416,61 +463,3 @@ test("scan of a missing root propagates the error instead of inventing an empty 
   await assert.rejects(() => scan(missing), /ENOENT/);
 });
 
-// --- buildAgmen ---
-
-test("buildAgmen keys the view by spec ID and keeps only callable peers", async (t) => {
-  const root = await makeRoot(t);
-  const self = selfSpec({ accepts_commands_from: [SELF], capabilities: [capOf("own")] });
-  await writeAgent(root, SELF, self, statusOf(SELF, "idle")); // our own folder: self-calls are legal
-  await writeAgent(root, "01-peer", peerSpec(), statusOf(PEER, "busy")); // callable, in another folder name
-  await writeAgent(root, "02-foreign", peerSpec({ id: "foreign", namespaces: ["ns9"] }), statusOf("foreign", "idle"));
-  await writeAgent(root, "03-asleep", peerSpec({ id: "asleep" }), statusOf("asleep", "inactive"));
-  await writeAgent(root, "04-zombie", peerSpec({ id: "zombie" }), statusOf("zombie", "idle", toIso(T0 - 700_000)));
-  const brokenSpec = { ...peerSpec({ id: "broken" }), capabilities: "nope" };
-  await writeAgent(root, "05-broken", brokenSpec, statusOf("broken", "idle"));
-  await writeAgent(root, "06-twin", peerSpec(), statusOf(PEER, "idle")); // duplicate of 01-peer's ID
-  await io.writeJsonAtomic(path.join(root, "actio.json"), { id: "not-an-agent" }, root);
-
-  const agmen = await buildAgmen(root, self, T0);
-  assert.deepEqual([...agmen.keys()].sort(), ["alpha", "beta", "zombie"]); // foreign, asleep, broken, twin absent
-  assert.equal(agmen.get("beta")!.folder, path.join(root, "01-peer")); // the lexical winner of the duplicate
-  assert.equal(agmen.get("alpha")!.id, SELF);
-  assert.equal(agmen.get("zombie")!.health, "zombie"); // flagged, not filtered
-});
-
-test("buildAgmen includes our own folder only when the scan finds it valid", async (t) => {
-  const root = await makeRoot(t);
-  const self = selfSpec();
-  await writeAgent(root, "elsewhere", peerSpec(), statusOf(PEER, "idle"));
-  const withoutSelf = await buildAgmen(root, self, T0);
-  assert.deepEqual([...withoutSelf.keys()], [PEER]);
-  await writeAgent(root, SELF, self, statusOf(SELF, "idle"));
-  const withSelf = await buildAgmen(root, self, T0);
-  assert.deepEqual([...withSelf.keys()].sort(), [SELF, PEER]); // SELF = "alpha" sorts first
-  assert.deepEqual([...withoutSelf.get(PEER)!.capabilities.keys()], ["work"]);
-});
-
-test("buildAgmen applies every callability rule: disabled peers stay for commands only", async (t) => {
-  const root = await makeRoot(t);
-  const self = selfSpec();
-  await writeAgent(root, "01-off", peerSpec({ id: "off", disabled: true }), statusOf("off", "idle"));
-  const noCommands = peerSpec({ id: "nocommands", accepts_commands_from: [] });
-  const untrusted = peerSpec({ id: "untrusted", security_posture: "untrusted" });
-  await writeAgent(root, "02-nocommands", noCommands, statusOf("nocommands", "idle"));
-  await writeAgent(root, "03-untrusted", untrusted, statusOf("untrusted", "idle"));
-  const agmen = await buildAgmen(root, self, T0);
-  assert.deepEqual([...agmen.keys()].sort(), ["nocommands", "off"]);
-  assert.deepEqual([...agmen.get("off")!.capabilities.keys()], []); // rule 1
-  assert.equal(agmen.get("off")!.commands, true);
-  assert.deepEqual([...agmen.get("nocommands")!.capabilities.keys()], ["work"]); // rule 5.1: commands false
-  assert.equal(agmen.get("nocommands")!.commands, false);
-});
-
-test("buildAgmen re-scan: a peer that turns inactive leaves the view", async (t) => {
-  const root = await makeRoot(t);
-  const self = selfSpec();
-  await writeAgent(root, PEER, peerSpec(), statusOf(PEER, "idle"));
-  assert.deepEqual([...(await buildAgmen(root, self, T0)).keys()], [PEER]);
-  await io.writeJsonAtomic(path.join(root, PEER, "status.json"), statusOf(PEER, "inactive"), path.join(root, PEER));
-  assert.deepEqual([...(await buildAgmen(root, self, T0 + 5000)).keys()], []); // a complete re-scan
-});

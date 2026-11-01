@@ -1,4 +1,4 @@
-// Diarium (WP3): append + typed event builders. append() validates with validateDiarium before
+// Diarium: append + typed event builders. append() validates with validateDiarium before
 // writing (a bug, not a peer, produced the event → throw).
 import path from "node:path";
 import { appendJsonl } from "./io.js";

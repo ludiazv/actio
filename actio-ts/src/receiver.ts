@@ -1,4 +1,4 @@
-// Receiver (WP5): lanes A (requests) and D (commands) — inbox dispatch, per-rid exchange
+// Receiver: lanes A (requests) and D (commands) — inbox dispatch, per-rid exchange
 // tracker, acceptance checks, work with AbortSignal, response, confirmation wait, archive,
 // and command dispatch (D0–D4) with the four built-ins handed to the agent lifecycle.
 import { open, readFile, rename, stat } from "node:fs/promises";
@@ -39,11 +39,11 @@ import type {
   Spec,
 } from "./generated/types.js";
 
-/** Lifecycle callbacks the receiver hands over to the ActioAgent (wired in WP7). */
+/** Lifecycle callbacks the receiver hands over to the owning agent (§2.7). */
 export interface ReceiverHooks {
   /** Watch error on the own inbox (D-22): the agent logs and fails itself. */
   onWatchError(dir: string, err: Error): void;
-  /** I-11: the requestor's spec as DISCOVERED by the last scan (before the callability rules, R2-4),
+  /** I-11: the requestor's spec as DISCOVERED by the last scan (before the callability rules),
    * or undefined when the scan did not find it: D-7's code 106 needs exactly this view, because a peer
    * with no shared namespace is never in the Agmen view. */
   peerSpec(src: AgentId): Spec | undefined;
@@ -119,9 +119,9 @@ export class Receiver {
   private readonly archived = new Set<Rid>();
   /** D-15: `(path, mtime)` markers already reported; a log is emitted once per marker. */
   private readonly ignoredSeen = new Set<string>();
-  /** R1-5: a `.can`/`.con`/`.res` whose request file is still pending delivery, by rid. */
+  /** Envelopes that arrived before their request: a `.can`/`.con`/`.res`, by rid. */
   private readonly deferred = new Map<Rid, { kind: "can" | "res" | "con"; file: CancellationFile | ResponseFile | ConfirmationFile }[]>();
-  /** P-5: the promise of every archive in flight, by rid; `stop()` awaits them all, so that when
+  /** D-9: the promise of every archive in flight, by rid; `stop()` awaits them all, so that when
    * it resolves EVERY archive has landed (the inreq line and the envelope removals precede C1). */
   private readonly archiving = new Map<Rid, Promise<void>>();
   /** D-5 for commands: the rids whose envelope this run has already dispatched (executed once). */
@@ -139,7 +139,7 @@ export class Receiver {
     private readonly commands: Map<string, CommandHandler>,
   ) {}
 
-  /** Arms the inbox watcher. The watcher's initial scan (WP1 contract) is the SINGLE delivery path
+  /** Arms the inbox watcher. The watcher's initial scan (§2.1) is the SINGLE delivery path
    * for the pending envelopes (D-4): every present file is reported exactly once, in lexical order.
    * `start` resolves after arming; the delivery itself is asynchronous. Every file event → `onFile`. */
   async start(onFile: (name: string) => void): Promise<void> {
@@ -233,7 +233,7 @@ export class Receiver {
       responseAttachments: [],
     };
     this.exchanges.set(file.rid, ex); // tracked before A0 starts: a concurrent .can matches it
-    this.drainDeferred(ex); // R1-5: the envelopes that were delivered before the request was tracked
+    this.drainDeferred(ex); // the envelopes delivered before this request was tracked
     this.guarded(file.rid, this.acceptAndRun(ex)); // A0 runs asynchronously: do not block the dispatcher
   }
 
@@ -321,7 +321,7 @@ export class Receiver {
     await this.archiveCommand(file, "completed"); // executed: the envelope was accepted and run
   }
 
-  /** `D1` for the four mandatory commands: the parsed parameters go to the agent lifecycle (WP7). */
+  /** `D1` for the four mandatory commands: the parsed parameters go to the agent lifecycle hooks (§2.7). */
   private async runStandardCommand(name: string, parameters: unknown): Promise<void> {
     // `commandRules` fixed the shape (`stop {force?}`, `enable {enabled}`, `restart {force?, delay?}`,
     // `ping null`), so these reads cover every accepted envelope; anything else never reached here.
@@ -366,7 +366,7 @@ export class Receiver {
     this.ctx.emit({ event: "inreq", rid: file.rid, finalStatus });
   }
 
-  /** R1-5: park one envelope until the request of its rid is tracked (the request file is present
+  /** Park one envelope until the request of its rid is tracked (the request file is present
    * in the inbox but its delivery has not happened yet — the watcher delivers in lexical order, so
    * a `.can.json` reaches us before its `.json`). */
   private defer(rid: Rid, kind: "can" | "res" | "con", file: CancellationFile | ResponseFile | ConfirmationFile): void {
@@ -375,7 +375,7 @@ export class Receiver {
     else list.push({ kind, file });
   }
 
-  /** R1-5: deliver the envelopes deferred for this rid — cancellation first, then response and
+  /** Deliver the envelopes deferred for this rid — cancellation first, then response and
    * confirmation in arrival order. Runs synchronously in `dispatchRequest`, before A0 starts. */
   private drainDeferred(ex: ExchangeState): void {
     const list = this.deferred.get(ex.rid);
@@ -403,7 +403,7 @@ export class Receiver {
     const ex = this.exchanges.get(file.rid); // D-2: match exchanges by rid, never by file name
     if (ex === undefined) {
       if (await io.exists(path.join(this.ctx.folders.inbox, `${file.rid}.json`))) {
-        this.defer(file.rid, "res", file); // R1-5: the request file is still pending delivery
+        this.defer(file.rid, "res", file); // the request file is still pending delivery
         return;
       }
       await this.retrackFromResponse(file); // D-4: a bare `.res.json` left by a previous run
@@ -449,7 +449,7 @@ export class Receiver {
     const ex = this.exchanges.get(file.rid);
     if (ex === undefined) {
       if (await io.exists(path.join(this.ctx.folders.inbox, `${file.rid}.json`))) {
-        this.defer(file.rid, "can", file); // R1-5: matched once the request is tracked
+        this.defer(file.rid, "can", file); // matched once the request is tracked
         return;
       }
       await this.ignore(full, name, `unmatched rid ${file.rid} (no tracked exchange)`);
@@ -481,7 +481,7 @@ export class Receiver {
     const ex = this.exchanges.get(file.rid);
     if (ex === undefined) {
       if (await io.exists(path.join(this.ctx.folders.inbox, `${file.rid}.json`))) {
-        this.defer(file.rid, "con", file); // R1-5: matched once the request is tracked
+        this.defer(file.rid, "con", file); // matched once the request is tracked
         return;
       }
       await this.ignore(full, name, `unmatched rid ${file.rid} (no tracked exchange)`);
@@ -492,7 +492,7 @@ export class Receiver {
   }
 
   /** D-9 (receiver side), fully archiving: `stop()` awaits every archive before it resolves — the
-   * stop-archives and the ones already in flight (P-5; E12: the agent's C1 runs after `stop()`).
+   * stop-archives and the ones already in flight (D-9: the agent's C1 runs after `stop()`).
    * Accepted-and-unanswered requests get the code 300 response first; every exchange that has a
    * response is then archived with the normal A4 rule. Exchanges still in `accepting` stay in the
    * inbox for the next start (D-4). */
@@ -523,7 +523,7 @@ export class Receiver {
       if (ex.res !== null) toArchive.push(ex); // waiting for confirmation, or answered with 300
     }
     for (const ex of toArchive) this.startArchive(ex);
-    // P-5: the map now holds the stop-archives together with every archive that was already in
+    // D-9: the map now holds the stop-archives together with every archive that was already in
     // flight (confirmation-triggered, started before stop()); no new one can start (the dispatchers
     // are stopped-guarded and the timers are cleared). Awaiting them all: when stop() resolves,
     // EVERY archive has landed.
@@ -701,14 +701,14 @@ export class Receiver {
     }
     await io.writeJsonAtomic(path.join(this.ctx.folders.inbox, `${ex.rid}.res.json`), checked.value, this.ctx.folders.agent);
     ex.res = checked.value;
-    // R1-3: `ex.responseAttachments` is NOT touched here — it is grown ONLY by `publishAttachment`,
+    // `ex.responseAttachments` is NOT touched here — it is grown ONLY by `publishAttachment`,
     // so A4 deletes every file the handler published, whatever THIS response body carried
     // (a cancellation or a code 300 response carries `attachments: []` by schema rule).
     ex.phase = "responded";
   }
 
   /** A4: the `inreq` diarium event, then delete all files of the rid and the response attachments.
-   * No `stopped` guard: `stop()` itself awaits these archives (R1-2); after `stop()` no other entry
+   * No `stopped` guard: `stop()` itself awaits these archives (D-9); after `stop()` no other entry
    * point can trigger one (every dispatcher is `stopped`-guarded and the timers are cleared). */
   private async archive(ex: ExchangeState): Promise<void> {
     // One archive per rid: `archived` is marked BEFORE the first await, so an envelope landing while
@@ -761,10 +761,10 @@ export class Receiver {
       this.startArchive(ex); // confirmed before this run started
       return;
     }
-    ex.confirmTimer = setTimeout(() => this.startArchive(ex), this.ctx.config.confirmTimeout); // P-6: tracked, so stop() awaits it
+    ex.confirmTimer = setTimeout(() => this.startArchive(ex), this.ctx.config.confirmTimeout); // tracked, so stop() awaits it (D-9)
   }
 
-  /** Starts one archive and tracks its promise (P-5: `stop()` awaits the in-flight ones). A second
+  /** Starts one archive and tracks its promise (D-9: `stop()` awaits the in-flight ones). A second
    * start for the same rid is a no-op: the D-5 guard makes the second `archive()` return at once,
    * so tracking only the first never loses an in-flight archive. Failures are reported, not thrown. */
   private startArchive(ex: ExchangeState): void {
@@ -831,14 +831,14 @@ export class Receiver {
     this.ignoredSeen.add(key);
     this.ctx.emit({ event: "ignored", path: full, reason });
     await this.ctx.appendDiarium(diarium.logEvent(this.ctx.id, this.ctx.now(), `ignored ${name}: ${reason}`));
-    // P-3: an ignored request file is never tracked — the envelopes deferred for its rid are
+    // An ignored request file is never tracked — the envelopes deferred for its rid are
     // orphans: drop them from `deferred` and log each once (the files stay in the inbox; D-16).
     if (!/\.(can|res|con)\.json$/.test(name)) {
       await this.dropDeferredFor(name.slice(0, -".json".length));
     }
   }
 
-  /** P-3: the request of `rid` was ignored (D-15) and will never be tracked — drop the envelopes
+  /** The request of `rid` was ignored (D-15) and will never be tracked — drop the envelopes
    * deferred for it and log each once (the same `ignore()` pattern: one event + one diarium line). */
   private async dropDeferredFor(rid: Rid): Promise<void> {
     const list = this.deferred.get(rid);

@@ -1,4 +1,4 @@
-// ActioAgent (WP7): lifecycle steps 1–5, lane C wiring, commands, and the public API of §2.7.
+// ActioAgent: lifecycle steps 1–5, lane C wiring, commands, and the public API of §2.7.
 import path from "node:path";
 import { defaultConfig, loadConfig } from "./config.js";
 import * as diarium from "./diarium.js";
@@ -46,7 +46,7 @@ function why(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** D-22's wording (R2-5): the error's `code` when it has one, its message as the fallback. */
+/** D-22's wording: the error's `code` when it has one, its message as the fallback. */
 function errCode(err: unknown): string {
   return (err as NodeJS.ErrnoException).code ?? why(err);
 }
@@ -58,7 +58,7 @@ export class ActioAgent {
   private readonly listeners: ((e: ActioEvent) => void)[] = [];
   /** D-19 (peer side): compiled peer capabilities, cached per (id, spec datetime, capability). */
   private readonly peerSchemas = new Map<string, CompiledCapability | null>();
-  /** R2-6 (§2.6, D-21): nothing of the environment is read at construction; `start()` loads the config.
+  /** §2.6, D-21: nothing of the environment is read at construction; `start()` loads the config.
    * `root: ""` is a placeholder: no path of the shared tree may be used before `start()`. */
   private config: ActioConfig = { ...defaultConfig, root: "", clock: Date.now };
   private folders: AgentFolders = { root: "", agent: "", inbox: "", forum: "", nuntium: "" };
@@ -71,15 +71,15 @@ export class ActioAgent {
   private currentSpec!: Spec; // the spec published by the current start (set by `buildSpecNow`)
   private current: StatusState = "inactive";
   private view = new Map<AgentId, AgentView>();
-  /** I-11 (R2-4): the specs of the last scan, unfiltered by the callability rules and keyed by id: D-7's
+  /** I-11: the specs of the last scan, unfiltered by the callability rules and keyed by id: D-7's
    * code 106 must see a requestor that rule 2 threw out of `view`, so it cannot come from `view`. */
   private discovered = new Map<AgentId, Spec>();
-  /** R2-1: the enabled state of the `enable` command (undefined = as the options say). Every spec built
+  /** D-10: the enabled state of the `enable` command (undefined = as the options say). Every spec built
    * during a run carries it; only a fresh start clears it (D-10). */
   private enabledState: boolean | undefined;
   private running = false; // between `start()` and `stop()`
   private stopping = false;
-  /** R3-3: the namespaces we own: the caller's array is cloned at construction, so a later
+  /** The namespaces we own: the caller's array is cloned at construction, so a later
    * mutation of it cannot change what a rebuild (ping, enable) publishes. */
   private readonly namespaces: (string | null)[] | null | undefined;
 
@@ -88,13 +88,13 @@ export class ActioAgent {
   }
 
   /** Registers a capability and its handler; throws on a duplicate name or a non-strict schema (D-19).
-   * R3-3: the stored capability is a deep copy, so a caller mutating its object after registration
+   * The stored capability is a deep copy, so a caller mutating its object after registration
    * cannot change a running agent's A0 decisions or its next published spec. */
   capability(capability: Capability, handler: CapabilityHandler): void {
     if (this.capabilities.has(capability.name)) {
       throw new Error(`agent: capability "${capability.name}" is already registered`);
     }
-    const copy = structuredClone(capability); // R3-3: own the registration, not the caller's object
+    const copy = structuredClone(capability); // own the registration, not the caller's object
     let compiled: CompiledCapability;
     try {
       compiled = compileCapability(copy); // own side of D-19: a schema strict mode rejects is a bug
@@ -171,7 +171,7 @@ export class ActioAgent {
     );
     await this.rescan();
     this.heartbeat = startHeartbeat(config.heartbeatInterval, () => this.beat());
-    // LAST step, on purpose (R2-3): the inbox watcher of WP5, whose initial scan delivers the pending
+    // LAST step, on purpose : the inbox watcher, whose initial scan delivers the pending
     // envelopes (D-4); the fan-out feeds the requestor, which uses it for the responses of self-calls
     // (B2 on our own inbox). A pending `stop`/`restart` command now runs while everything is armed, so
     // its `stop()` (or `restart()`) can tear it all down: nothing below arms anything afterwards.
@@ -239,8 +239,8 @@ export class ActioAgent {
     this.heartbeat = undefined;
     if (this.scanTimer !== undefined) clearTimeout(this.scanTimer);
     this.scanTimer = undefined;
-    // (2) the grace wait (R1-2: only in-flight WORK). The requestor is NOT stopped yet: a handler may
-    // still issue a request and receive its response inside `stopGrace` (R2-2). `force` skips the wait,
+    // (2) the grace wait (D-9: only in-flight WORK). The requestor is NOT stopped yet: a handler may
+    // still issue a request and receive its response inside `stopGrace`. `force` skips the wait,
     // it does not reorder the steps.
     if (options?.force !== true) {
       const steps = Math.ceil(this.config.stopGrace / GRACE_STEP_MS);
@@ -267,7 +267,7 @@ export class ActioAgent {
     this.stopping = false;
   }
 
-  // --- wiring of the lower modules (WP7 is the wiring task) --------------------------------------
+  // --- wiring of the lower modules  --------------------------------------
 
   /** The AgentContext shared by the receiver and the requestor (no DI container). */
   private context(): AgentContext {
@@ -287,7 +287,7 @@ export class ActioAgent {
   private receiverHooks(): ReceiverHooks {
     return {
       onWatchError: (dir, err) => void this.failWatch(dir, err), // D-22: own inbox
-      peerSpec: (src) => this.discovered.get(src), // code 106 needs the DISCOVERED spec, not the view (R2-4)
+      peerSpec: (src) => this.discovered.get(src), // code 106 needs the DISCOVERED spec, not the view (D-7)
       onStateChange: () => void this.syncBusy(),
       onCommandStop: (force) => this.stop({ force }),
       onCommandRestart: (force, delaySeconds) => this.restart(force, delaySeconds),
@@ -307,7 +307,7 @@ export class ActioAgent {
 
   /** D-22: a watch error on the own inbox or `nuntium` is fatal: log it and enter `error`. */
   private async failWatch(dir: string, err: Error): Promise<void> {
-    this.emit({ event: "log", message: `watch lost ${dir}: ${errCode(err)}` }); // the plan's wording (R2-5)
+    this.emit({ event: "log", message: `watch lost ${dir}: ${errCode(err)}` }); // D-22's wording
     await this.fail(`watch lost ${dir}`);
   }
 
@@ -342,7 +342,7 @@ export class ActioAgent {
     const specs = new Map<AgentId, Spec>();
     const now = this.now();
     for (const peer of found.agents) {
-      specs.set(peer.spec.id, peer.spec); // unfiltered: the 106 check of A0 (R2-4)
+      specs.set(peer.spec.id, peer.spec); // unfiltered: the 106 check of A0 (D-7)
       const view = callable(this.currentSpec, peer, now); // our own folder is included: self-calls work
       if (view !== undefined) next.set(view.id, view);
     }
@@ -366,7 +366,7 @@ export class ActioAgent {
   /** D-8: busy iff an inbound exchange (A1/A2/A3) or an outbound one (B2) is in flight. */
   private async syncBusy(): Promise<void> {
     // The fields being gone means C2 ran; `stopping` means lane C began. Either way the status belongs
-    // to lane C now: a work settle landing after `stop()` must not resurrect the agent (R2-2), and with
+    // to lane C now: a work settle landing after `stop()` must not resurrect the agent (D-9), and with
     // the fields gone the counts are 0, which would publish `idle` over the `inactive` of C1.
     if (!this.receiver || !this.requestor || !this.running || this.stopping) return;
     if (this.current !== "idle" && this.current !== "busy") return; // inactive/error: no automatic transition
@@ -391,12 +391,12 @@ export class ActioAgent {
   /** spec.json from the options and the registered capabilities, with a fresh `datetime` (I-2 self-validated). */
   private buildSpecNow(): void {
     this.currentSpec = buildSpec(
-      { ...this.options, namespaces: this.namespaces }, // R3-3: our copy, not the caller's array
+      { ...this.options, namespaces: this.namespaces }, // our copy, not the caller's array
       this.capabilityList(),
       this.now(),
     );
-    // R2-1: the enabled state is agent state, not option state, so EVERY rebuild during a run (the `ping`
-    // command above all) keeps it. `buildSpec` never writes `disabled` (WP7-B-1); this is the only writer.
+    // D-10: the enabled state is agent state, not option state, so EVERY rebuild during a run (the `ping`
+    // command above all) keeps it. `buildSpec` never writes `disabled`; this is the only writer.
     if (this.enabledState !== undefined) this.currentSpec.disabled = this.enabledState;
   }
 
@@ -461,7 +461,7 @@ export class ActioAgent {
 
   /** `enable` (D2): `disabled` belongs to the built spec object, never to the options or the capabilities. */
   private async applyEnable(enabled: boolean): Promise<void> {
-    this.enabledState = !enabled; // R2-1: state of the run, not of the options: every later rebuild
+    this.enabledState = !enabled; // D-10: state of the run, not of the options: every later rebuild
     // re-applies it (a `ping` used to clear `disabled`), and only a fresh start clears it (D-10).
     this.buildSpecNow();
     await publishSpec(this.folders.agent, this.currentSpec);

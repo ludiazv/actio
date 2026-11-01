@@ -15,8 +15,8 @@ export * from "./generated/types.js";
 /** Health derived from a peer's status age (*Agent's status* rules 4–8); undefined for inactive/error. */
 export type Health = "healthy" | "online" | "degraded" | "zombie" | undefined;
 
-/** The four mandatory status states. */
-export type StatusState = "inactive" | "idle" | "busy" | "error";
+/** The four mandatory status states, read off the generated status schema (*Agent's status* rule 1). */
+export type StatusState = Status["status"];
 
 /** Final status of an incoming exchange (receiver side, diarium `inreq`). */
 export type InreqFinalStatus = "cancelled" | "completed" | "confirmed" | "dropped";

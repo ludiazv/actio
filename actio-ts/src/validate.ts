@@ -1,4 +1,4 @@
-// Runtime validation (§2.3, WP2): Ajv validators over the embedded protocol schemas, the rules the
+// Runtime validation (§2.3): Ajv validators over the embedded protocol schemas, the rules the
 // schemas cannot express, and the capability schemas compiled on demand (D-19). No schema is
 // re-implemented by hand.
 import { Ajv2020 } from "ajv/dist/2020.js";
@@ -156,9 +156,18 @@ export function nameMatches(req: RequestBody, can: CancellationBody): boolean {
   return req.name === can.name;
 }
 
-/** Capability names are unique within an agent (*Schemas* rules). */
-export function uniqueCapabilityNames(spec: Spec): boolean {
-  return new Set(spec.capabilities.map((cap) => cap.name)).size === spec.capabilities.length;
+/**
+ * Capability names are unique within an agent (*Schemas*, "Rules that the schemas cannot express, checked
+ * by the agents"). undefined when the names are unique; otherwise the first name the list repeats, so a
+ * caller can say which one broke the rule (the schemas cannot: uniqueness is across array elements).
+ */
+export function uniqueCapabilityNames(spec: Spec): string | undefined {
+  const seen = new Set<string>();
+  for (const cap of spec.capabilities) {
+    if (seen.has(cap.name)) return cap.name; // the first repeated name
+    seen.add(cap.name);
+  }
+  return undefined;
 }
 
 /** Compiled parameter/result validators of one capability (D-19). */

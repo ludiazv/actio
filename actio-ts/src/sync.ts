@@ -47,7 +47,7 @@ function parseDelayMs(value: string, raw: string | undefined): number {
  * read from `ACTIO_MUTAGEN_BIN` (default `mutagen`) at run time. Failures (spawn error or
  * non-zero exit) call `onError` once per failed run and never throw.
  *
- * R1-4: a request is never absorbed by the run already in flight. While a run is going, at most ONE
+ * §2.6: a flush request is never absorbed by the run already in flight. While a run is going, at most ONE
  * follow-up run is promised (`pendingRun`): a `notify()` or `flush()` arriving mid-run coalesces into
  * it, and `flush()` resolves only once a run that started after the call has finished — so the writes
  * made during a flush are still covered by the next one.
@@ -101,7 +101,7 @@ function mutagenProvider(session: string, onError?: (err: Error) => void): SyncP
       if (timer) return;
       timer = setTimeout(() => {
         timer = null;
-        void run(); // mid-run: this becomes the coalesced follow-up instead of being swallowed (R1-4)
+        void run(); // mid-run: this becomes the coalesced follow-up instead of being swallowed
       }, MUTAGEN_DEBOUNCE_MS);
     },
     flush(): Promise<void> {
@@ -115,7 +115,7 @@ function mutagenProvider(session: string, onError?: (err: Error) => void): SyncP
       if (timer) {
         clearTimeout(timer);
         timer = null; // only the debounced run is cancelled: a promised follow-up still executes,
-        // because a caller of `flush()` is already waiting on it (R1-4); close() is idempotent.
+        // because a caller of `flush()` is already waiting on it; close() is idempotent.
       }
       return Promise.resolve();
     },

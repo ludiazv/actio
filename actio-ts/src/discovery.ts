@@ -1,9 +1,9 @@
-// Discovery and callability (WP4): folder scan, the callability rules 1–8, and the Agmen view.
+// Discovery and callability: folder scan, the callability rules 1–8, and the Agmen view of one peer.
 import fsp from "node:fs/promises";
 import path from "node:path";
 import * as io from "./io.js";
 import { health } from "./status.js";
-import { validateSpec, validateStatus } from "./validate.js";
+import { uniqueCapabilityNames, validateSpec, validateStatus } from "./validate.js";
 import type { Capability, Spec, Status } from "./generated/types.js";
 import type { AgentId, AgentView } from "./types.js";
 
@@ -110,6 +110,13 @@ export async function scan(root: string): Promise<ScanResult> {
       ignored.push({ path: specFile, reason: firstError(spec.errors) });
       continue;
     }
+    // Rule 3 covers the rules the schemas cannot express: a spec that repeats a capability name is
+    // ignored like a schema failure, and reported with the name it repeats (*Schemas* rules).
+    const repeated = uniqueCapabilityNames(spec.value);
+    if (repeated !== undefined) {
+      ignored.push({ path: specFile, reason: `duplicate capability name "${repeated}"` });
+      continue;
+    }
     const status = validateStatus(statusRead.value);
     if (!status.ok) {
       ignored.push({ path: statusFile, reason: firstError(status.errors) });
@@ -153,15 +160,4 @@ export function callable(self: Spec, peer: DiscoveredAgent, nowMs: number): Agen
     commands,
     capabilities: new Map(usable.map((c) => [c.name, c])),
   };
-}
-
-/** Builds the whole Agmen view: scan + callability for every discovered agent (self included). */
-export async function buildAgmen(root: string, self: Spec, nowMs: number): Promise<Map<AgentId, AgentView>> {
-  const { agents } = await scan(root); // duplicates and ignored material are the caller's to report (WP7)
-  const view = new Map<AgentId, AgentView>();
-  for (const agent of agents) {
-    const viewOfPeer = callable(self, agent, nowMs);
-    if (viewOfPeer !== undefined) view.set(viewOfPeer.id, viewOfPeer); // keyed by the spec ID, unique per scan
-  }
-  return view;
 }

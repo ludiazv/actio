@@ -1,4 +1,4 @@
-// Requestor (WP6): lane B — write request/command, watch the destination inbox (D-18),
+// Requestor: lane B — write request/command, watch the destination inbox (D-18),
 // cancellation (B4), confirmation (B3 with the D-13 guard), attachment cleanup (B5), abandon (D-6).
 import path from "node:path";
 import { stat } from "node:fs/promises";

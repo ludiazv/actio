@@ -442,11 +442,11 @@ test("nameMatches compares the capability name", () => {
   assert.ok(!nameMatches(reqNamed("translate"), canNamed("summarize")));
 });
 
-test("uniqueCapabilityNames is about names, which the schema cannot express", () => {
-  assert.ok(uniqueCapabilityNames(specOf()));
-  assert.ok(uniqueCapabilityNames(specOf({ capabilities: [] })));
+test("uniqueCapabilityNames reports the first repeated name, or nothing when they are unique", () => {
+  assert.equal(uniqueCapabilityNames(specOf()), undefined, "unique names: nothing to report");
+  assert.equal(uniqueCapabilityNames(specOf({ capabilities: [] })), undefined, "no capabilities: nothing to repeat");
   const dup = specOf({ capabilities: [specCapability, { ...specCapability, description: "same name" }] });
-  assert.ok(!uniqueCapabilityNames(dup));
+  assert.equal(uniqueCapabilityNames(dup), specCapability.name, "the name it repeats, so the caller can say it");
   assert.ok(validateSpec(dup).ok); // schema-valid and rule-invalid: the rule is the code's job
 });
 

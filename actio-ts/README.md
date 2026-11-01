@@ -127,7 +127,7 @@ actio validate <file> [--as spec|status|announce|request|cancellation|response|c
 
 - `agent.request(dst, name, params, options?)` → `{ finalStatus, response? }`; rejects with `ActioCallError` (nothing written) when the callability rules fail, and with `ActioResultError` when a non-error result breaks the peer's published `result` schema (D-12).
 - `agent.on("event", handler)` receives **every protocol event** on both lanes: `status`, `announce`, `inreq`, `outreq`, `ignored` (D-15/D-14), `log`.
-- `agent.capability(cap, handler)` deep-copies the registration (a later mutation of the caller's object changes nothing — R3-3) and compiles the schemas eagerly (D-19: a non-strict schema throws at registration).
+- `agent.capability(cap, handler)` deep-copies the registration (a later mutation of the caller's object changes nothing) and compiles the schemas eagerly (D-19: a non-strict schema throws at registration).
 - `agent.stop({ force })` follows D-9: graceful (default) lets in-flight work finish within `stopGrace` (handlers may still issue requests), then aborts + 300 + archives; `force=true` aborts at once. A stopped agent is `inactive` and announces (C1). `fail(msg)` is terminal (`error` + announce; no recovery).
 - A `restart` command archives the command, runs `stop` (honouring `force`), waits `delay`, then starts fresh in-process (the registrations survive; a `disabled` set by `enable` does not).
 
@@ -145,7 +145,7 @@ Where the protocol leaves room, the implementation decided — each choice is ob
 | D-6 | requestor timeout: `> 0` → cancel at expiry, wait up to `cancelWaitTimeout` for the response, then abandon; `0` → wait forever (or until `signal`) |
 | D-7 | optional A0 checks implemented: 105 (parameters), 106 (namespaces — against the requestor's spec as **discovered** by the last scan, before the callability filter; an unknown requestor skips 106), 107 (reject, no queue), 108 (expired); **104 not implemented** |
 | D-8 | busy iff ≥ 1 inbound exchange (A1/A2/A3) or ≥ 1 outbound in B2; written immediately on change; the heartbeat republishes with a fresh `datetime`; the diarium `status` event only on change; the announce file only on active↔non-active changes, `enable`, `ping`, steps 3/C1 |
-| D-9 | stop order (v11): heartbeat/scan off → grace (handlers may still issue requests) → `receiver.stop()` (abort + 300 + archive) → `requestor.stop()` (abandon) → C1 → C2; a stop during `start()` leaves nothing armed |
+| D-9 | stop order: heartbeat/scan off → grace (handlers may still issue requests) → `receiver.stop()` (abort + 300 + archive) → `requestor.stop()` (abandon) → C1 → C2; a stop during `start()` leaves nothing armed |
 | D-10 | restart: archive → stop (honouring `force`) → wait `delay` → start fresh in-process; a `disabled` set by `enable` does not survive |
 | D-11 | a `.can/.res/.con` envelope whose header differs from the tracked request (except `datetime`) is ignored and logged; the same check applies to the responses the requestor captures |
 | D-12 | a non-error result that breaks the peer's `result` schema ends the exchange as `ActioResultError` (the exchange itself is already confirmed on both sides); cancellation responses (`result: null`) are exempt |
@@ -160,7 +160,7 @@ Where the protocol leaves room, the implementation decided — each choice is ob
 | D-21 | a bad `ACTIO_SYNC`/env value is a configuration error at `start()` — never at construction |
 | D-22 | a watch error on the own inbox or `nuntium` is fatal: `log` (`watch lost <dir>: <code>`) + `fail()`; a destination watch error abandons the requestor's exchanges there (the agent stays up) |
 
-From the review history (issues.md): **I-1** the mutagen `onError` hook; **I-2** every written file is self-validated before writing; **I-3** `CapabilityEntry.compiled` (D-19 registration) and `ReceiverHooks.peerSpec` (I-11); **I-4** D-12 validated in `agent.request()`; **I-5** `announce()` takes two folders; **I-6** exactly 100 s → `degraded`; **I-8** no `dst` check at A0/D0 (the inbox is the address); **I-9** `namespaces` admits `null` items; **I-10** one sync provider per process; **I-11** the `peerSpec` hook. Deferred: P-1 (a shared `ACTIO_VERSION` constant).
+From the review history: **I-1** the mutagen `onError` hook; **I-2** every written file is self-validated before writing; **I-3** `CapabilityEntry.compiled` (D-19 registration) and `ReceiverHooks.peerSpec` (I-11); **I-4** D-12 validated in `agent.request()`; **I-5** `announce()` takes two folders; **I-6** exactly 100 s → `degraded`; **I-7** a captured base64 (encrypted) response body is treated as received: the exchange is confirmed and `request()` resolves `confirmed` with `response: undefined`; **I-8** no `dst` check at A0/D0 (the inbox is the address); **I-9** `namespaces` admits `null` items; **I-10** one sync provider per process; **I-11** the `peerSpec` hook. Deferred: a shared protocol-version constant (the version string is written where it is needed).
 
 ## Limitations (core profile)
 

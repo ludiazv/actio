@@ -50,7 +50,7 @@ function buildFails(opts: Partial<AgentOptions>, capabilities: Capability[], why
 function mustValidate(spec: Spec): void {
   const checked = validateSpec(spec);
   if (!checked.ok) assert.fail(`the builder produced an invalid spec: ${checked.errors.join("; ")}`);
-  assert.equal(uniqueCapabilityNames(spec), true, "the builder's belt check must agree");
+  assert.equal(uniqueCapabilityNames(spec), undefined, "the builder never emits a repeated name");
 }
 
 test("a minimal agent builds exactly the required fields", () => {
@@ -127,7 +127,7 @@ test("duplicate capability names are rejected, and the message names the duplica
   buildFails({}, [{ ...cap("search"), description: "one" }, { ...cap("search"), description: "two" }], /"search"/);
   buildFails({}, [cap("a"), cap("b"), cap("c"), cap("b")], /duplicate capability name "b"/);
   buildFails({}, [cap("x"), cap("x"), cap("x")], /duplicate/);
-  assert.equal(uniqueCapabilityNames(build({}, [cap("a"), cap("b"), cap("c")])), true, "unique names are fine");
+  assert.equal(uniqueCapabilityNames(build({}, [cap("a"), cap("b"), cap("c")])), undefined, "unique names are fine");
 });
 
 test("capabilities are embedded in registration order, as the same objects", () => {

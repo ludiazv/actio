@@ -1,5 +1,5 @@
-// Event-driven folder watcher (§2.1, WP1): fs.watch events trigger a folder scan; no timers,
-// no polling, no re-arming. Exact contract in the master plan (WP1).
+// Event-driven folder watcher (§2.1): fs.watch events trigger a folder scan; no timers,
+// no polling, no re-arming: the watcher never decides for itself what to look at.
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";

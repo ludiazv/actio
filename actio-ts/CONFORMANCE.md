@@ -10,7 +10,7 @@ Conventions: **§** references point into `doc/actio_protocol.md`; "v" reference
 | --- | --- | --- | --- |
 | 1.1 | *Directory structure*: "One folder per agent … The owning agent writes spec.json, status.json and diarium.jsonl" | `src/agent.ts` `startUp()` (folders per `AgentFolders`); `src/io.ts` | `e2e:requests` (all scenarios read the real layout) |
 | 1.2 | "`nuntium` : Mandatory announce folder" | `src/agent.ts` `startUp()` (created at start; `src/status.ts` `announce()` writes `nuntium/<id>.n.json`) | `unit:status` (`announce` tests), `e2e:commands` E10 (announce count) |
-| 1.3 | "`forum`: Optional shared folder … Attachments are listed … by their path relative to `forum`" | `src/receiver.ts` `publishAttachment()` (B1 copies into `forum` before the request file); `src/requestor.ts` `beginOutbound()` | `e2e:robustness` E16, `unit:requestor` |
+| 1.3 | "`forum`: Optional shared folder … Attachments are listed … by their path relative to `forum`" | `src/requestor.ts` `beginOutbound()` (B1 copies the request attachments into `forum` before the request file); `src/receiver.ts` `publishAttachment()` (the response side) | `e2e:robustness` E16, `unit:requestor` |
 | 1.4 | "`tools`, `forum` and `nuntium` are reserved and cannot be used as agent folders" | `src/discovery.ts` `scan()` (RESERVED set, skipped before any stat) | `unit:discovery` (`scan ignores files and reserved folders…`) |
 | 1.5 | "Each agent creates its own folder and its `inbox`" (announce steps 1/5) | `src/agent.ts` `startUp()` (steps 1–5 in protocol order) | `unit:agent` (`start` tests), `e2e:smoke` |
 | 1.6 | "The file names are recommended but not enforced … identified by the `rid` field … the kind of file by its body key" (D-2) | `src/receiver.ts` `processFile()` (`envelopeKind` + rid matching); `src/validate.ts` `envelopeKind` | `unit:receiver` (D-2 matching), `unit:validate` (`envelopeKind`) |
@@ -36,8 +36,8 @@ Conventions: **§** references point into `doc/actio_protocol.md`; "v" reference
 | # | Normative statement | Implementation | Tests |
 | --- | --- | --- | --- |
 | 3.1 | "**ID** … up to 32 characters matching `[a-zA-Z0-9_-]+`. **It MUST be unique**" | `src/spec-builder.ts` `buildSpec()` (id from the options; the schema enforces the pattern; duplicates of capability names throw) | `unit:spec-builder`, `unit:discovery` (D-3) |
-| 3.2 | Namespace rules (absent/null/empty → the null namespace; explicit `null`; `"*"`; the string `"null"` is ordinary) | `src/discovery.ts` `namespacesOf()`/`shareNamespace()`; `src/receiver.ts` `namespacesOf()` (A0 code 106) | `unit:discovery` (19 namespace rows × 2 directions), `unit:validate` (spec vectors), `e2e:requests` (the R2-4 106 scenario) |
-| 3.3 | "Capabilities … The id MUST be unique for an agent and MUST follow the regex" | `src/spec-builder.ts` `buildSpec()` (duplicates throw); `src/validate.ts` (`validateSpec` + the schema) | `unit:spec-builder`, vectors (`spec`) |
+| 3.2 | Namespace rules (absent/null/empty → the null namespace; explicit `null`; `"*"`; the string `"null"` is ordinary) | `src/discovery.ts` `namespacesOf()`/`shareNamespace()`; `src/receiver.ts` `namespacesOf()` (A0 code 106) | `unit:discovery` (19 namespace rows × 2 directions), `unit:validate` (spec vectors), `e2e:requests` (the 106 namespace scenario) |
+| 3.3 | "Capabilities … The id MUST be unique for an agent and MUST follow the regex" | `src/spec-builder.ts` `buildSpec()` (our own spec: a duplicate throws) + `src/discovery.ts` `scan()` (a peer's spec: rule 3 — ignored, reported with the name); `src/validate.ts` `uniqueCapabilityNames()` is the decision, `validateSpec` the schema side | `unit:spec-builder` (the duplicate throw), `unit:discovery` (the duplicate-name peer), vectors (`spec`) |
 | 3.4 | "`accepts_commands_from` … Mandatory. Only agents in this list can send commands" | `src/spec-builder.ts` (always written); `src/receiver.ts` `acceptCommand()` (fresh read, empty = nobody) | `unit:receiver` (D0 tests), `e2e:commands` E10/E11 |
 | 3.5 | "security_support … security_posture … Mandatory" | `src/spec-builder.ts` (core profile: `[]` / `"trusted"`) | `unit:spec-builder` |
 | 3.6 | "Info: Additional info … not subject to strict schema definition" | `src/spec-builder.ts` (carried as given) | `unit:spec-builder` |
@@ -72,7 +72,7 @@ Conventions: **§** references point into `doc/actio_protocol.md`; "v" reference
 | # | Normative statement | Implementation | Tests |
 | --- | --- | --- | --- |
 | 6.1 | "An exchange is made of up to four envelope files … Each file has a single writer" | `src/requestor.ts` (`beginOutbound`/`writeCancellation`/`complete`) and `src/receiver.ts` (`writeResponse`/`archive`) | `unit:requestor`, `unit:receiver`, `e2e:requests` E1–E9, vectors |
-| 6.2 | "All files of an exchange share the same header as the original request; only `datetime` changes" | `src/receiver.ts` (`sameHeader` on can/res/con, D-11); `src/requestor.ts` (D-11 on the captured response — R1-6); `src/validate.ts` `sameHeader` | `unit:receiver`, `unit:requestor` (D-11 test), `unit:validate` |
+| 6.2 | "All files of an exchange share the same header as the original request; only `datetime` changes" | `src/receiver.ts` (`sameHeader` on can/res/con, D-11); `src/requestor.ts` (D-11 on the captured response too); `src/validate.ts` `sameHeader` | `unit:receiver`, `unit:requestor` (D-11 test), `unit:validate` |
 | 6.3 | "The name of a cancellation is the same as the `name` in the request" | `src/validate.ts` `nameMatches`; `src/receiver.ts` (`applyCancellation`) | `unit:validate`, `unit:receiver`, vectors (`cancellation`) |
 | 6.4 | The request body: "ts, nonce, signature, name, parameters, timeout, attachments" all mandatory | the schema (`request.schema.json`); `src/validate.ts` `validateRequest` | vectors (`request`), `unit:validate`, `unit:requestor` (I-2 self-validation) |
 | 6.5 | "`parameters`: … If there are no parameters it MUST be null" | `src/validate.ts` (the requestRules if/then); `src/receiver.ts` `accept()` (105; `null ≡ {}`) | `unit:validate`, `unit:receiver`, vectors (`request`) |
@@ -93,7 +93,7 @@ Conventions: **§** references point into `doc/actio_protocol.md`; "v" reference
 | 7.4 | 102 `capability_disabled` — Required | `src/receiver.ts` `accept()` | `unit:receiver`, `e2e:requests` E3-102 |
 | 7.5 | 103 `requestor_not_allowed` — Required | `src/receiver.ts` `accept()` (`accepts_from`) | `unit:receiver`, `e2e:requests` E3-103 |
 | 7.6 | 105 `invalid_parameters` (the capability `parameters` schema, D-19) | `src/receiver.ts` `accept()` (`entry.compiled.validateParams`) | `unit:receiver`, `e2e:requests` E3-105 |
-| 7.7 | 106 `namespace_mismatch` — against the requestor's spec **as discovered**, before the callability filter (v11) | `src/agent.ts` (`discovered` map) + `ReceiverHooks.peerSpec` (I-11); `src/receiver.ts` `accept()` | `unit:receiver` (the 106 test), `unit:agent` (the R2-4 e2e in `requests.e2e.test.ts`) |
+| 7.7 | 106 `namespace_mismatch` — against the requestor's spec **as discovered**, before the callability filter (D-7) | `src/agent.ts` (`discovered` map) + `ReceiverHooks.peerSpec` (I-11); `src/receiver.ts` `accept()` | `unit:receiver` (the 106 test), `unit:agent` (a discovered peer with no shared namespace is answered 106), `e2e:requests` (the same scenario against a live agent) |
 | 7.8 | 107 `capacity_exceeded` ("at `max_parallel` … reject, no queue") | `src/receiver.ts` `accept()` (`entry.running >= max_parallel`) | `unit:receiver`, `e2e:requests` E3-107 |
 | 7.9 | 108 `request_expired` ("`ts + timeout < now`") | `src/receiver.ts` `accept()` | `unit:receiver`, `e2e:requests` E3-108 (+ the direct-write row), `e2e:robustness` E17 |
 | 7.10 | 104 `version_not_supported` — Optional, **not implemented** (D-7) | absent by design | `unit:validate` (the version is informative; the vectors prove acceptance) |
@@ -106,9 +106,9 @@ Conventions: **§** references point into `doc/actio_protocol.md`; "v" reference
 | --- | --- | --- | --- |
 | 8.1 | D0: "src listed in `accepts_commands_from` … commands are processed even if the agent is disabled … `name` is a command the agent knows" | `src/receiver.ts` `acceptCommand()` | `unit:receiver` (D0 tests: listed/unlisted/disabled/unknown) |
 | 8.2 | "stop {force:bool} | Stop the agent. … answered with error code 300" | `src/receiver.ts` (`onCommandStop` after the archive) + `src/agent.ts` `stop()` | `unit:receiver` (archive-before-hook), `unit:agent`, `e2e:commands` E12 |
-| 8.3 | "enable {enabled:bool} … Sets `disabled` in `spec.json` accordingly and re-announces" | `src/agent.ts` `applyEnable()` (rebuilds + sets `disabled` on the built object; R2-1: it survives `ping`) | `unit:agent` (R2-1 test), `e2e:commands` E10, `e2e:requests` (the stale-view 100) |
+| 8.3 | "enable {enabled:bool} … Sets `disabled` in `spec.json` accordingly and re-announces" | `src/agent.ts` `applyEnable()` (rebuilds + sets `disabled` on the built object; the state survives `ping`, D-10) | `unit:agent` (the enable state survives a `ping`), `e2e:commands` E10, `e2e:requests` (the stale-view 100) |
 | 8.4 | "restart {force:bool, delay} … start again as fresh … The command is archived before the agent shuts down, and the `delay` starts after the archive" | `src/receiver.ts` (archive first) + `src/agent.ts` `restart()` | `unit:receiver` (the order test), `unit:agent` (the restart test), `e2e:commands` E13 |
-| 8.5 | "ping … Update spec and status and re-announce" | `src/agent.ts` `applyPing()` (rebuilds spec + status with fresh datetimes; R2-1: the enabled state survives) | `unit:agent`, `e2e:commands` E10 |
+| 8.5 | "ping … Update spec and status and re-announce" | `src/agent.ts` `applyPing()` (rebuilds spec + status with fresh datetimes; the enabled state survives, D-10) | `unit:agent`, `e2e:commands` E10 |
 | 8.6 | "A command that is not known by the receiver is invalid and is dropped … without any response" (D4: "status.json, spec.json and the announce file are not touched") | `src/receiver.ts` `acceptCommand()`/`archiveCommand("dropped")` | `unit:receiver`, `e2e:commands` E11 (byte-identical status/spec/nuntium) |
 | 8.7 | Custom commands ("any custom command of its own") | `src/agent.ts` `onCommand()`; `src/receiver.ts` (`commands` map, `CommandContext`) | `unit:receiver`, `unit:agent`, `e2e:commands` E10 (`noop`) |
 
@@ -145,19 +145,19 @@ Conventions: **§** references point into `doc/actio_protocol.md`; "v" reference
 | 11.7 | A1: "run handler with AbortSignal; status … busy" | `src/receiver.ts` `run()`; `src/agent.ts` (D-8) | `unit:receiver`, `e2e:requests` E6, `e2e:requests` (the D-8 rows) |
 | 11.8 | A2: "Writes the response file … Waits for confirmation or confirmation timeout … If a cancellation arrives after the response was written, no second response is written" | `src/receiver.ts` `respond()`/`writeResponse()` | `unit:receiver`, `e2e:requests` E7 |
 | 11.9 | A3: "A cancellation file appeared; the work is stopped as gracefully as possible" → the cancellation response | `src/receiver.ts` `run()` (the abort path) | `unit:receiver`, `e2e:requests` E6 |
-| 11.10 | A4: "append an `inreq` event … then delete all files of the exchange … and its response attachments" | `src/receiver.ts` `archive()` (single-shot, P-2) | `unit:receiver`, `e2e:requests` (per scenario), `e2e:robustness` E16 |
+| 11.10 | A4: "append an `inreq` event … then delete all files of the exchange … and its response attachments" | `src/receiver.ts` `archive()` (single-shot per rid, D-5) | `unit:receiver`, `e2e:requests` (per scenario), `e2e:robustness` E16 |
 | 11.11 | C1: "status.json MUST be updated to inactive and the announce file written; status first" | `src/agent.ts` `stop()` (`setStatus` → `reannounceAfterDelay`) | `unit:agent`, `e2e:commands` E12/E13, `e2e:smoke` |
 | 11.12 | D0–D4 (the command lifecycle: accepted → executed → archived `completed`; rejected → archived `dropped`, nothing else touched) | `src/receiver.ts` `acceptCommand()`/`runCommand()`/`archiveCommand()` | `unit:receiver` (the lane-D tests), `e2e:commands` E10/E11 |
 | 11.13 | Pending envelopes at startup (D-4) | `src/receiver.ts` (the watcher's initial scan; the deferral for can/res/con whose request is pending; the bare-res re-track) | `unit:receiver` (the D-4 tests), `e2e:robustness` E17 |
-| 11.14 | A stop that arrives during `start()` leaves nothing armed; a pending restart leaves exactly one instance (D-9 v11) | `src/agent.ts` (`receiver.start()` last; the `stopping` guard) | `unit:agent` (the R2-3 tests), oracle probe P3 |
+| 11.14 | A stop that arrives during `start()` leaves nothing armed; a pending restart leaves exactly one instance (D-9) | `src/agent.ts` (`receiver.start()` last; the `stopping` guard) | `unit:agent` (the pending `stop` and `restart` tests) |
 
 ## 12. Sync, watch, and storage
 
 | # | Normative statement | Implementation | Tests |
 | --- | --- | --- | --- |
 | 12.1 | "`sync`: Signal the storage layer that files have changed" | `src/sync.ts` (the four providers) + `src/io.ts` (the write hooks) | `unit:sync`, `unit:io`, `e2e:robustness` E20 |
-| 12.2 | "`watch_dir`: Watch a directory non-recursively … report new and modified files … keeping a per-file change marker" | `src/watch.ts` `watchDir()`/`diffMarkers()` (event-driven; no timers/polling — R1-11/§2.1) | `unit:watch` (13 scenarios), `unit:io` (the atomic-write loop) |
-| 12.3 | "`write_json`: Write a json to file/object as atomically as possible" (the temp-then-rename example) | `src/io.ts` `writeJsonAtomic()` (temp `<tmpDir>/.<name>.<nonce>.tmp` → rename, with the sync hooks) | `unit:io` (the atomicity loop + the P-4 pin test) |
+| 12.2 | "`watch_dir`: Watch a directory non-recursively … report new and modified files … keeping a per-file change marker" | `src/watch.ts` `watchDir()`/`diffMarkers()` (event-driven; no timers and no polling, §2.1) | `unit:watch` (13 scenarios), `unit:io` (the atomic-write loop) |
+| 12.3 | "`write_json`: Write a json to file/object as atomically as possible" (the temp-then-rename example) | `src/io.ts` `writeJsonAtomic()` (temp `<tmpDir>/.<name>.<nonce>.tmp` → rename, with the sync hooks; a failed rename unlinks the temp) | `unit:io` (the atomicity loop + the temp-file cleanup test) |
 | 12.4 | "Errors … a bad `<ms>` … is a configuration error at `start()`" (D-21) | `src/sync.ts` `createSyncProvider()`; `src/agent.ts` `start()` | `unit:sync` (the parser/rejection tables), `unit:agent` (the bad-sync test) |
 | 12.5 | E20: the four providers produce identical protocol outcomes | `e2e:robustness` E20 (the deep-equal across providers) | `e2e:robustness` E20 |
 
@@ -167,7 +167,7 @@ Conventions: **§** references point into `doc/actio_protocol.md`; "v" reference
 | --- | --- | --- | --- |
 | 13.1 | "Any file or object that does not conform to the protocol schemas is invalid and **ignored** by the receiver: it does not trigger any acceptance test, generates no response and produces no state change" | `src/receiver.ts` `processFile()` (validation first, D-15) | `unit:receiver`, `e2e:robustness` E14, `e2e:child-process` E14 |
 | 13.2 | "validated with Ajv at runtime against the schemas embedded by the generator … Ajv strict" | `src/validate.ts` (the lazy strict singletons; no relaxations) | `unit:validate`, vectors |
-| 13.3 | "Rules that the schemas cannot express": the same header (D-11), the cancellation `name` match, unique capability names | `src/validate.ts` (`sameHeader`/`nameMatches`/`uniqueCapabilityNames`) + the call sites | `unit:validate`, `unit:receiver`, `unit:requestor`, `unit:spec-builder` |
+| 13.3 | "Rules that the schemas cannot express": the same header (D-11), the cancellation `name` match, unique capability names | `src/validate.ts` (`sameHeader`/`nameMatches`/`uniqueCapabilityNames`); the call sites: `src/receiver.ts`/`src/requestor.ts` (header and name), `src/discovery.ts` `scan()` (a peer's capability names), `src/spec-builder.ts` `buildSpec()` (our own) | `unit:validate`, `unit:receiver`, `unit:requestor`, `unit:spec-builder`, `unit:discovery` |
 | 13.4 | "The `result` of a response that is not an error follows the capability `result` schema … the request `parameters` follow its `parameters` schema" (D-12/D-19) | `src/validate.ts` `compileCapability()`; `src/receiver.ts` `accept()` (105); `src/agent.ts` `checkResult()` (D-12) | `unit:validate` (compileCapability), `unit:receiver` (105), `unit:agent` (the D-12 test) |
 | 13.5 | "All 11 schemas … as a whole (refs by `$id`)" embedded and strict-clean | `src/generated/schemas.ts` + `scripts/gen-schemas.ts` (the strict gate) | `npm run check` (the gen gate), vectors |
 
@@ -181,9 +181,9 @@ Conventions: **§** references point into `doc/actio_protocol.md`; "v" reference
 
 ## 15. Process rules the implementation adds (from the review history)
 
-| # | Statement (issues.md) | Implementation | Tests |
+| # | Statement (the I-x rows of `README.md`) | Implementation | Tests |
 | --- | --- | --- | --- |
 | 15.1 | I-2: every file the library writes is self-validated before writing | `src/status.ts`, `src/diarium.ts`, `src/requestor.ts`, `src/receiver.ts` (the `mustValidate`/inline checks) | the unit suites of each writer |
 | 15.2 | I-3/I-11: the capability registrations carry their compiled schemas (D-19); the 106 hook reads the DISCOVERED specs | `src/types.ts` (`CapabilityEntry.compiled`), `src/agent.ts` (`capability()`), `src/receiver.ts` (`accept()` 106) | `unit:agent` (the registration tests), `unit:receiver` (106) |
 | 15.3 | I-10: one sync provider per process | `src/io.ts` `setSyncProvider()`; `src/agent.ts` `start()` | `unit:io` (the provider tests) |
-| 15.4 | P-3/P-4/P-5/P-6 (the carry-over fixes) | `src/receiver.ts` (`dropDeferredFor`, `startArchive`, the awaited `stop()`), `src/io.ts` (the P-4 pin test) | `unit:receiver` (the P-3/P-5 tests), `unit:io` (the P-4 test) |
+| 15.4 | the rules the review rounds settled, stated as the code keeps them: an ignored request file drops the envelopes deferred for its rid (D-15); a failed atomic rename leaves no temp file (§2.1 `write_json`); `receiver.stop()` resolves only once every archive has landed (D-9); the `confirmTimeout` timer is tracked, so `stop()` awaits it | `src/receiver.ts` (`dropDeferredFor`, `startArchive`, the awaited `stop()`, the tracked `confirmTimer`), `src/io.ts` (`writeJsonAtomic`) | `unit:receiver` (the deferred-drop and archive-await tests), `unit:io` (the temp-file cleanup test) |
