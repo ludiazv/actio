@@ -539,3 +539,26 @@ test("checkParams skips the checks when the schema does not compile (D-19)", () 
   assert.equal(checkParams(cap, { whatever: 1 }), undefined);
   assert.equal(checkParams(cap, { text: "ok" }), undefined);
 });
+
+test("checkParams compiles distinct objects sharing a $id independently; a local $ref still works (D-19)", () => {
+  const parameters = {
+    $id: "urn:actio:peer-params",
+    type: "object",
+    properties: { text: { $ref: "#/$defs/text" } },
+    required: ["text"],
+    additionalProperties: false,
+    $defs: { text: { type: "string" } },
+  };
+  const first = capability(parameters, true);
+  const second = capability(structuredClone(parameters), true); // a distinct object, the same $id
+  const ra = checkParams(first, {});
+  const rb = checkParams(second, {});
+  assert.ok(ra, "the first object returns an error");
+  assert.match(ra, /must have required property 'text'/);
+  assert.ok(rb, "the second object with the same $id validates too");
+  assert.match(rb, /must have required property 'text'/);
+  const rc = checkParams(second, { text: 3 });
+  assert.ok(rc);
+  assert.match(rc, /must be string/, "a local $ref resolves in the second object");
+  assert.equal(checkParams(second, { text: "ok" }), undefined);
+});

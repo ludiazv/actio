@@ -42,9 +42,11 @@ function protocol(): Ajv2020 {
   return protocolAjv;
 }
 
-/** The capability Ajv instance (D-19): same strict options, no protocol schemas added. */
+/** The capability Ajv instance (D-19, §2.3): same strict options, no protocol schemas added, and
+ * `addUsedSchema: false` so a compiled schema is not registered under its `$id`: a rescan builds
+ * fresh schema objects, and two objects with the same `$id` must each compile and validate. */
 function capabilities(): Ajv2020 {
-  if (capabilityAjv === undefined) capabilityAjv = new Ajv2020(AJV_OPTIONS);
+  if (capabilityAjv === undefined) capabilityAjv = new Ajv2020({ ...AJV_OPTIONS, addUsedSchema: false });
   return capabilityAjv;
 }
 
