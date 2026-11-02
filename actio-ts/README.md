@@ -13,7 +13,10 @@ Actio is a file-based agent coordination protocol: a team of agents (*agmen*) sh
 npm ci          # install
 npm run gen     # regenerate src/generated from ../doc/schemas (deterministic)
 npm run check   # gen + tsc --noEmit + the full test suite
+npm run blackbox # the independent black-box run (echo agent as a child process, envelopes by hand)
 ```
+
+`test/blackbox/blackbox.mjs` imports no actio-ts code: it writes the protocol files by hand and validates every file the agent produces with its own Ajv built from `../doc/schemas/`. Run it after any change to protocol behavior.
 
 ## Quick start: two agents in one process
 

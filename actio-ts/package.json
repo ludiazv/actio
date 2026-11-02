@@ -13,7 +13,8 @@
     "test": "npm run gen && node --import tsx --test \"test/**/*.test.ts\"",
     "check": "npm run gen && tsc --noEmit && node --import tsx --test \"test/**/*.test.ts\"",
     "actio": "tsx src/cli.ts",
-    "echo": "tsx examples/echo-agent.ts"
+    "echo": "tsx examples/echo-agent.ts",
+    "blackbox": "node test/blackbox/blackbox.mjs"
   },
   "dependencies": {
     "ajv": "^8.17.1"
