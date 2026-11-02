@@ -21,11 +21,11 @@ export interface Config {
 /** The TypeBox schema of the file; every key optional, no extras (D-1…D-5). */
 const Schema = Type.Object(
   {
-    agentId: Type.String({ pattern: "^[a-zA-Z0-9_-]{1,32}$" }),
+    agentId: Type.Optional(Type.String({ pattern: "^[a-zA-Z0-9_-]{1,32}$" })),
     namespaces: Type.Optional(Type.Array(Type.String())),
     actioDir: Type.Optional(Type.String()),
     exposePrompt: Type.Optional(Type.Boolean()),
-    acceptPrompt: Type.Optional(Type.Array(Type.String())),
+    acceptPrompt: Type.Optional(Type.Array(Type.String({ pattern: "^[a-zA-Z0-9_-]{1,32}$" }))),
     disabled: Type.Optional(Type.Boolean()),
     json: Type.Optional(Type.Boolean()),
     reportActivity: Type.Optional(Type.Boolean()),

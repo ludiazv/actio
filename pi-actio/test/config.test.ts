@@ -39,7 +39,7 @@ test("loadConfig: a full valid file is returned as written", () => {
         namespaces: ["ns1", "ns2"],
         actioDir: "~/actio-test",
         exposePrompt: true,
-        acceptPrompt: ["alpha*", "beta"],
+        acceptPrompt: ["alpha1", "beta"],
         disabled: true,
         json: true,
         reportActivity: true,
@@ -50,7 +50,7 @@ test("loadConfig: a full valid file is returned as written", () => {
       namespaces: ["ns1", "ns2"],
       actioDir: "~/actio-test",
       exposePrompt: true,
-      acceptPrompt: ["alpha*", "beta"],
+      acceptPrompt: ["alpha1", "beta"],
       disabled: true,
       json: true,
       reportActivity: true,
@@ -93,6 +93,23 @@ test("loadConfig: an agentId outside the pattern throws naming the path", () => 
     assert.throws(
       () => loadConfig(file, cwd),
       (err: Error) => err.message.startsWith(`${file}: `) && err.message.includes("agentId"),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadConfig: an empty or partial file is valid with defaults; acceptPrompt items keep the id pattern", () => {
+  const { dir, file, cwd } = scratch();
+  try {
+    writeFileSync(file, "{}");
+    assert.match(loadConfig(file, cwd).agentId, /^workspace-[0-9a-f]{4}$/);
+    writeFileSync(file, JSON.stringify({ disabled: true }));
+    assert.equal(loadConfig(file, cwd).disabled, true);
+    writeFileSync(file, JSON.stringify({ acceptPrompt: ["bad id!"] }));
+    assert.throws(
+      () => loadConfig(file, cwd),
+      (err: Error) => err.message.startsWith(`${file}: `) && err.message.includes("acceptPrompt"),
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });

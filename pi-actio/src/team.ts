@@ -82,12 +82,14 @@ export class Team {
     const record = this.history.startCall(id);
     try {
       const outcome = await this.agent.request(id, name, params ?? null, { timeout: 0, signal });
-      // A peer's error answer is a confirmed record whose `error` is set (A-2).
+      // A peer's error answer is a confirmed record whose `error` is set (A-2): the payload is
+      // the protocol's error result in `response.result` (`code` optional, `msg` required);
+      // the guard covers a malformed peer.
       if (outcome.finalStatus === "confirmed" && outcome.response?.error === true) {
-        const response = outcome.response;
+        const result = outcome.response.result;
         this.history.endCall(record, "confirmed", {
-          code: typeof response.code === "number" ? response.code : undefined,
-          error: response.msg === undefined ? "" : String(response.msg),
+          code: typeof result?.code === "number" ? result.code : undefined,
+          error: typeof result?.msg === "string" ? result.msg : "",
         });
       } else {
         this.history.endCall(record, outcome.finalStatus);
