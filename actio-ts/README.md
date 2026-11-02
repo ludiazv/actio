@@ -128,6 +128,8 @@ actio validate <file> [--as spec|status|announce|request|cancellation|response|c
 
 ## API notes
 
+- `agent.refresh()` runs a full discovery scan now (the same `rescan()` a nuntium event schedules) and returns the new Agmen view; a stopped agent returns its current view without scanning.
+- `checkParams(capability, params)` → the first Ajv error of the capability's `parameters` schema against `params`, as `"<instancePath or (root)> <message>"`; `undefined` when valid, or when the schema does not compile (D-19: the checks are skipped and the peer decides).
 - `agent.request(dst, name, params, options?)` → `{ finalStatus, response? }`; rejects with `ActioCallError` (nothing written) when the callability rules fail, and with `ActioResultError` when a non-error result breaks the peer's published `result` schema (D-12).
 - `agent.on("event", handler)` receives **every protocol event** on both lanes: `status`, `announce`, `inreq`, `outreq`, `ignored` (D-15/D-14), `log`.
 - `agent.capability(cap, handler)` deep-copies the registration (a later mutation of the caller's object changes nothing) and compiles the schemas eagerly (D-19: a non-strict schema throws at registration).

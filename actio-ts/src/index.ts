@@ -6,6 +6,7 @@ export type {
   ActioConfig,
   ActioEvent,
   AgentFolders,
+  AgentId,
   AgentOptions,
   AgentView,
   CapabilityContext,
@@ -21,3 +22,4 @@ export type {
   StatusState,
   SyncProvider,
 } from "./types.js";
+export type { Capability, ResponseBody } from "./generated/types.js";

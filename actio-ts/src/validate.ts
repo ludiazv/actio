@@ -190,3 +190,21 @@ export function compileCapability(cap: Capability): CompiledCapability {
     validateResult: (resultValue: unknown): boolean => result(resultValue) === true,
   };
 }
+
+/**
+ * The first Ajv error of `capability.parameters` against `params` (D-19, capability Ajv instance),
+ * as `"<instancePath or (root)> <message>"`; `undefined` when the parameters are valid, and when the
+ * schema does not compile (the checks are skipped and the peer decides, as in D-19).
+ */
+export function checkParams(capability: Capability, params: unknown): string | undefined {
+  let validate: ValidateFunction;
+  try {
+    validate = capabilities().compile(capability.parameters);
+  } catch {
+    return undefined; // D-19: an uncompilable schema skips the checks
+  }
+  if (validate(params) === true) return undefined;
+  const err = (validate.errors ?? [])[0]; // allErrors: false → the first (most specific) error
+  const where = err.instancePath === "" ? "(root)" : err.instancePath;
+  return `${where} ${err.message}`;
+}

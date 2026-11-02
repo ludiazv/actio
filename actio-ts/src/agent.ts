@@ -199,6 +199,13 @@ export class ActioAgent {
     return this.view;
   }
 
+  /** A full discovery scan now (the same `rescan()` a nuntium event schedules); returns the new view.
+   * Not running: the current view, no scan. */
+  async refresh(): Promise<Map<AgentId, AgentView>> {
+    await this.rescan();
+    return this.view;
+  }
+
   /** Issues a request (lane B); rejects locally with ActioCallError if not callable. */
   async request(dst: AgentId, name: string, params: unknown, options?: RequestOptions): Promise<RequestOutcome> {
     const view = this.view.get(dst);

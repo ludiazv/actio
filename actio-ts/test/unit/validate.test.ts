@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Validated } from "../../src/validate.js";
 import {
+  checkParams,
   compileCapability,
   envelopeKind,
   nameMatches,
@@ -520,4 +521,21 @@ test("capability schemas of different capabilities do not interfere", () => {
   assert.equal(a.validateParams({ a: 1 }), true);
   assert.equal(b.validateParams({ a: 1 }), false);
   assert.equal(b.validateParams({ b: 1 }), true);
+});
+
+test("checkParams reports the first Ajv error as '<path> <message>' and undefined when valid", () => {
+  const cap = capability(
+    { type: "object", properties: { text: { type: "string" } }, required: ["text"], additionalProperties: false },
+    true,
+  );
+  assert.equal(checkParams(cap, { text: "hello" }), undefined, "valid parameters");
+  assert.equal(checkParams(cap, { text: 3 }), "/text must be string", "a wrong type, at its path");
+  assert.equal(checkParams(cap, {}), "(root) must have required property 'text'", "a missing required field, at the root");
+  assert.equal(checkParams(cap, { text: "x", extra: 1 }), "(root) must NOT have additional properties", "an extra property");
+});
+
+test("checkParams skips the checks when the schema does not compile (D-19)", () => {
+  const cap = capability({ type: "object", propeties: {} }, true); // unknown keyword: strict mode refuses
+  assert.equal(checkParams(cap, { whatever: 1 }), undefined);
+  assert.equal(checkParams(cap, { text: "ok" }), undefined);
 });

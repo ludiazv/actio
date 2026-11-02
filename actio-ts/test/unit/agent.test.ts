@@ -570,6 +570,25 @@ test("a broadcast signal in nuntium triggers a full rescan (D-17)", opts, async 
   assert.deepEqual([...(a.agmen().get("gamma")?.capabilities.keys()) ?? []], ["echo"]);
 });
 
+test("refresh() sees a peer that started after us, where the nuntium debounce would not", opts, async (t) => {
+  const h = await harness(t);
+  const timers = { nuntiumDebounce: 60_000 }; // no nuntium-driven scan can land during the test
+  const a = agent(h, "alpha", { acceptsCommandsFrom: ["beta"] }, timers);
+  a.agent.capability(ECHO, echoHandler);
+  await a.agent.start();
+  assert.equal(a.agent.agmen().has("beta"), false, "beta has not started: not in the view");
+  const b = agent(h, "beta", { acceptsCommandsFrom: ["alpha"] }, timers);
+  b.agent.capability(ECHO, echoHandler);
+  await b.agent.start(); // its announce schedules a scan 60 s out: it cannot land in time
+  await sleep(300); // well past any other pending debounce: no scan may have sneaked in
+  assert.equal(a.agent.agmen().has("beta"), false, "the 60 s debounce hides beta");
+  const view = await a.agent.refresh();
+  assert.ok(view.has("beta"), "refresh() scans now and sees beta");
+  assert.equal(view, a.agent.agmen(), "the new view, the same map as agmen()");
+  assert.equal(a.agent.agmen().get("beta")?.health, "healthy");
+  assert.deepEqual([...(a.agent.agmen().get("beta")?.capabilities.keys()) ?? []], ["echo"]);
+});
+
 // --- the R2 regressions (WP7-C-1): one test per finding; the oracle's probes are separate -----------
 
 /** A request envelope as a peer would write it: the local gate of `request()` refuses to produce one. */
