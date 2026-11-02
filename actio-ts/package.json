@@ -4,6 +4,9 @@
   "description": "TypeScript implementation of the Actio protocol v0.1, core conformance profile",
   "type": "module",
   "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "engines": {
     "node": ">=22"
   },
