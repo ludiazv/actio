@@ -2,6 +2,7 @@
 export { ActioAgent } from "./agent.js";
 export { ActioCallError, ActioError, ActioResultError } from "./types.js";
 export { loadConfig } from "./config.js";
+export { checkParams } from "./validate.js";
 export type {
   ActioConfig,
   ActioEvent,
