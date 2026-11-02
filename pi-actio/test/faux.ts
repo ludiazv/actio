@@ -40,16 +40,19 @@ function newestToolResult(messages: Message[]): string | undefined {
   return m && m.role === "toolResult" ? textOf(m) : undefined;
 }
 
-// A response is: a tool call for `toolcall <tool> <json>`, otherwise `echo: <prompt>` — or the
-// text of a fresh tool result, so a caller can see that a tool ran. "slow" replies are delayed.
+// A response is: the text of a fresh tool result (so a caller can see that a tool ran), otherwise a
+// tool call for `toolcall <tool> <json>`, otherwise `echo: <prompt>`. "slow" replies are delayed.
+// The tool-result branch must come first: the prompt text stays the last user message, so checking the
+// `toolcall` shape first would make the model call the same tool again for every remaining response.
 async function respond(context: unknown) {
   const messages = (context as { messages: Message[] }).messages ?? [];
   const prompt = lastUserText(messages);
+  const toolResult = newestToolResult(messages);
+  if (toolResult !== undefined) return fauxAssistantMessage(`tool: ${toolResult}`);
   const toolCall = /^toolcall\s+(\S+)\s+(\{[\s\S]*\})$/.exec(prompt);
   if (toolCall) return fauxAssistantMessage(fauxToolCall(toolCall[1], JSON.parse(toolCall[2])));
-  const toolResult = newestToolResult(messages);
   if (prompt.includes("slow")) await sleep(SLOW_MS);
-  return fauxAssistantMessage(toolResult === undefined ? `echo: ${prompt}` : `tool: ${toolResult}`);
+  return fauxAssistantMessage(`echo: ${prompt}`);
 }
 
 export default function (pi: ExtensionAPI): void {
