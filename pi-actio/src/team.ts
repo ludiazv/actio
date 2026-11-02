@@ -79,7 +79,7 @@ export class Team {
       throw new Error(`invalid params for ${id}/${name}: ${invalid} (use \`info ${id}\`)`);
     }
     // D-10 passed: the call is real, so its record opens now (A-2).
-    const record = this.history.startCall(id);
+    const record = this.history.startCall(`${id}/${name}`);
     try {
       const outcome = await this.agent.request(id, name, params ?? null, { timeout: 0, signal });
       // A peer's error answer is a confirmed record whose `error` is set (A-2): the payload is
