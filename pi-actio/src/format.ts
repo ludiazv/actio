@@ -19,16 +19,15 @@ function namespacesText(namespaces: (string | null)[] | null | undefined): strin
 
 /** `list-team` output (D-8: the view never contains this agent). */
 export function formatTeam(views: AgentView[], json: boolean): string {
-  const sorted = [...views].sort((a, b) => a.id.localeCompare(b.id));
   if (json) {
     return JSON.stringify(
-      sorted.map((v) => ({ id: v.id, description: v.spec.description, capabilities: capabilityNames(v) })),
+      views.map((v) => ({ id: v.id, description: v.spec.description, capabilities: capabilityNames(v) })),
       null,
       2,
     );
   }
-  if (sorted.length === 0) return "No visible agents.";
-  return sorted
+  if (views.length === 0) return "No visible agents.";
+  return views
     .map((v) => `- **${v.id}** — ${v.spec.description} — capabilities: ${quoted(capabilityNames(v))}`)
     .join("\n");
 }
@@ -63,8 +62,7 @@ export function formatInfo(view: AgentView, capability: string | undefined, json
       2,
     );
   }
-  const health = view.health ?? "unknown";
-  const head = `# ${view.id}\n${view.spec.description}\nStatus: ${view.status.status} · Health: ${health} · Namespaces: ${namespacesText(view.spec.namespaces)}`;
+  const head = `# ${view.id}\n${view.spec.description}\nStatus: ${view.status.status} · Health: ${view.health} · Namespaces: ${namespacesText(view.spec.namespaces)}`;
   return `${head}\n\n${caps.map(capabilitySection).join("\n\n")}`;
 }
 

@@ -114,12 +114,12 @@ class ExplorerComponent {
       this.selectKey = "";
       return [th.fg("dim", "no other agents in the view")];
     }
-    const key = views.map((v) => `${v.id}:${v.status.status}:${v.health ?? "-"}`).join("|");
+    const key = views.map((v) => `${v.id}:${v.status.status}:${v.health}`).join("|");
     if (this.select === undefined || key !== this.selectKey) {
       const previous = this.select?.getSelectedItem()?.value;
       const items = views.map((v) => ({
         value: v.id,
-        label: `${v.id}  ${v.status.status}/${v.health ?? "-"}`,
+        label: `${v.id}  ${v.status.status}/${v.health}`,
         description: v.spec.description,
       }));
       this.select = new SelectList(items, 10, getSelectListTheme());
@@ -144,7 +144,7 @@ class ExplorerComponent {
     return lines;
   }
 
-  /** Calls tab: newest first, one line per record (A-2). */
+  /** Calls tab: newest first, one line per record (D-19). */
   private callsTab(width: number, th: Theme): string[] {
     const calls = [...this.history.calls].reverse();
     if (calls.length === 0) return [truncateToWidth(th.fg("dim", "no outgoing calls yet"), width)];
@@ -156,7 +156,7 @@ class ExplorerComponent {
     );
   }
 
-  /** A-2: how a call record (including in-flight) reads in the Calls tab. */
+  /** D-19: how a call record (including in-flight) reads in the Calls tab. */
   private callState(record: CallRecord, th: Theme): string {
     switch (record.state) {
       case "in-flight":

@@ -17,7 +17,7 @@ export default function (pi: ExtensionAPI): void {
     const message = err instanceof Error ? err.message : String(err);
     // D-2: register nothing; a session_start handler notifies once.
     pi.on("session_start", (_event, ctx) => {
-      if (ctx.hasUI) ctx.ui.notify(`actio: ${message}`, "info");
+      if (ctx.hasUI) ctx.ui.notify(`actio: ${message}`, "error");
     });
     return;
   }
@@ -44,7 +44,7 @@ export default function (pi: ExtensionAPI): void {
   // The latest context, kept from session_start and agent_settled (D-18, §3.2).
   let latest: ExtensionContext | undefined;
 
-  // 5. The activity subscription is the only notifier (D-18, A-1).
+  // 5. The activity subscription is the only notifier (D-18).
   if (config.reportActivity) {
     history.onChange((event) => {
       const ctx = latest;
@@ -54,7 +54,7 @@ export default function (pi: ExtensionAPI): void {
         ctx.ui.notify(callText(event.record), "info");
         return;
       }
-      // A polling retrieve (queued/running) is recorded but not notified (A-1).
+      // A polling retrieve (queued/running) is recorded but not notified (D-18).
       if (event.record.capability === "retrieve" && (event.record.outcome === "queued" || event.record.outcome === "running")) {
         return;
       }
@@ -71,7 +71,7 @@ export default function (pi: ExtensionAPI): void {
       await team.start();
     } catch (err) {
       // D-7: a failed start is notified; the tool answers "actio agent is not running".
-      if (ctx.hasUI) ctx.ui.notify(`actio: agent start failed: ${err instanceof Error ? err.message : String(err)}`, "info");
+      if (ctx.hasUI) ctx.ui.notify(`actio: agent start failed: ${err instanceof Error ? err.message : String(err)}`, "error");
     }
   });
   pi.on("agent_settled", (_event, ctx) => {
@@ -84,7 +84,7 @@ export default function (pi: ExtensionAPI): void {
   });
 }
 
-/** The D-18 notification text for a finished call record (A-2). */
+/** The D-18 notification text for a finished call record. */
 function callText(record: CallRecord): string {
   switch (record.state) {
     case "confirmed":

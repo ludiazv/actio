@@ -46,7 +46,7 @@ export function actioTool(team: Team, config: Config): ToolDefinition {
       if (p.command === "info") {
         if (p.id === undefined) throw new Error('info needs "id"');
         const view = team.view().find((v) => v.id === p.id);
-        if (view === undefined) throw new Error(`no visible agent "${p.id}"`);
+        if (view === undefined) throw new Error(`no visible agent "${p.id}" (use list-team)`);
         return { content: [{ type: "text", text: formatInfo(view, p.capability, config.json) }], details: undefined };
       }
       // p.command === "call"
