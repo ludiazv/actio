@@ -13,6 +13,8 @@ export class Team {
 
   private history: History;
   private agentRunning = false;
+  /** Set while a `start()` is in flight, so a `stop()` can await it (V-4). */
+  private startPromise: Promise<void> | undefined;
 
   constructor(config: Config, cwd: string, history: History) {
     this.history = history;
@@ -31,16 +33,32 @@ export class Team {
 
   start(): Promise<void> {
     if (this.agentRunning) return Promise.resolve();
-    return this.agent.start().then(() => {
-      this.agentRunning = true;
-    });
+    // A `start()` called twice returns the same promise; the field clears when it settles.
+    this.startPromise ??= this.agent
+      .start()
+      .then(() => {
+        this.agentRunning = true;
+      })
+      .finally(() => {
+        this.startPromise = undefined;
+      });
+    return this.startPromise;
   }
 
   /** `stop({ force: true })`: quitting never waits out the grace period (D-7). */
-  stop(): Promise<void> {
-    if (!this.agentRunning) return Promise.resolve();
+  async stop(): Promise<void> {
+    const start = this.startPromise;
+    this.startPromise = undefined;
+    if (start !== undefined) {
+      try {
+        await start;
+      } catch {
+        // Only its rejection is swallowed: the start caller reports it (D-7), not `stop()`.
+      }
+    }
+    if (!this.agentRunning) return;
     this.agentRunning = false;
-    return this.agent.stop({ force: true });
+    await this.agent.stop({ force: true });
   }
 
   running(): boolean {
@@ -68,7 +86,7 @@ export class Team {
     const name = match[2];
     const view = this.view().find((v) => v.id === id);
     if (view === undefined) {
-      throw new Error(`agent "${id}" is not in the team view (use \`info ${id}\`)`);
+      throw new Error(`agent "${id}" is not in the team view (use list-team)`);
     }
     const capability = view.capabilities.get(name);
     if (capability === undefined) {
@@ -78,11 +96,11 @@ export class Team {
     if (invalid !== undefined) {
       throw new Error(`invalid params for ${id}/${name}: ${invalid} (use \`info ${id}\`)`);
     }
-    // D-10 passed: the call is real, so its record opens now (A-2).
+    // D-10 passed: the call is real, so its record opens now (D-19).
     const record = this.history.startCall(`${id}/${name}`);
     try {
       const outcome = await this.agent.request(id, name, params ?? null, { timeout: 0, signal });
-      // A peer's error answer is a confirmed record whose `error` is set (A-2): the payload is
+      // A peer's error answer is a confirmed record whose `error` is set (D-19): the payload is
       // the protocol's error result in `response.result` (`code` optional, `msg` required);
       // the guard covers a malformed peer.
       if (outcome.finalStatus === "confirmed" && outcome.response?.error === true) {

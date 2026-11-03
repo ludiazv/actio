@@ -142,23 +142,15 @@ test("configPath: joins the agent dir and actio.json", () => {
   }
 });
 
-test("defaultAgentId: shape, length, pattern, and stable per cwd", () => {
+test("defaultAgentId: shape, length, pattern, basename rules, and stability per cwd", () => {
   const cwd = join(tmpdir(), "some dir.x");
   const first = defaultAgentId(cwd);
   assert.match(first, /^[a-zA-Z0-9_-]{1,32}$/);
   assert.ok(first.length <= 32);
   assert.match(first, /^some_dir_x-[0-9a-f]{4}$/);
   assert.equal(defaultAgentId(cwd), first); // kept per process and cwd
-});
-
-test("defaultAgentId: long basenames are cut to 27 characters", () => {
-  const cwd = join(tmpdir(), "a".repeat(40));
-  const id = defaultAgentId(cwd);
-  assert.equal(id.length, 32); // 27 + "-" + 4 hex
-  assert.match(id, new RegExp(`^a{27}-[0-9a-f]{4}$`));
-});
-
-test("defaultAgentId: an empty basename becomes pi", () => {
-  const id = defaultAgentId("/");
-  assert.match(id, /^pi-[0-9a-f]{4}$/);
+  const long = defaultAgentId(join(tmpdir(), "a".repeat(40)));
+  assert.equal(long.length, 32); // 27 + "-" + 4 hex
+  assert.match(long, /^a{27}-[0-9a-f]{4}$/);
+  assert.match(defaultAgentId("/"), /^pi-[0-9a-f]{4}$/);
 });

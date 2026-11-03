@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 
@@ -33,14 +34,9 @@ const Schema = Type.Object(
   { additionalProperties: false },
 );
 
-/** The agent directory pi reads extensions from: `$PI_CODING_AGENT_DIR` or `~/.pi/agent`. */
-function agentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-}
-
-/** Absolute path of the configuration file (D-1). */
+/** Absolute path of the configuration file (D-1); the agent dir is pi's own `getAgentDir()`. */
 export function configPath(): string {
-  return join(agentDir(), "actio.json");
+  return join(getAgentDir(), "actio.json");
 }
 
 /** Expands a leading `~` or `~/` to the home directory (D-5). */
