@@ -144,9 +144,9 @@ export class PromptService {
   private async onPrompt(params: unknown, ctx: CapabilityContext): Promise<unknown> {
     const p = params as { msg_prompt: string; asap?: boolean };
     const id = this.newId();
-    // D-14/D-16: busy = !ctx.isIdle() || running.size > 0 || compacting. Nothing is sent
-    // while busy without `deliverAs`; an `asap` prompt steers only when not compacting.
-    const busy = this.ctx === undefined || !this.ctx.isIdle() || this.running.size > 0 || this.compacting;
+    // D-14/D-16: nothing is sent while busy without `deliverAs`, and an `asap` prompt steers
+    // only when no compaction is in flight.
+    const busy = this.busy();
     let outcome: string;
     if (!busy) {
       this.send(id, p.msg_prompt);

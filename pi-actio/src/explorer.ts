@@ -175,7 +175,7 @@ class ExplorerComponent {
     }
   }
 
-  /** Prompts tab: newest first; the outcome is shown as it is (A-3). */
+  /** Prompts tab: newest first; the outcome is shown as D-19 defines it. */
   private promptsTab(width: number, th: Theme): string[] {
     const prompts = [...this.history.prompts].reverse();
     if (prompts.length === 0) return [truncateToWidth(th.fg("dim", "no prompt requests received yet"), width)];
