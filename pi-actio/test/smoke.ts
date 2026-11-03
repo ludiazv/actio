@@ -2,7 +2,7 @@
 // One line per step, exit 0 when all steps pass, 1 otherwise. No LLM call: the faux model (§3.8).
 // Every directory is temporary, so nothing of the user's pi or actio root is touched.
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -114,7 +114,13 @@ try {
   await tester.stop({ force: true });
   child.stdin.end();
   if (!child.killed) await new Promise<void>((r) => { child.once("close", () => r()); setTimeout(r, 8000); });
-  step(`teardown: temp roots kept for inspection: ${ROOT} · ${AGENT_DIR}`, true);
+  // V-5: keep the folders only when something failed, so a green run leaves nothing in /tmp.
+  if (failed === 0) {
+    for (const dir of [ROOT, AGENT_DIR, CWD]) rmSync(dir, { recursive: true, force: true });
+    step("teardown: temp folders removed", true);
+  } else {
+    step(`teardown: temp folders kept for inspection: ${ROOT} · ${AGENT_DIR} · ${CWD}`, true);
+  }
 }
 console.log(failed === 0 ? "SMOKE OK" : `SMOKE FAILED (${failed})`);
 process.exit(failed === 0 ? 0 : 1);
