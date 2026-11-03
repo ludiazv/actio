@@ -29,6 +29,9 @@ export class PromptService {
   private queue: string[] = [];
   private running = new Set<string>();
   private lastAnswer = "";
+  // D-16 (V-1): a compaction is in flight, or was requested while busy and is deferred.
+  private compacting = false;
+  private compactPending = false;
 
   constructor(pi: PiSurface, history: History) {
     this.pi = pi;
@@ -48,8 +51,15 @@ export class PromptService {
         }
       }
       this.running.clear();
-      // Then, if idle, the next queued prompt is sent.
-      if (ctx.isIdle()) this.sendNext();
+      // Then, if idle: a deferred compaction starts before the queue (D-16, V-1).
+      if (ctx.isIdle()) {
+        if (this.compactPending) {
+          this.compactPending = false;
+          this.startCompaction();
+        } else {
+          this.sendNext();
+        }
+      }
     });
   }
 
@@ -134,14 +144,14 @@ export class PromptService {
   private async onPrompt(params: unknown, ctx: CapabilityContext): Promise<unknown> {
     const p = params as { msg_prompt: string; asap?: boolean };
     const id = this.newId();
-    // D-14: busy = !ctx.isIdle() || running.size > 0. Nothing is ever sent while busy
-    // without `deliverAs`; a plain send happens only when not busy.
-    const busy = this.ctx === undefined || !this.ctx.isIdle() || this.running.size > 0;
+    // D-14/D-16: busy = !ctx.isIdle() || running.size > 0 || compacting. Nothing is sent
+    // while busy without `deliverAs`; an `asap` prompt steers only when not compacting.
+    const busy = this.ctx === undefined || !this.ctx.isIdle() || this.running.size > 0 || this.compacting;
     let outcome: string;
     if (!busy) {
       this.send(id, p.msg_prompt);
       outcome = "running";
-    } else if (p.asap === true) {
+    } else if (p.asap === true && !this.compacting) {
       this.send(id, p.msg_prompt, { deliverAs: "steer" });
       outcome = "running";
     } else {
@@ -187,7 +197,10 @@ export class PromptService {
 
   /** D-16: always success; a small session fails with "Nothing to compact". */
   private async onCompact(ctx: CapabilityContext): Promise<unknown> {
-    this.ctx?.compact({ onError: () => {} });
+    // pi's compact() aborts the run in progress and never settles (V-1): while busy the
+    // compaction is deferred to the next settle; its callbacks resume the queue.
+    if (this.busy()) this.compactPending = true;
+    else this.startCompaction();
     this.history.addPrompt({ src: ctx.src, capability: "compact", outcome: "compact" });
     return null;
   }
@@ -216,6 +229,22 @@ export class PromptService {
     const entry = this.entries.get(id);
     if (entry === undefined || entry.msg === undefined) return;
     this.send(id, entry.msg);
+  }
+
+  /** D-14/D-16: busy = !isIdle, a prompt running, or a compaction in flight. */
+  private busy(): boolean {
+    return this.ctx === undefined || !this.ctx.isIdle() || this.running.size > 0 || this.compacting;
+  }
+
+  /** D-16 (V-1): starts the compaction; its callbacks clear `compacting` and, if idle, run the queue. */
+  private startCompaction(): void {
+    if (this.ctx === undefined) return;
+    this.compacting = true;
+    const after = (): void => {
+      this.compacting = false;
+      if (this.ctx?.isIdle() === true) this.sendNext();
+    };
+    this.ctx.compact({ onComplete: after, onError: after });
   }
 
   /** The last assistant text of an `agent_end` ("" when there is none). */

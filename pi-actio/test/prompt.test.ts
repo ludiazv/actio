@@ -6,18 +6,22 @@ import { ActioError, type ActioAgent, type Capability, type CapabilityContext, t
 import { History } from "../src/history.js";
 import { PromptService, type PiSurface } from "../src/prompt.js";
 
+/** The compaction callbacks the service passes to `ctx.compact` (D-16). */
+type CompactOptions = { onComplete?: () => void; onError?: (error: Error) => void };
+
 /** A stub ctx: an `isIdle` flag, and `abort`/`compact` spies. */
 function makeCtx() {
-  const state = { idle: true, aborted: 0, compacts: 0 };
+  const state = { idle: true, aborted: 0, compacts: 0, autoError: true, compact: undefined as CompactOptions | undefined };
   const ctx = {
     isIdle: () => state.idle,
     abort: () => {
       state.aborted += 1;
     },
-    // Simulates a small session: the compaction fails, so `onError` fires.
-    compact: (options?: { onError?: (error: Error) => void }) => {
+    // Simulates a small session: the compaction fails, so `onError` fires (by default).
+    compact: (options?: CompactOptions) => {
       state.compacts += 1;
-      options?.onError?.(new Error("Nothing to compact"));
+      state.compact = options;
+      if (state.autoError) options?.onError?.(new Error("Nothing to compact"));
     },
   };
   return { state, ctx: ctx as unknown as ExtensionContext };
@@ -167,4 +171,20 @@ test("compact returns null even when onError fires", async () => {
   assert.equal(await h.call("compact", {}), null);
   assert.equal(h.state.compacts, 1);
   assert.equal(h.history.prompts.at(-1)?.outcome, "compact");
+});
+
+test("compact defers while busy; the queue runs on onComplete; asap queues during compaction", async () => {
+  const h = makeService();
+  h.state.autoError = false;
+  await h.call("prompt", { msg_prompt: "first" });
+  assert.equal(await h.call("compact", {}), null);
+  h.pi.settled(false, h.ctx);
+  assert.equal(h.state.compacts, 1);
+  const plain = (await h.call("prompt", { msg_prompt: "after" })) as { prompt_id: string };
+  const hurry = (await h.call("prompt", { msg_prompt: "hurry", asap: true })) as { prompt_id: string };
+  assert.deepEqual(await h.call("retrieve", { prompt_id: plain.prompt_id }), { status: "queued" });
+  assert.deepEqual(await h.call("retrieve", { prompt_id: hurry.prompt_id }), { status: "queued" });
+  h.state.compact!.onComplete?.();
+  h.state.compact!.onError?.(new Error("late"));
+  assert.deepEqual(h.pi.sent.map((s) => s.text), ["first", "after", "hurry"]);
 });
