@@ -833,3 +833,17 @@ test("R2-6: a bad environment value throws at start(), never at construction (D-
     delete process.env["ACTIO_HEARTBEAT"];
   }
 });
+
+test("diarium() and log(): the agent's own diarium, rejected before start, readable after", opts, async (t) => {
+  const h = await harness(t);
+  const { agent: a } = agent(h, "alpha");
+  await assert.rejects(() => a.diarium(), { message: "the agent has never started" });
+  await assert.rejects(() => a.log("hello"), { message: "the agent has never started" });
+  await a.start();
+  await a.log("hello");
+  const read = await a.diarium();
+  const last = read.lines[read.lines.length - 1];
+  assert.equal(last.event, "log");
+  assert.equal(last.event_data, "hello");
+  assert.ok(read.lines.some((l) => l.event === "status"), "start() recorded a status line");
+});

@@ -1,17 +1,20 @@
-// Public API barrel of actio-ts (§2.7). Internal modules are reached via deep imports.
+// The public API of actio-ts; `package.json` `exports` exposes only this file.
 export { ActioAgent } from "./agent.js";
 export { ActioCallError, ActioError, ActioResultError } from "./types.js";
 export { loadConfig } from "./config.js";
 export { checkParams } from "./validate.js";
+export { scan } from "./discovery.js";
+export { health } from "./status.js";
+export { read as readDiarium } from "./diarium.js";
+export type * from "./generated/types.js";
+export type { DiscoveredAgent, ScanResult } from "./discovery.js";
+export type { DiariumRead } from "./diarium.js";
 export type {
   ActioConfig,
   ActioEvent,
-  AgentFolders,
-  AgentId,
   AgentOptions,
   AgentView,
   CapabilityContext,
-  CapabilityEntry,
   CapabilityHandler,
   CommandContext,
   CommandHandler,
@@ -21,6 +24,4 @@ export type {
   RequestOptions,
   RequestOutcome,
   StatusState,
-  SyncProvider,
 } from "./types.js";
-export type { Capability, ResponseBody } from "./generated/types.js";

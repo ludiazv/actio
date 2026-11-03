@@ -2,6 +2,7 @@
 import path from "node:path";
 import { defaultConfig, loadConfig } from "./config.js";
 import * as diarium from "./diarium.js";
+import type { DiariumRead } from "./diarium.js";
 import { callable, scan } from "./discovery.js";
 import * as io from "./io.js";
 import { Receiver } from "./receiver.js";
@@ -197,6 +198,23 @@ export class ActioAgent {
   /** The current Agmen view (Map<AgentId, AgentView> after the callability rules). */
   agmen(): Map<AgentId, AgentView> {
     return this.view;
+  }
+
+  /** The agent's own diarium (the valid lines in file order, and the ignored lines with a reason).
+   * Works after `stop()`: the folder stays. */
+  async diarium(): Promise<DiariumRead> {
+    const folder = this.folders.agent;
+    if (folder === "") throw new Error("the agent has never started");
+    return diarium.read(folder);
+  }
+
+  /** Appends a `log` event to the agent's own diarium through the existing `append` path, so it is
+   * validated and the sync provider applies it. It emits no `ActioEvent`. There is no API to append
+   * any other event name: the mandatory events belong to the library. Works after `stop()`. */
+  async log(message: string): Promise<void> {
+    const folder = this.folders.agent;
+    if (folder === "") throw new Error("the agent has never started");
+    await diarium.append(folder, diarium.logEvent(this.options.id, this.now(), message));
   }
 
   /** A full discovery scan now (the same `rescan()` a nuntium event schedules); returns the new view.

@@ -1,6 +1,6 @@
 // Tests of the diarium append and the five typed event builders (WP3-A).
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { test } from "node:test";
 import * as diarium from "../../src/diarium.js";
@@ -221,4 +221,27 @@ test("append validates, it does not restrict the events: custom events are allow
 test("append propagates a write failure (missing folder) instead of swallowing it", async (t) => {
   const root = path.join(await makeRoot(t), "not-created");
   await assert.rejects(() => diarium.append(root, diarium.logEvent(ID, T0, "x")), { code: "ENOENT" });
+});
+
+// --- read(): the valid lines in file order, the ignored lines with a reason each ---
+
+test("read: a mixed file gives the valid lines and the ignored lines with a reason", async (t) => {
+  const folder = path.join(await makeRoot(t), ID);
+  await mkdir(folder);
+  const valid1 = JSON.stringify({ id: ID, datetime: ISO, event: "log", event_data: "one" });
+  const invalid = JSON.stringify({ id: ID, datetime: "not-a-date", event: "log", event_data: "x" });
+  const valid2 = JSON.stringify({ id: ID, datetime: ISO, event: "log", event_data: "two" });
+  const partial = `{"id":"${ID}","datetime":"${ISO}","event":"log","event_data":"cut`;
+  await writeFile(diariumFile(folder), `${valid1}\nnot json\n${invalid}\n${valid2}\n${partial}`);
+  const read = await diarium.read(folder);
+  assert.deepEqual(read.lines.map((l) => l.event_data), ["one", "two"], "the valid lines, in file order");
+  assert.equal(read.ignored.length, 2, "the partial last line is not reported (an append may be in progress)");
+  assert.deepEqual(read.ignored[0], { line: 2, reason: "not valid JSON" });
+  assert.equal(read.ignored[1].line, 3);
+  assert.match(read.ignored[1].reason, /datetime/, "the first Ajv error of the schema-invalid line");
+});
+
+test("read: a missing file gives the empty result", async (t) => {
+  const root = await makeRoot(t);
+  assert.deepEqual(await diarium.read(path.join(root, "never-created")), { lines: [], ignored: [] });
 });
