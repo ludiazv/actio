@@ -29,10 +29,11 @@ cd ../pi-actio && npm install
 pi install <absolute path>/pi-actio
 ```
 
-- **Node ≥ 22.** pi runs on whatever `node` is first on PATH. If that is a Bun shim, `npm test` and
-  `npm run smoke` fail — Bun does not hand Node's test glob to the test runner — and `npm run check` stops at
-  that point. The extension itself loads under both.
-- Removing it: `pi uninstall pi-actio`.
+- **Node ≥ 22.** pi runs on whatever `node` is first on PATH. If that is a Bun shim, `npm run check` fails:
+  Bun does not hand Node's quoted `test/*.test.ts` glob to the test runner. `npm run smoke` and the extension
+  itself work under both. There is no `npm test` script here.
+- Removing it: `pi uninstall <absolute path>/pi-actio` — pi matches a local extension by its resolved path, so
+  the bare name only works from the folder you installed from.
 - For development, nothing needs installing: `pi -ne -e <path>/pi-actio/src/index.ts`. Keep
   `PI_CODING_AGENT_DIR` and `ACTIO_DIR` pointed at temporary directories while testing, or the agent joins a
   real team.
@@ -148,4 +149,7 @@ The history is **in memory, per session**: `/reload`, `/new` or `/fork` starts i
 - The prompt service answers with the run's final text: no streaming, no mid-run output, no model choice.
 - The Explorer cannot show the resolved actio root when `actioDir` is unset (actio-ts keeps it); set
   `actioDir` to see the path in the header.
+- A compaction started **by the pi user** (`/compact`) is outside the extension's view: a prompt queued during
+  it waits for the next run, and an `asap` prompt sent during it can be lost or answered late. Every
+  compaction requested through the prompt service is waited for and then run.
 - No protocol commands (`cmd`), no attachments, no retries.
