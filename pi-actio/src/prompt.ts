@@ -199,7 +199,11 @@ export class PromptService {
   private async onCompact(ctx: CapabilityContext): Promise<unknown> {
     // pi's compact() aborts the run in progress and never settles (V-1): while busy the
     // compaction is deferred to the next settle; its callbacks resume the queue.
-    if (this.busy()) this.compactPending = true;
+    // V-12: during a compaction the one in flight already covers the request. Deferring it
+    // would run a second compaction after some unrelated later settle, maybe the user's turn.
+    if (this.compacting) {
+      /* the compaction in flight covers it */
+    } else if (this.busy()) this.compactPending = true;
     else this.startCompaction();
     this.history.addPrompt({ src: ctx.src, capability: "compact", outcome: "compact" });
     return null;
@@ -236,13 +240,16 @@ export class PromptService {
     return this.ctx === undefined || !this.ctx.isIdle() || this.running.size > 0 || this.compacting;
   }
 
-  /** D-16 (V-1): starts the compaction; its callbacks clear `compacting` and, if idle, run the queue. */
+  /** D-16 (V-1): starts the compaction; one callback clears the flag and, if not busy, runs the queue. */
   private startCompaction(): void {
     if (this.ctx === undefined) return;
     this.compacting = true;
     const after = (): void => {
+      // V-11: pi runs `onError` even when `onComplete` throws, so the callback must fire once. And it
+      // checks busy(), not isIdle(): a plain send while a prompt is running breaks D-14.
+      if (!this.compacting) return;
       this.compacting = false;
-      if (this.ctx?.isIdle() === true) this.sendNext();
+      if (!this.busy()) this.sendNext();
     };
     this.ctx.compact({ onComplete: after, onError: after });
   }

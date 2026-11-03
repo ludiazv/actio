@@ -19,9 +19,8 @@ function namespacesText(namespaces: (string | null)[] | null | undefined): strin
 
 /** `list-team` output (D-8: the view never contains this agent). */
 export function formatTeam(input: AgentView[], json: boolean): string {
-  // One comparator for the whole project — the same as `Team.view()` (D-8) — so `list-team` and the
-  // Explorer cannot disagree about the order, and a caller that passes an unsorted list still gets a
-  // sorted one.
+  // The same comparator as `Team.view()` (D-8), so `list-team` and the Explorer cannot disagree about
+  // the order, and a caller that passes an unsorted list still gets a sorted one.
   const views = [...input].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   if (json) {
     return JSON.stringify(
