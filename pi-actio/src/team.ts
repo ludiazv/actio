@@ -13,7 +13,7 @@ export class Team {
 
   private history: History;
   private agentRunning = false;
-  /** Set while a `start()` is in flight, so a `stop()` can await it (V-4). */
+  /** Set while a `start()` is in flight, so a `stop()` awaits it instead of racing it. */
   private startPromise: Promise<void> | undefined;
 
   constructor(config: Config, cwd: string, history: History) {
