@@ -8,7 +8,7 @@ export { health } from "./status.js";
 export { read as readDiarium } from "./diarium.js";
 export type * from "./generated/types.js";
 export type { DiscoveredAgent, ScanResult } from "./discovery.js";
-export type { DiariumRead } from "./diarium.js";
+export type { DiariumEntry, DiariumRead } from "./diarium.js";
 export type {
   ActioConfig,
   ActioEvent,

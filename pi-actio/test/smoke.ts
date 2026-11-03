@@ -114,7 +114,7 @@ try {
   await tester.stop({ force: true });
   child.stdin.end();
   if (!child.killed) await new Promise<void>((r) => { child.once("close", () => r()); setTimeout(r, 8000); });
-  // V-5: keep the folders only when something failed, so a green run leaves nothing in /tmp.
+  // Keep the folders only when something failed, so a green run leaves nothing in /tmp.
   if (failed === 0) {
     for (const dir of [ROOT, AGENT_DIR, CWD]) rmSync(dir, { recursive: true, force: true });
     step("teardown: temp folders removed", true);

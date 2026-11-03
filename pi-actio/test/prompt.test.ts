@@ -185,6 +185,6 @@ test("compact defers while busy; the queue runs on onComplete; asap queues durin
   assert.deepEqual(await h.call("retrieve", { prompt_id: plain.prompt_id }), { status: "queued" });
   assert.deepEqual(await h.call("retrieve", { prompt_id: hurry.prompt_id }), { status: "queued" });
   h.state.compact!.onComplete?.();
-  h.state.compact!.onError?.(new Error("late")); // V-11: pi fires onError after a throwing onComplete; once is once
+  h.state.compact!.onError?.(new Error("late")); // pi fires onError after a throwing onComplete; once is once
   assert.deepEqual(h.pi.sent.map((s) => s.text), ["first", "after"]);
 });

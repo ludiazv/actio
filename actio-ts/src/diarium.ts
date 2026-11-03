@@ -52,19 +52,31 @@ export function logEvent(id: AgentId, nowMs: number, message: string): DiariumLi
   return line(id, nowMs, "log", message);
 }
 
+/** One line as `read` returns it. The generated `DiariumLine` types `event_data` as an object, which is
+ * wrong for `status` and `log` (a string), for `announce` (`null`), and unusable for `inreq`/`outreq`: it
+ * cannot be cast to `Exchange`. So the reader says `unknown`, and the event names say what to cast to. */
+export interface DiariumEntry {
+  id: AgentId;
+  datetime: string;
+  event: string;
+  event_data: unknown;
+}
+
 /** The read-only view of a diarium file: the valid lines, and the ignored lines with a reason each. */
 export interface DiariumRead {
-  lines: DiariumLine[];                         // the valid lines, in file order
+  lines: DiariumEntry[];                        // the valid lines, in file order
   ignored: { line: number; reason: string }[];  // 1-based; "not valid JSON" or the first Ajv error
 }
 
 /** Reads `<folder>/diarium.jsonl` (an agent folder as `AgentView.folder` gives it, never `root/<id>`).
  * A missing file gives the empty result; any other read error rejects. Blank lines are skipped, and a
  * last line without a trailing newline is skipped and not reported: an append may be in progress.
- * Each line goes through `JSON.parse` and then `validateDiarium`; `event_data` is not narrowed (the
- * schema does not enforce it per event, and another agent's file is untrusted) — consumers narrow on
- * `event`. There are no filter options: filtering is the caller's job, and protocol `datetime`
- * strings compare correctly as plain strings. */
+ * Each line goes through `JSON.parse` and then `validateDiarium`, which checks `event_data` for each of
+ * the five protocol events (its own `if`/`then` per event), so every line returned has passed that check;
+ * an event name of its own is not checked, and another agent's file is untrusted either way. The value
+ * arrives as `unknown`: after `event === "inreq"` or `"outreq"` a consumer casts it to `Exchange`, after
+ * `"status"` to `StatusState`, after `"log"` to `string`. There are no filter options: filtering is the
+ * caller's job, and protocol `datetime` strings compare correctly as plain strings. */
 export async function read(folder: string): Promise<DiariumRead> {
   let raw: string;
   try {
@@ -73,7 +85,7 @@ export async function read(folder: string): Promise<DiariumRead> {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return { lines: [], ignored: [] };
     throw err;
   }
-  const lines: DiariumLine[] = [];
+  const lines: DiariumEntry[] = [];
   const ignored: DiariumRead["ignored"] = [];
   const parts = raw.split("\n");
   const endsWithNewline = raw.endsWith("\n");
@@ -89,7 +101,7 @@ export async function read(folder: string): Promise<DiariumRead> {
       continue;
     }
     const checked = validateDiarium(parsed);
-    if (checked.ok) lines.push(checked.value);
+    if (checked.ok) lines.push(checked.value as DiariumEntry);
     else ignored.push({ line: i + 1, reason: checked.errors[0] });
   }
   return { lines, ignored };

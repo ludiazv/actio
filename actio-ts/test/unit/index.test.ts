@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { ActioAgent, checkParams, health, readDiarium, scan } from "../../src/index.js";
-import type { Capability, DiariumLine, DiscoveredAgent, Spec, Status } from "../../src/index.js";
+import type { Capability, DiariumEntry, DiscoveredAgent, Exchange, Spec, Status } from "../../src/index.js";
 
 test("the entry exports checkParams as a function and the agent class", () => {
   assert.equal(typeof checkParams, "function");
@@ -17,11 +17,13 @@ test("the entry exports scan, health and readDiarium as functions", () => {
 });
 
 test("the protocol types are nameable through the entry (type-only import)", () => {
-  const line: DiariumLine = { id: "alpha", datetime: "2023-11-14T22:13:20Z", event: "log", event_data: { msg: "hi" } };
+  const line: DiariumEntry = { id: "alpha", datetime: "2023-11-14T22:13:20Z", event: "log", event_data: "hi" };
+  const inreq: DiariumEntry = { id: "alpha", datetime: "2023-11-14T22:13:20Z", event: "inreq", event_data: { final_status: "timeout", req: null, can: null, res: null, con: null } };
   const spec: Spec | null = null;
   const status: Status | null = null;
   const discovered: DiscoveredAgent | null = null;
   assert.equal(line.event, "log");
+  assert.equal((inreq.event_data as Exchange).final_status, "timeout"); // one cast reaches the exchange: no `as unknown as`
   assert.equal(spec, null);
   assert.equal(status, null);
   assert.equal(discovered, null);

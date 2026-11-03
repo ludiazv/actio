@@ -43,8 +43,8 @@ pi install <absolute path>/pi-actio
 Location: the pi agent directory — `$PI_CODING_AGENT_DIR/actio.json`, by default `~/.pi/agent/actio.json`.
 
 **Every key is optional.** No file, or an empty object, means all defaults. A file that is not valid JSON, has
-an unknown key, or has a wrong type or a bad `agentId` registers **nothing** and shows one notification naming
-the file and the first error; fix it and `/reload`.
+an unknown key, or has a wrong type, or a bad agent id (`agentId` or an `acceptPrompt` item), registers
+**nothing** and shows one notification naming the file and the first error; fix it and `/reload`.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -150,6 +150,7 @@ The history is **in memory, per session**: `/reload`, `/new` or `/fork` starts i
 - The Explorer cannot show the resolved actio root when `actioDir` is unset (actio-ts keeps it); set
   `actioDir` to see the path in the header.
 - A compaction started **by the pi user** (`/compact`) is outside the extension's view: a prompt queued during
-  it waits for the next run, and an `asap` prompt sent during it can be lost or answered late. Every
-  compaction requested through the prompt service is waited for and then run.
+  it waits for the next run, and an `asap` prompt sent during it never reaches the model and is later reported
+  `done` with the next run's answer. Every compaction requested through the prompt service is waited for and
+  then run.
 - No protocol commands (`cmd`), no attachments, no retries.
