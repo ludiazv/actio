@@ -50,8 +50,10 @@ func TestSyncProviderForms(t *testing.T) {
 			t.Errorf("%q: accepted, want an error", value)
 			continue
 		}
-		if !strings.Contains(err.Error(), value) {
-			t.Errorf("%q: the error %q does not name the value", value, err)
+		// The value must be named in quotes: for the empty value a bare Contains is vacuous ("" is
+		// a substring of every message), and the quotes are what the message owes the operator.
+		if !strings.Contains(err.Error(), fmt.Sprintf("%q", value)) {
+			t.Errorf("%q: the error %q does not name the value in quotes", value, err)
 		}
 	}
 }
@@ -95,6 +97,56 @@ func pollUntil(t *testing.T, what string, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestMutagenBinReadAtRunTime: the binary path is read from ACTIO_MUTAGEN_BIN at run time, not at
+// construction: changing the variable after the provider exists changes the binary the next run
+// uses.
+func TestMutagenBinReadAtRunTime(t *testing.T) {
+	dir := t.TempDir()
+	old := filepath.Join(dir, "old-runs")
+	neu := filepath.Join(dir, "new-runs")
+	t.Setenv("ACTIO_MUTAGEN_BIN", fakeMutagen(t, old, "", false))
+	p, err := newSyncProvider("mutagen:sess", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The variable changes after the provider was built; the run must follow it.
+	t.Setenv("ACTIO_MUTAGEN_BIN", fakeMutagen(t, neu, "", false))
+	if err := p.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := countRuns(old); n != 0 {
+		t.Fatalf("the run used the pre-construction binary: %d runs, want 0", n)
+	}
+	if n := countRuns(neu); n != 1 {
+		t.Fatalf("the run did not use the post-construction binary: %d runs, want 1", n)
+	}
+}
+
+// TestMutagenDefaultBinaryName: with ACTIO_MUTAGEN_BIN unset, the binary is the default name
+// "mutagen", resolved through PATH: a fake `mutagen` placed first on a t.Setenv PATH is the one
+// that runs.
+func TestMutagenDefaultBinaryName(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "runs")
+	binDir := t.TempDir()
+	script := "#!/bin/sh\necho run >> " + counter + "\n"
+	if err := os.WriteFile(filepath.Join(binDir, "mutagen"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ACTIO_MUTAGEN_BIN", "") // unset: the default name must be used
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	p, err := newSyncProvider("mutagen:sess", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := countRuns(counter); n != 1 {
+		t.Fatalf("the default binary name did not run the fake mutagen: %d runs, want 1", n)
+	}
 }
 
 // TestMutagenNotifyBurstCollapsesToOneRun: notifications inside the 200 ms window collapse into
@@ -288,34 +340,125 @@ func TestMutagenCloseCancelsPendingRunAndIsIdempotent(t *testing.T) {
 	}
 }
 
+// fakeMutagenHolding writes a shell script that signals its start ("started"), then holds the run
+// open until marker exists, and only then records its run: the test controls when the run ends,
+// so nothing here depends on how long the machine takes.
+func fakeMutagenHolding(t *testing.T, counter, marker string) string {
+	t.Helper()
+	var sb strings.Builder
+	sb.WriteString("#!/bin/sh\n")
+	fmt.Fprintf(&sb, "echo started >> %s\n", counter)
+	fmt.Fprintf(&sb, "while [ ! -f %s ]; do sleep 0.05; done\n", marker)
+	fmt.Fprintf(&sb, "echo run >> %s\n", counter)
+	p := filepath.Join(t.TempDir(), "mutagen-fake.sh")
+	if err := os.WriteFile(p, []byte(sb.String()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// countLines counts the lines of counter that contain needle (0 when the file is missing).
+func countLines(counter, needle string) int {
+	b, err := os.ReadFile(counter)
+	if err != nil {
+		return 0
+	}
+	return strings.Count(string(b), needle)
+}
+
 // TestMutagenCloseLetsPromisedFollowUpRun: Close cancels only the debounced run; a follow-up
-// already promised to a mid-run Flush still runs.
+// already promised to a mid-run Flush still runs. The ordering is explicit, not timed: the fake
+// binary signals its start, the test waits for the follow-up to be actually promised (p.pending),
+// and only then closes; the held run is released by a marker file. If the follow-up were not
+// promised — or Close cancelled it — the mid-run Flush would never resolve and the test fails.
 func TestMutagenCloseLetsPromisedFollowUpRun(t *testing.T) {
 	dir := t.TempDir()
 	counter := filepath.Join(dir, "runs")
-	t.Setenv("ACTIO_MUTAGEN_BIN", fakeMutagen(t, counter, "0.4", false))
+	marker := filepath.Join(dir, "release")
+	t.Setenv("ACTIO_MUTAGEN_BIN", fakeMutagenHolding(t, counter, marker))
 	p, err := newSyncProvider("mutagen:sess", nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	mp, ok := p.(*mutagenProvider)
+	if !ok {
+		t.Fatal("not a mutagen provider")
 	}
 	ctx := context.Background()
 
 	first := make(chan error, 1)
 	go func() { first <- p.Flush(ctx) }()
-	pollUntil(t, "run 1 to start", func() bool { return countRuns(counter) >= 1 })
+	pollUntil(t, "run 1 to start", func() bool { return countLines(counter, "started") >= 1 })
 
+	// Mid-run: this Flush is entitled to the single promised follow-up, not a swallow.
 	second := make(chan error, 1)
 	go func() { second <- p.Flush(ctx) }()
-	time.Sleep(50 * time.Millisecond) // let the mid-run Flush register the promised follow-up
+	// Wait for the promise explicitly (the test is in-package): without this, Close on a slow
+	// machine could land before the registration and the test would pass while proving nothing.
+	pollUntil(t, "the follow-up to be promised", func() bool {
+		mp.mu.Lock()
+		defer mp.mu.Unlock()
+		return mp.pending != nil
+	})
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-second; err != nil {
+
+	// Release the held run: the follow-up was promised before the Close, so it must run after it.
+	if err := os.WriteFile(marker, []byte("go"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the mid-run Flush never resolved: the promised follow-up did not run after Close")
+	}
+	select {
+	case err := <-first:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first Flush never resolved")
 	}
 	pollUntil(t, "the promised follow-up to run", func() bool { return countRuns(counter) >= 2 })
 	if n := countRuns(counter); n != 2 {
 		t.Fatalf("the promised follow-up ran mutagen %d times in total, want 2", n)
+	}
+}
+
+// TestMutagenCloseBeatsCallbackInFireWindow: in the window between the timer firing and the
+// callback clearing p.timer, Close() lands and the run must not start — this test pins that the
+// process never started. The window itself is sub-microsecond and not deterministically
+// reproducible by a probe (RV1-A-1 P5 pins the adjacent boundary), so the test simulates the
+// exact interleaving deterministically: Close first, then the callback. With the closed flag the
+// callback sees it and the run never starts; without it the callback would spawn the process and
+// this test fails.
+func TestMutagenCloseBeatsCallbackInFireWindow(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "runs")
+	t.Setenv("ACTIO_MUTAGEN_BIN", fakeMutagen(t, counter, "", false))
+	p, err := newSyncProvider("mutagen:sess", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mp, ok := p.(*mutagenProvider)
+	if !ok {
+		t.Fatal("not a mutagen provider")
+	}
+	mp.Notify() // arms the debounced run
+	if err := mp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The timer has "fired" and its callback runs after the Close: it must see closed and not
+	// start the process.
+	mp.onDebounce()
+	time.Sleep(100 * time.Millisecond) // enough for a started process to record itself
+	if n := countRuns(counter); n != 0 {
+		t.Fatalf("the run started after Close: %d runs, want 0 (the process never started)", n)
 	}
 }
 
@@ -324,8 +467,9 @@ func TestMutagenCloseLetsPromisedFollowUpRun(t *testing.T) {
 func TestMutagenFlushRespectsContext(t *testing.T) {
 	dir := t.TempDir()
 	counter := filepath.Join(dir, "runs")
-	t.Setenv("ACTIO_MUTAGEN_BIN", fakeMutagen(t, counter, "1", false))
-	p, err := newSyncProvider("mutagen:sess", nil)
+	t.Setenv("ACTIO_MUTAGEN_BIN", fakeMutagenKillRecording(t, counter))
+	var killErr atomic.Value // the error the killed run reports to onError
+	p, err := newSyncProvider("mutagen:sess", func(e error) { killErr.Store(e) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,4 +485,26 @@ func TestMutagenFlushRespectsContext(t *testing.T) {
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("Flush kept waiting %v after the context was cancelled", elapsed)
 	}
+	// The process is not just abandoned: the kill is delivered, the run reports its death to
+	// onError, and only then does the provider settle. (The kill is a SIGKILL, which no shell can
+	// trap, so the death is observed through the run's failure, not a trap.)
+	pollUntil(t, "the killed run to be reported to onError", func() bool { return killErr.Load() != nil })
+	if e, _ := killErr.Load().(error); e == nil || !strings.Contains(e.Error(), "killed") {
+		t.Fatalf("the cancelled run was not killed: onError = %v, want a killed-process failure", e)
+	}
+}
+
+// fakeMutagenKillRecording writes a shell script that records its start and then sleeps so long
+// that only a kill can end it: a run that were not killed would still be going when the test ends.
+func fakeMutagenKillRecording(t *testing.T, counter string) string {
+	t.Helper()
+	var sb strings.Builder
+	sb.WriteString("#!/bin/sh\n")
+	fmt.Fprintf(&sb, "echo run >> %s\n", counter)
+	sb.WriteString("sleep 30\n")
+	p := filepath.Join(t.TempDir(), "mutagen-fake.sh")
+	if err := os.WriteFile(p, []byte(sb.String()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

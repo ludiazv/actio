@@ -118,6 +118,7 @@ type mutagenProvider struct {
 	onError func(error)
 
 	mu      sync.Mutex
+	closed  bool // Close won: a debounced run whose timer fires from then on must not start
 	timer   *time.Timer
 	running *mutagenRun
 	pending *mutagenRun // the single promised follow-up, never two
@@ -138,13 +139,21 @@ func (p *mutagenProvider) Notify() {
 		p.mu.Unlock()
 		return
 	}
-	p.timer = time.AfterFunc(mutagenDebounce, func() {
-		p.mu.Lock()
-		p.timer = nil
-		p.mu.Unlock()
-		p.run() // mid-run this becomes the coalesced follow-up instead of being swallowed
-	})
+	p.timer = time.AfterFunc(mutagenDebounce, p.onDebounce)
 	p.mu.Unlock()
+}
+
+// onDebounce is the timer's callback. It tests closed under the mutex before it runs: in the
+// window between the timer firing and this clearing p.timer, Close() can land (Stop then returns
+// false), and the run must not start after a Close.
+func (p *mutagenProvider) onDebounce() {
+	p.mu.Lock()
+	p.timer = nil
+	shouldRun := !p.closed
+	p.mu.Unlock()
+	if shouldRun {
+		p.run() // mid-run this becomes the coalesced follow-up instead of being swallowed
+	}
 }
 
 // Flush forces a sync now: it cancels the pending debounced run (the forced run covers whatever it
@@ -168,9 +177,11 @@ func (p *mutagenProvider) Flush(ctx context.Context) error {
 }
 
 // Close cancels the pending debounced run; a promised follow-up still runs, because a caller of
-// Flush is already waiting on it. Idempotent.
+// Flush is already waiting on it. A debounced run whose timer has already fired cannot start:
+// onDebounce sees closed. Idempotent.
 func (p *mutagenProvider) Close() error {
 	p.mu.Lock()
+	p.closed = true
 	if p.timer != nil {
 		p.timer.Stop()
 		p.timer = nil

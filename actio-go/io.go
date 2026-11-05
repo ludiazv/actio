@@ -100,18 +100,24 @@ func (f *fileIO) writeBytesAtomic(target string, raw []byte, tmpDir string) erro
 	return nil
 }
 
-// appendJSONL appends one line (no trailing newline in line) to an O_APPEND file in a single Write,
-// then runs the sync provider's hooks. The single Write is what keeps a half line from ever being
-// visible to a peer reading the diarium.
-func (f *fileIO) appendJSONL(target string, line []byte) error {
+// writeJSONLine writes line and its newline to w in a single Write: that one Write is what keeps a
+// half line from ever being visible to a peer reading the diarium, and a line is never split
+// across two writes.
+func writeJSONLine(w io.Writer, line []byte) (int, error) {
 	full := make([]byte, 0, len(line)+1)
 	full = append(append(full, line...), '\n')
+	return w.Write(full)
+}
+
+// appendJSONL appends one line (no trailing newline in line) to an O_APPEND file, then runs the
+// sync provider's hooks. The line goes out as the single Write of writeJSONLine.
+func (f *fileIO) appendJSONL(target string, line []byte) error {
 	fh, err := os.OpenFile(target, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
 	var werr error
-	if _, werr = fh.Write(full); werr == nil && f.provider.Fsync() {
+	if _, werr = writeJSONLine(fh, line); werr == nil && f.provider.Fsync() {
 		werr = fh.Sync()
 	}
 	if cerr := fh.Close(); werr == nil {

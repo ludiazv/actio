@@ -216,6 +216,77 @@ func TestMarshalJSON(t *testing.T) {
 	}
 }
 
+// TestListDirOrderIsByteLexical: listDir's order is load-bearing (peers list the same folder and
+// must agree on the same names in the same order), so the rule is pinned exactly, not as
+// "sorted". The names below are created in an order that is neither their byte order nor their
+// natural order: a dot-file, an uppercase name, a name with a digit, a prefix of another, and a
+// non-ASCII byte. The dot-file stays in the result on purpose: the layer above decides (watch.go,
+// next door, skips dot files in its scan — the two files disagree deliberately).
+func TestListDirOrderIsByteLexical(t *testing.T) {
+	dir := t.TempDir()
+	// Created in a scrambled order: creation order is not the byte order.
+	created := []string{"alpha", "écho", "a1", ".hidden", "abc", "ab", "Beta"}
+	for _, n := range created {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f := newFileIO(&hookRecorder{})
+	got, err := f.listDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Byte-lexical: '.' (0x2E) < 'B' (0x42) < 'a' (0x61); among the 'a' names the second byte
+	// decides ('1' 0x31 < 'b' 0x62 < 'l' 0x6C); a prefix sorts before its extension; the UTF-8
+	// bytes of é (0xC3 0xA9) sort after every ASCII byte.
+	want := []string{".hidden", "Beta", "a1", "ab", "abc", "alpha", "écho"}
+	if len(got) != len(want) {
+		t.Fatalf("listDir = %v (len %d), want %v (len %d) — dot files are included on purpose", got, len(got), want, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("listDir = %v, want the exact byte-lexical order %v", got, want)
+		}
+	}
+}
+
+// countingWriter records every Write it is given, whole: the oracle for the one-Write rule.
+type countingWriter struct {
+	mu     sync.Mutex
+	writes [][]byte
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writes = append(c.writes, append([]byte(nil), p...))
+	return len(p), nil
+}
+
+// TestWriteJSONLineSingleWrite: the line and its newline go out as exactly one Write of line +
+// "\n" — a half line must never be visible, and a line must never be split across two writes.
+func TestWriteJSONLineSingleWrite(t *testing.T) {
+	w := &countingWriter{}
+	line := []byte(`{"a":1}`)
+	if _, err := writeJSONLine(w, line); err != nil {
+		t.Fatal(err)
+	}
+	if len(w.writes) != 1 {
+		t.Fatalf("writeJSONLine made %d Writes, want exactly 1: %q", len(w.writes), w.writes)
+	}
+	if string(w.writes[0]) != string(line)+"\n" {
+		t.Fatalf("the single Write carried %q, want %q (the line and its newline, together)", w.writes[0], string(line)+"\n")
+	}
+	// An empty line still writes its newline, in one Write.
+	w2 := &countingWriter{}
+	if _, err := writeJSONLine(w2, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(w2.writes) != 1 || string(w2.writes[0]) != "\n" {
+		t.Fatalf("an empty line: %d writes %q, want one write of the newline alone", len(w2.writes), w2.writes)
+	}
+}
+
 // TestAppendJSONL checks the one-line contract: one Write of line + "\n", the file is created, and
 // two appends in a row yield two lines.
 func TestAppendJSONL(t *testing.T) {
