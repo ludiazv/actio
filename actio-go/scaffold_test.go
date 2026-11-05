@@ -65,3 +65,51 @@ func TestBadSchemaFailsAtCompile(t *testing.T) {
 		t.Errorf("a schema whose type is \"objekt\" compiled: an unknown type would silently accept everything")
 	}
 }
+
+// TestBodyPointersCompile: the four envelope bodies live at $defs/body of their file, and the
+// validators check the decrypted body against exactly that pointer. The pointer must compile in the
+// embedded set, and a body that does not fit must fail there.
+func TestBodyPointersCompile(t *testing.T) {
+	compiler := jsonschema.NewCompiler()
+
+	entries, err := schema.Files.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading the embedded schemas: %v", err)
+	}
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		raw, err := schema.Files.ReadFile(entry.Name())
+		if err != nil {
+			t.Fatalf("reading %s: %v", entry.Name(), err)
+		}
+		doc, err := jsonschema.UnmarshalJSON(strings.NewReader(string(raw)))
+		if err != nil {
+			t.Fatalf("parsing %s: %v", entry.Name(), err)
+		}
+		if err := compiler.AddResource(entry.Name(), doc); err != nil {
+			t.Fatalf("adding %s: %v", entry.Name(), err)
+		}
+	}
+
+	for _, pointer := range []string{
+		"request.schema.json#/$defs/body",
+		"cancellation.schema.json#/$defs/body",
+		"response.schema.json#/$defs/body",
+		"confirmation.schema.json#/$defs/body",
+	} {
+		sch, err := compiler.Compile(pointer)
+		if err != nil {
+			t.Fatalf("compiling %s: %v", pointer, err)
+		}
+		// a body missing a required field must fail at the body pointer
+		var broken any
+		if err := json.Unmarshal([]byte(`{}`), &broken); err != nil {
+			t.Fatalf("building the broken body: %v", err)
+		}
+		if err := sch.Validate(broken); err == nil {
+			t.Errorf("an empty body passed %s: the body pointer does not check the body", pointer)
+		}
+	}
+}
