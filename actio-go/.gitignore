@@ -1,1 +1,4 @@
 orchestra/
+
+# the user's launcher: it starts the team, it is not part of the module
+start_team.sh
