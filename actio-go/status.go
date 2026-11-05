@@ -6,6 +6,7 @@
 package actio
 
 import (
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -20,46 +21,159 @@ const (
 // buildStatus makes a valid status object: id, state, a fresh datetime from the agent's clock, and
 // the capability_status list (empty is legal, nil is not).
 func buildStatus(id AgentID, state StatusState, now time.Time, capabilityStatus []CapabilityStatus) Status {
-	panic("actio: not implemented")
+	if capabilityStatus == nil {
+		capabilityStatus = []CapabilityStatus{}
+	}
+	return Status{
+		ID:               id,
+		Status:           state,
+		Datetime:         formatISO(now),
+		CapabilityStatus: capabilityStatus,
+	}
 }
 
 // publishSpec writes spec.json in the agent's folder.
-func publishSpec(files *fileIO, folder string, spec *Spec) error { panic("actio: not implemented") }
+func publishSpec(files *fileIO, folder string, spec *Spec) error {
+	raw, err := marshalJSON(spec)
+	if err != nil {
+		return err
+	}
+	checked, err := validateSpec(raw)
+	if err != nil {
+		return err // G-5: nothing invalid reaches the tree, so no file is created or changed
+	}
+	return files.writeJSONAtomic(filepath.Join(folder, "spec.json"), checked, folder)
+}
 
 // publishStatus writes status.json in the agent's folder.
 func publishStatus(files *fileIO, folder string, status *Status) error {
-	panic("actio: not implemented")
+	raw, err := marshalJSON(status)
+	if err != nil {
+		return err
+	}
+	checked, err := validateStatus(raw)
+	if err != nil {
+		return err // G-5: nothing invalid reaches the tree, so no file is created or changed
+	}
+	return files.writeJSONAtomic(filepath.Join(folder, "status.json"), checked, folder)
 }
 
 // publishAnnounce writes <nuntium>/<id>.n.json and appends the announce event to the agent's
 // diarium: one call, two folders (*Agent's status* rule 2). The caller keeps the announce delay
 // between its status write and this call.
 func publishAnnounce(files *fileIO, log *diaria, agentFolder, nuntiumDir string, id AgentID, text string, now time.Time) error {
-	panic("actio: not implemented")
+	file := Announce{ID: id, Datetime: formatISO(now), TS: now.Unix(), Nuntium: text}
+	raw, err := marshalJSON(file)
+	if err != nil {
+		return err
+	}
+	checked, err := validateAnnounce(raw)
+	if err != nil {
+		return err // G-5: the announce file is not written and the diarium is not touched
+	}
+	if err := files.makeDir(nuntiumDir); err != nil {
+		return err
+	}
+	if err := files.writeJSONAtomic(filepath.Join(nuntiumDir, string(id)+".n.json"), checked, agentFolder); err != nil {
+		return err
+	}
+	return log.append(announceEvent(id, now)) // records the completed announce
 }
 
 // Broadcast writes the reserved <root>/nuntium/nuntium.json, the signal no agent writes: a tool's
 // way of telling the team to rescan. The CLI's broadcast subcommand is its only user.
-func Broadcast(cfg Config, text string) error { panic("actio: not implemented") }
+func Broadcast(cfg Config, text string) error {
+	now := cfg.Clock()
+	file := Announce{ID: "broadcast", Datetime: formatISO(now), TS: now.Unix(), Nuntium: text}
+	raw, err := marshalJSON(file)
+	if err != nil {
+		return err
+	}
+	if _, err := validateAnnounce(raw); err != nil {
+		return err // G-5: the reserved file is not written
+	}
+	// A tool write: its own provider from cfg.Sync, no agent involved. Its hooks cannot fail here —
+	// Notify and Delay have no error path and Flush is never called — so the sink has nothing to
+	// receive.
+	provider, err := newSyncProvider(cfg.Sync, func(error) {})
+	if err != nil {
+		return err
+	}
+	files := newFileIO(provider)
+	nuntiumDir := filepath.Join(cfg.Root, "nuntium")
+	if err := files.makeDir(nuntiumDir); err != nil {
+		return err
+	}
+	return files.writeJSONAtomic(filepath.Join(nuntiumDir, "nuntium.json"), file, cfg.Root) // tmpDir: the root
+}
 
 // HealthOf rates a peer's status by its age (*Agent's status* rules 4–8). An inactive or error
 // agent, or a datetime that cannot be read, gives HealthUnknown (""): rule 8 says such an agent owes
 // no answer, and a reader cannot rate it.
-func HealthOf(status Status, now time.Time) Health { panic("actio: not implemented") }
+func HealthOf(status Status, now time.Time) Health {
+	if status.Status != StatusIdle && status.Status != StatusBusy {
+		return HealthUnknown
+	}
+	updated, ok := parseISO(status.Datetime)
+	if !ok {
+		return HealthUnknown
+	}
+	age := now.Sub(updated) // a datetime in the future is the freshest possible
+	switch {
+	case age < healthHealthyAge:
+		return HealthHealthy
+	case age < healthOnlineAge:
+		return HealthOnline
+	case age <= healthDegradedAge:
+		return HealthDegraded
+	}
+	return HealthZombie
+}
 
 // heartbeat re-publishes the status on a fixed interval: the protocol demands an update at least
 // every 90 seconds even when nothing changed, which keeps peers from rating us degraded.
-type heartbeat struct{}
+type heartbeat struct {
+	interval time.Duration
+	tick     func() error
+	mu       sync.Mutex
+	stopped  bool
+	stopCh   chan struct{} // closed by stop(): the heartbeat's own end, beside the agent's stop
+}
 
 // newHeartbeat makes a heartbeat that calls tick on every interval. The first tick waits a whole
 // interval: the agent publishes its first status itself.
 func newHeartbeat(interval time.Duration, tick func() error) *heartbeat {
-	panic("actio: not implemented")
+	return &heartbeat{interval: interval, tick: tick, stopCh: make(chan struct{})}
 }
 
 // start runs it on one tracked goroutine; it ends when stop closes, and stop ends it early. After
 // stop no timer is armed (D-9).
-func (h *heartbeat) start(wg *sync.WaitGroup, stop <-chan struct{}) { panic("actio: not implemented") }
+func (h *heartbeat) start(wg *sync.WaitGroup, stop <-chan struct{}) {
+	wg.Go(func() {
+		ticker := time.NewTicker(h.interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-h.stopCh:
+				return
+			case <-ticker.C:
+				// A tick that returns an error reports it to the caller's sink through the tick
+				// itself; the heartbeat neither swallows it nor stops the chain, so the next tick
+				// comes (*Agent's status* rule 3 keeps the freshness promise alive).
+				_ = h.tick()
+			}
+		}
+	})
+}
 
 // stop ends it; idempotent.
-func (h *heartbeat) stop() { panic("actio: not implemented") }
+func (h *heartbeat) stop() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.stopped {
+		h.stopped = true
+		close(h.stopCh)
+	}
+}
