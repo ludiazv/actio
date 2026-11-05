@@ -11,8 +11,14 @@ import { Team } from "../src/team.js";
 
 const MIN_HEIGHT = 12;
 
-/** A theme that passes the text through: the assertions are about shape, not color. */
-const plainTheme = { fg: (_token: string, text: string) => text } as unknown as Theme;
+/** A theme that passes the text through and records the token each span asked for. */
+const spans: Array<[string, string]> = [];
+const plainTheme = {
+  fg: (token: string, text: string) => {
+    spans.push([token, text]);
+    return text;
+  },
+} as unknown as Theme;
 const noTui = { requestRender: () => {} } as unknown as TUI;
 
 function open(promptOn = false): ExplorerComponent {
@@ -66,6 +72,16 @@ test("the explorer pads a short tab up to the minimum height", () => {
   assert.ok(lines.some((line) => line.includes("[Team]  Calls  Prompts")));
   assert.ok(lines.some((line) => line.includes("no other agents in the view")));
   assert.ok(lines.some((line) => line.includes("tab switch · ↑↓ select · r refresh · esc close")));
+});
+
+test("every line of the frame is drawn with one color token", () => {
+  spans.length = 0;
+  open().render(60);
+  const frame = spans.filter(([, text]) => /[╭╮╰╯├┤│─]/.test(text));
+  assert.ok(frame.length > 0, "the render drew no frame at all");
+  for (const [token, text] of frame) {
+    assert.equal(token, "border", `${JSON.stringify(text)} is drawn as "${token}", not "border"`);
+  }
 });
 
 test("a long tab grows past the minimum without breaking the frame", () => {

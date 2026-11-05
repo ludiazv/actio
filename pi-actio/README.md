@@ -117,8 +117,8 @@ protocol effect.
 Opens an overlay with three tabs. It needs the interactive terminal; in another mode it reports that.
 
 It is a bordered window of **at least 12 rows**: an almost empty tab is padded inside the frame, a
-long one grows the frame. The outer frame uses the theme's `borderAccent`, the header and footer
-rules its `border`.
+long one grows the frame. Every line of the frame — the outer border and the header and footer
+rules — uses the theme's `border` token, the same one pi's own dialogs draw with.
 
 ```
 ╭──────────────────────────────────────────────────────────────────────────────────────────╮

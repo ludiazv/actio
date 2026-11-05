@@ -24,7 +24,7 @@ const TABS = ["Team", "Calls", "Prompts"];
  */
 const MIN_HEIGHT = 12;
 
-/** Frame glyphs: the outer frame is accented, the inner rules are the plain border color. */
+/** Frame glyphs. The whole frame uses one color token, so it reads as a single window. */
 const FRAME = { top: ["╭", "╮"], middle: ["├", "┤"], bottom: ["╰", "╯"] } as const;
 
 export function openExplorer(
@@ -121,26 +121,26 @@ export class ExplorerComponent {
     const filler = Math.max(0, MIN_HEIGHT - (header.length + body.length + footer.length + 4));
 
     const lines: string[] = [
-      this.rule(FRAME.top, width, "borderAccent"),
+      this.rule(FRAME.top, width),
       ...header.map((line) => this.row(line, inner, width)),
-      this.rule(FRAME.middle, width, "border"),
+      this.rule(FRAME.middle, width),
       ...body.map((line) => this.row(line, inner, width)),
       ...Array.from({ length: filler }, () => this.row("", inner, width)),
-      this.rule(FRAME.middle, width, "border"),
+      this.rule(FRAME.middle, width),
       ...footer.map((line) => this.row(line, inner, width)),
-      this.rule(FRAME.bottom, width, "borderAccent"),
+      this.rule(FRAME.bottom, width),
     ];
     return lines.map((line) => truncateToWidth(line, width));
   }
 
   /** One horizontal rule: the two corners plus the fill, `width` cells wide. */
-  private rule(corners: readonly [string, string], width: number, token: "border" | "borderAccent"): string {
-    return this.theme.fg(token, `${corners[0]}${"─".repeat(Math.max(0, width - 2))}${corners[1]}`);
+  private rule(corners: readonly [string, string], width: number): string {
+    return this.theme.fg("border", `${corners[0]}${"─".repeat(Math.max(0, width - 2))}${corners[1]}`);
   }
 
   /** One framed row: the side borders around content padded to exactly the inner width. */
   private row(content: string, inner: number, width: number): string {
-    const side = this.theme.fg("borderAccent", "│");
+    const side = this.theme.fg("border", "│");
     return `${side} ${truncateToWidth(content, inner, "...", true)} ${side}`;
   }
 
