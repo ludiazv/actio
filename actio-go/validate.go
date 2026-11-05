@@ -158,118 +158,76 @@ func decodeInto(doc any, out any) error {
 
 // The publication files and the four envelopes: raw bytes in, decoded value out, and the first
 // schema failures as the error. A file that does not conform is never used and never written.
-func validateSpec(raw []byte) (*Spec, error) {
-	var out Spec
-	if err := checkRaw("spec.schema.json", raw, &out); err != nil {
+//
+// checkShape is the shared body of every validate*: validate the bytes against the compiled
+// schema at pointer, then decode the validated document as a new value of T. The fourteen
+// validators differ only in the pointer of the schema that pins their shape and in the type they
+// decode to; the pointer stays at each call site, so the error names the same file and rule it
+// always did.
+func checkShape[T any](pointer string, raw []byte) (*T, error) {
+	var out T
+	if err := checkRaw(pointer, raw, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
+}
+
+func validateSpec(raw []byte) (*Spec, error) {
+	return checkShape[Spec]("spec.schema.json", raw)
 }
 
 func validateStatus(raw []byte) (*Status, error) {
-	var out Status
-	if err := checkRaw("status.schema.json", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[Status]("status.schema.json", raw)
 }
 
 func validateAnnounce(raw []byte) (*Announce, error) {
-	var out Announce
-	if err := checkRaw("announce.schema.json", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[Announce]("announce.schema.json", raw)
 }
 
 func validateTeamMetadata(raw []byte) (*TeamMetadata, error) {
-	var out TeamMetadata
-	if err := checkRaw("actio.schema.json", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[TeamMetadata]("actio.schema.json", raw)
 }
 
 func validateRequestFile(raw []byte) (*RequestFile, error) {
-	var out RequestFile
-	if err := checkRaw("request.schema.json", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[RequestFile]("request.schema.json", raw)
 }
 
 func validateCancellationFile(raw []byte) (*CancellationFile, error) {
-	var out CancellationFile
-	if err := checkRaw("cancellation.schema.json", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[CancellationFile]("cancellation.schema.json", raw)
 }
 
 func validateResponseFile(raw []byte) (*ResponseFile, error) {
-	var out ResponseFile
-	if err := checkRaw("response.schema.json", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[ResponseFile]("response.schema.json", raw)
 }
 
 func validateConfirmationFile(raw []byte) (*ConfirmationFile, error) {
-	var out ConfirmationFile
-	if err := checkRaw("confirmation.schema.json", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[ConfirmationFile]("confirmation.schema.json", raw)
 }
 
 func validateDiariumLine(raw []byte) (*DiariumLine, error) {
-	var out DiariumLine
-	if err := checkRaw("diarium.schema.json", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[DiariumLine]("diarium.schema.json", raw)
 }
 
 func validateErrorResult(raw []byte) (*ErrorResult, error) {
-	var out ErrorResult
-	if err := checkRaw("error.schema.json", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[ErrorResult]("error.schema.json", raw)
 }
 
 // The four envelope bodies, validated on their own when a file's body key holds an object rather
 // than an encrypted string.
 func validateRequestBody(raw []byte) (*RequestBody, error) {
-	var out RequestBody
-	if err := checkRaw("request.schema.json#/$defs/body", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[RequestBody]("request.schema.json#/$defs/body", raw)
 }
 
 func validateCancellationBody(raw []byte) (*CancellationBody, error) {
-	var out CancellationBody
-	if err := checkRaw("cancellation.schema.json#/$defs/body", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[CancellationBody]("cancellation.schema.json#/$defs/body", raw)
 }
 
 func validateResponseBody(raw []byte) (*ResponseBody, error) {
-	var out ResponseBody
-	if err := checkRaw("response.schema.json#/$defs/body", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[ResponseBody]("response.schema.json#/$defs/body", raw)
 }
 
 func validateConfirmationBody(raw []byte) (*ConfirmationBody, error) {
-	var out ConfirmationBody
-	if err := checkRaw("confirmation.schema.json#/$defs/body", raw, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return checkShape[ConfirmationBody]("confirmation.schema.json#/$defs/body", raw)
 }
 
 // Validate reports whether the file at path conforms to the schema of kind. kind "" infers the
