@@ -215,10 +215,10 @@ type CapabilityActio struct {
 	Tool               *bool           `json:"tool,omitempty"`
 	ToolName           string          `json:"tool_name,omitempty"`
 	Sync               *bool           `json:"sync,omitempty"`
-	AcceptsFrom        []string        `json:"accepts_from,omitempty"` // absent or empty: everybody
-	MaxParallel        int             `json:"max_parallel,omitempty"` // 0: unbounded
-	RecommendedTimeout float64         `json:"recommended_timeout,omitempty"`
-	Disabled           *bool           `json:"disabled,omitempty"` // absent means false; a written false stays written
+	AcceptsFrom        []string        `json:"accepts_from,omitempty"`        // absent or empty: everybody
+	MaxParallel        int             `json:"max_parallel,omitempty"`        // 0: unbounded; an explicit 0 is never written, absent means it
+	RecommendedTimeout float64         `json:"recommended_timeout,omitempty"` // seconds; same absent-equals-zero reading
+	Disabled           *bool           `json:"disabled,omitempty"`            // absent means false; a written false stays written
 }
 
 // SecurityAttr is one key-value pair of spec.json's security array (spec.schema.json). The core

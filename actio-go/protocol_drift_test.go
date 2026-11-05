@@ -131,6 +131,11 @@ func checkOne(t *testing.T, what string, props map[string]schemaLocation, requir
 		if mayBeNull(declared) && !canHoldNull(field.field.Type) {
 			t.Errorf("%s: %q may be null, but %s of type %s cannot hold it", what, name, field.field.Name, field.field.Type)
 		}
+		for _, jsonType := range declaredTypes(declared) {
+			if !kindOk(jsonType, field.field.Type) {
+				t.Errorf("%s: %q is a JSON %s, but %s of type %s cannot hold it", what, name, jsonType, field.field.Name, field.field.Type)
+			}
+		}
 	}
 	for name := range fields {
 		if _, ok := props[name]; !ok {
@@ -144,6 +149,59 @@ func checkOne(t *testing.T, what string, props map[string]schemaLocation, requir
 	}
 	if len(extra) > 0 {
 		t.Errorf("%s: Go fields with no schema property: %s", what, strings.Join(extra, ", "))
+	}
+}
+
+// declaredTypes is the property's declared JSON type as a list; empty when the schema states no
+// single type (anyOf, oneOf, or no type at all), which is how the protocol leaves the schema-shaped
+// fields to the peer: parameters, result, details.
+func declaredTypes(node *schemaNode) []string {
+	if node == nil || len(node.Type) == 0 {
+		return nil
+	}
+	var one string
+	if err := json.Unmarshal(node.Type, &one); err == nil {
+		return []string{one}
+	}
+	var many []string
+	if err := json.Unmarshal(node.Type, &many); err == nil {
+		return many
+	}
+	return nil
+}
+
+// kindOk reports whether a Go type can hold the JSON type the schema declares for the property. This
+// is the check that catches the plan's integer trap: a 64-bit integer "ts" cannot live in a float64,
+// and no reference vector would ever show it. json.RawMessage and any hold whatever the schema says,
+// because the runtime validator decides for those.
+func kindOk(jsonType string, typ reflect.Type) bool {
+	base := typ
+	for base.Kind() == reflect.Pointer {
+		base = base.Elem()
+	}
+	if base.Kind() == reflect.Interface {
+		return true
+	}
+	if base.Kind() == reflect.Slice && base.Elem().Kind() == reflect.Uint8 {
+		return true
+	}
+	switch jsonType {
+	case "string":
+		return base.Kind() == reflect.String
+	case "integer":
+		return base.Kind() >= reflect.Int && base.Kind() <= reflect.Int64
+	case "number":
+		return base.Kind() == reflect.Float32 || base.Kind() == reflect.Float64
+	case "boolean":
+		return base.Kind() == reflect.Bool
+	case "object":
+		return base.Kind() == reflect.Struct || base.Kind() == reflect.Map
+	case "array":
+		return base.Kind() == reflect.Slice || base.Kind() == reflect.Array
+	case "null":
+		return canHoldNull(typ)
+	default:
+		return true
 	}
 }
 

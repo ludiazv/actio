@@ -6,6 +6,7 @@ package actio
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"time"
@@ -68,10 +69,14 @@ func LoadConfig(overrides Config) (Config, error) {
 		StopGrace:         defaultStopGrace,
 		Clock:             time.Now,
 	}
-	if v := os.Getenv(EnvRoot); v != "" {
+	// An empty value is different from an unset one: ACTIO_DIR="" is the empty root, which
+	// the check at the end reports, because guessing a root the operator meant to set would put the
+	// agent's files in the wrong folder. ACTIO_SYNC="" survives LoadConfig untouched: the provider
+	// parser is what rejects a sync value, and it runs at Start, as in the reference.
+	if v, ok := os.LookupEnv(EnvRoot); ok {
 		cfg.Root = v
 	}
-	if v := os.Getenv(EnvSync); v != "" {
+	if v, ok := os.LookupEnv(EnvSync); ok {
 		cfg.Sync = v
 	}
 	for _, env := range []struct {
@@ -119,9 +124,6 @@ func LoadConfig(overrides Config) (Config, error) {
 	if cfg.Root == "" {
 		return Config{}, errors.New("actio: config Root must not be empty")
 	}
-	if cfg.Sync == "" {
-		return Config{}, errors.New("actio: config Sync must not be empty")
-	}
 	for _, timed := range []struct {
 		key   string
 		value time.Duration
@@ -146,14 +148,16 @@ func defaultRoot() string {
 }
 
 // envSeconds reads one environment override given in seconds; unset or empty is not an override.
-// A non-number or a non-positive one is a configuration error, never a silent default.
+// A non-number, an infinite or NaN one, or a non-positive one is a configuration error, never a
+// silent default. ParseFloat accepts "Inf" and "NaN" without an error, so finiteness is checked
+// here; a timer of infinite length is a timer that never fires.
 func envSeconds(key string) (time.Duration, error) {
 	raw := os.Getenv(key)
 	if raw == "" {
 		return 0, nil
 	}
 	seconds, err := strconv.ParseFloat(raw, 64)
-	if err != nil || !(seconds > 0) {
+	if err != nil || math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
 		return 0, fmt.Errorf("actio: %s must be a positive number of seconds, got %q", key, raw)
 	}
 	return time.Duration(seconds * float64(time.Second)), nil

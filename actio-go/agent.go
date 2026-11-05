@@ -20,8 +20,9 @@ type Agent struct {
 	st *agentState
 }
 
-// New checks the options and the configuration. Nothing is written and nothing is armed until
-// Start; a bad environment value surfaces here (from LoadConfig) and a bad sync value at Start.
+// New checks the options: the id's shape, and a namespace list the protocol can write. It reads no
+// configuration and arms nothing: a bad ACTIO_* value surfaces at Start, as in the reference, because
+// Start is where LoadConfig runs.
 func New(opts Options) (*Agent, error) { panic("actio: not implemented") }
 
 // Capability registers a capability: its published description, its parameters and result schemas,
