@@ -41,7 +41,8 @@ const (
 
 // compiledSchemas is the compiled protocol schema set, built once on first use and immutable after —
 // the compiler is discarded when the build finishes and the *Schema values are only ever validated
-// against, never changed. §5.3 (v1.6) allows exactly this: a value computed once from embedded data,
+// against, never changed. This is the one kind of package value that is allowed: computed once from
+// embedded data,
 // with nothing per-agent in it and nothing that changes after it is built.
 // A build failure is a contract bug (the embedded schemas are pinned and compile-proven by
 // TestEmbeddedSchemasCompile): it surfaces as the error of every validator, never as a silent
@@ -274,7 +275,7 @@ func validateConfirmationBody(raw []byte) (*ConfirmationBody, error) {
 // Validate reports whether the file at path conforms to the schema of kind. kind "" infers the
 // kind from the file name, as the CLI does. A diarium file is validated line by line.
 //
-// The read goes through readFile in io.go, the one file §9 allows to reach os for files.
+// The read goes through readFile in io.go, where the package keeps its file access.
 func Validate(path string, kind string) error {
 	raw, err := readFile(path)
 	if err != nil {

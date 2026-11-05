@@ -222,7 +222,7 @@ type CapabilityActio struct {
 }
 
 // isTrue reads one of the protocol's optional booleans: a capability's disabled, tool and sync, the
-// spec's disabled, a task's contention. A peer may leave any of them out, and reading one through a
+// spec's disabled, the status's contention. A peer may leave any of them out, and reading one through a
 // nil pointer is a panic in our code, not a protocol event.
 func isTrue(b *bool) bool { return b != nil && *b }
 

@@ -187,8 +187,8 @@ func marshalJSON(value any) ([]byte, error) {
 func (f *fileIO) readFile(target string) ([]byte, error) { return readFile(target) }
 
 // readFile is the package's one read. It is a plain function rather than a method because a reader
-// needs no sync hooks, and it lives here because §9 keeps every os file call in this file: the CLI's
-// Validate reads through it.
+// needs no folder and no sync hooks. The CLI's Validate reads through it, so the bytes a caller names
+// are read in the same place as the bytes an agent names.
 func readFile(target string) ([]byte, error) { return os.ReadFile(target) }
 
 // listDir names the entries of a folder in lexical order.

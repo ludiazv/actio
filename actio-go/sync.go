@@ -16,7 +16,8 @@ import (
 )
 
 // syncProvider is the hook pair the file primitives call: before the rename and after it. It stays
-// unexported: §4 does not list it, nothing outside the package builds one, and TS removed its
+// unexported: no part of the public API takes or returns one, nothing outside the package builds
+// one, and TS removed its
 // equivalent from the package entry.
 type syncProvider interface {
 	// Fsync asks for the file to be synced before the rename and its folder after it.
