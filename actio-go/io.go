@@ -42,11 +42,10 @@ func (f *fileIO) copyFile(src, dst, tmpDir string) error { panic("actio: not imp
 // reads the same bytes back.
 func marshalJSON(value any) ([]byte, error) { panic("actio: not implemented") }
 
-// readJSONFile returns the bytes of a JSON file. A missing or unparsable file is an error: the
-// caller decides whether that is silence (a peer that has not published yet) or a report.
-func (f *fileIO) readJSONFile(target string) ([]byte, error) { panic("actio: not implemented") }
-
-// readFile returns the bytes of any file (a diarium, a team metadata file).
+// readFile returns the bytes of a file: a JSON envelope, a diarium, team metadata. A missing
+// file is fs.ErrNotExist, and the caller decides whether that is silence (a peer that has not
+// published yet) or a report. The bytes are validated before they are decoded (G-5): this file
+// hands out bytes, it does not parse them.
 func (f *fileIO) readFile(target string) ([]byte, error) { panic("actio: not implemented") }
 
 // listDir names the entries of a folder in lexical order.
