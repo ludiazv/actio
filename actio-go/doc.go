@@ -16,7 +16,7 @@
 //	cfg := actio.Config{Root: "/shared/actio"}
 //	summarizer, err := actio.New(actio.Options{
 //		ID: "summarizer", Description: "summarizes text",
-//		AcceptsCommandsFrom: []string{"*"}, Config: cfg,
+//		AcceptsCommandsFrom: []string{"ops"}, Config: cfg,
 //	})
 //	if err != nil {
 //		return err

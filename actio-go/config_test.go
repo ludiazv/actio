@@ -64,7 +64,7 @@ func TestConfigDefaultsMatchProtocolUnits(t *testing.T) {
 	if cfg.Sync != "none" {
 		t.Errorf("Sync = %q, want the default %q", cfg.Sync, "none")
 	}
-	if home := os.Getenv(EnvHome); cfg.Root != home+"/.actio" {
+	if home := os.Getenv(envHome); cfg.Root != home+"/.actio" {
 		t.Errorf("Root = %q, want $HOME/.actio = %q", cfg.Root, home+"/.actio")
 	}
 }
@@ -150,7 +150,7 @@ func TestConfigEnvNameWithTypoIsNotRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if home := os.Getenv(EnvHome); cfg.Root != home+"/.actio" {
+	if home := os.Getenv(envHome); cfg.Root != home+"/.actio" {
 		t.Errorf("a typo'd root name was read: Root = %q", cfg.Root)
 	}
 	if cfg.Sync != "none" {
@@ -397,7 +397,7 @@ func TestConfigSyncSurvivesLoadConfigAndIsRejectedAtProviderParse(t *testing.T) 
 // difference; see the report's Open points.
 func TestConfigEmptyHomeYieldsRootSlashActioUnlikeReference(t *testing.T) {
 	withCleanEnv(t)
-	t.Setenv(EnvHome, "")
+	t.Setenv(envHome, "")
 	cfg, err := LoadConfig(Config{})
 	if err != nil {
 		t.Fatalf("LoadConfig with HOME empty: %v", err)

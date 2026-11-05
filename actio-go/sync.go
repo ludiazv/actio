@@ -15,8 +15,10 @@ import (
 	"time"
 )
 
-// SyncProvider is the hook pair the file primitives call: before the rename and after it.
-type SyncProvider interface {
+// syncProvider is the hook pair the file primitives call: before the rename and after it. It stays
+// unexported: §4 does not list it, nothing outside the package builds one, and TS removed its
+// equivalent from the package entry.
+type syncProvider interface {
 	// Fsync asks for the file to be synced before the rename and its folder after it.
 	Fsync() bool
 	// Delay is how long every write waits before it returns, 0 for none.
@@ -32,7 +34,7 @@ type SyncProvider interface {
 // newSyncProvider parses a Config.Sync value. An unknown form, or a delay outside 1–10 000 ms, is a
 // configuration error reported at Start. A provider's own failures (a mutagen run that fails) never
 // reach the protocol: they go to onError once per failed run, which the agent wires to its log.
-func newSyncProvider(value string, onError func(error)) (SyncProvider, error) {
+func newSyncProvider(value string, onError func(error)) (syncProvider, error) {
 	if value == "none" {
 		return &nopProvider{}, nil
 	}

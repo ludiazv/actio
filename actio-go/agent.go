@@ -32,8 +32,9 @@ func (a *Agent) Capability(cap Capability, handler CapabilityHandler) error {
 	panic("actio: not implemented")
 }
 
-// OnCommand registers a handler for one command name. The protocol's four commands already exist;
-// registering their name replaces what the agent does with it.
+// OnCommand registers a handler for one command name. A name that is one of the protocol's four
+// built-in commands, or a name already registered, is an error: the built-in's behavior is not
+// replaceable, as in the reference.
 func (a *Agent) OnCommand(name string, handler CommandHandler) error { panic("actio: not implemented") }
 
 // OnEvent adds an observability callback. Callbacks run synchronously on the protocol goroutine that
@@ -77,14 +78,16 @@ func (a *Agent) Command(ctx context.Context, dst AgentID, name string, params an
 	panic("actio: not implemented")
 }
 
-// Fail publishes the error state, announces it and stops the agent: a fatal error we cannot recover
-// from, told to the team instead of hidden.
+// Fail publishes the error state and announces it: a fatal error we cannot recover from, told to the
+// team instead of hidden. It does not stop the agent — the agent stays in the error state until it is
+// stopped (D-22), so a peer can see why.
 func (a *Agent) Fail(message string) error { panic("actio: not implemented") }
 
 // Diarium reads this agent's own log.
 func (a *Agent) Diarium() (DiariumRead, error) { panic("actio: not implemented") }
 
-// Log appends a log event to our diarium and surfaces it to the event callbacks.
+// Log appends a log event to our diarium. It emits no ActioEvent: an event callback is not a log
+// consumer, as in the reference.
 func (a *Agent) Log(message string) error { panic("actio: not implemented") }
 
 // agentState is the wiring the protocol files share, created by New and by the CLI's Call. Every
@@ -94,7 +97,7 @@ type agentState struct {
 	config  Config
 	folders agentFolders
 	files   *fileIO
-	sync    SyncProvider
+	sync    syncProvider
 	diaria  *diaria
 	hub     *watchHub
 	now     func() time.Time

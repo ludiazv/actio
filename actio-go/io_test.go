@@ -1,4 +1,4 @@
-// Tests for the file primitives. The fake SyncProvider records the order of its hook calls; it is
+// Tests for the file primitives. The fake syncProvider records the order of its hook calls; it is
 // deliberately not the implementation of sync.go (that belongs to a separate task).
 package actio
 
@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// hookRecorder is a SyncProvider fake that records the order of its hook calls. probe, when set,
+// hookRecorder is a syncProvider fake that records the order of its hook calls. probe, when set,
 // is consulted at every Fsync() call so a test can see whether the target is in place at that
 // moment (false before the rename, true at the directory sync).
 type hookRecorder struct {

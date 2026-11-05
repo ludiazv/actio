@@ -50,8 +50,11 @@ const (
 	EnvConfirmTimeout = "ACTIO_CONFIRM_TIMEOUT"
 	EnvCancelWait     = "ACTIO_CANCEL_WAIT"
 	EnvMutagenBin     = "ACTIO_MUTAGEN_BIN" // the mutagen provider's binary path
-	EnvHome           = "HOME"
 )
+
+// envHome is the home folder the default root is built from. It is not an Actio setting, so it is not
+// part of the Env* vocabulary.
+const envHome = "HOME"
 
 // LoadConfig resolves the configuration: defaults, then the environment, then overrides, where a
 // zero field of overrides means "not set". It reports a bad environment value rather than starting
@@ -144,7 +147,7 @@ func LoadConfig(overrides Config) (Config, error) {
 
 // defaultRoot is the protocol's default location: <home>/.actio (*Actio directory structure*).
 func defaultRoot() string {
-	return os.Getenv(EnvHome) + "/.actio"
+	return os.Getenv(envHome) + "/.actio"
 }
 
 // envSeconds reads one environment override given in seconds; unset or empty is not an override.

@@ -75,15 +75,15 @@ const (
 // and 108 are optional and this implementation makes them (104 is not made). Capability errors are
 // the agent's own, 1000 and up.
 const (
-	CodeAgentDisabled      = 100
-	CodeUnknownCapability  = 101
-	CodeCapabilityDisabled = 102
-	CodeRequestorNotNamed  = 103
-	CodeInvalidParameters  = 105
-	CodeNamespaceMismatch  = 106
-	CodeCapacityExceeded   = 107
-	CodeRequestExpired     = 108
-	CodeAgentStopping      = 300 // work error (*Acceptance errors*, work error codes)
+	CodeAgentDisabled       = 100
+	CodeUnknownCapability   = 101
+	CodeCapabilityDisabled  = 102
+	CodeRequestorNotAllowed = 103 // the protocol names it requestor_not_allowed
+	CodeInvalidParameters   = 105
+	CodeNamespaceMismatch   = 106
+	CodeCapacityExceeded    = 107
+	CodeRequestExpired      = 108
+	CodeAgentStopping       = 300 // work error (*Acceptance errors*, work error codes)
 )
 
 // Header is the envelope header: the top-level fields of an envelope file, not a nested "header"
@@ -218,8 +218,13 @@ type CapabilityActio struct {
 	AcceptsFrom        []string        `json:"accepts_from,omitempty"`        // absent or empty: everybody
 	MaxParallel        int             `json:"max_parallel,omitempty"`        // 0: unbounded; an explicit 0 is never written, absent means it
 	RecommendedTimeout float64         `json:"recommended_timeout,omitempty"` // seconds; same absent-equals-zero reading
-	Disabled           *bool           `json:"disabled,omitempty"`            // absent means false; a written false stays written
+	Disabled           *bool           `json:"disabled,omitempty"`            // absent means false; the pointer only keeps a written false written
 }
+
+// isTrue reads one of the protocol's optional booleans: a capability's disabled, tool and sync, the
+// spec's disabled, a task's contention. A peer may leave any of them out, and reading one through a
+// nil pointer is a panic in our code, not a protocol event.
+func isTrue(b *bool) bool { return b != nil && *b }
 
 // SecurityAttr is one key-value pair of spec.json's security array (spec.schema.json). The core
 // profile publishes none.

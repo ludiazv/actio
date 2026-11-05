@@ -195,14 +195,10 @@ type IgnoredFile struct {
 	Reason string
 }
 
-// DiariumEntry is one valid line of a diarium file. EventData is any JSON value: a string for
-// "status" and "log", null for "announce", an ExchangeEnvelopes object for "inreq" and "outreq".
-type DiariumEntry struct {
-	ID        AgentID
-	Datetime  string
-	Event     string
-	EventData json.RawMessage
-}
+// DiariumEntry is one valid line of a diarium file, the same thing the protocol writes: EventData is
+// a string for "status" and "log", null for "announce", an ExchangeEnvelopes object for "inreq" and
+// "outreq". It is an alias of the pinned shape, not a second copy of it.
+type DiariumEntry = DiariumLine
 
 // DiariumRead is the read-only view of one agent's diarium: the valid lines in file order, and the
 // lines that were not, each with its 1-based line number and the reason.

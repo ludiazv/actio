@@ -24,11 +24,11 @@ import (
 // fileIO is the file access of one agent, bound to that agent's sync provider: there is no
 // package-level provider to install.
 type fileIO struct {
-	provider SyncProvider
+	provider syncProvider
 }
 
 // newFileIO binds the primitives to a sync provider.
-func newFileIO(provider SyncProvider) *fileIO { return &fileIO{provider: provider} }
+func newFileIO(provider syncProvider) *fileIO { return &fileIO{provider: provider} }
 
 // tempName is the temp file of an atomic write: .<base>.<nonce>.tmp inside tmpDir, which is always
 // the agent's own folder and on the same filesystem as the target.
@@ -184,9 +184,12 @@ func marshalJSON(value any) ([]byte, error) {
 // file is fs.ErrNotExist, and the caller decides whether that is silence (a peer that has not
 // published yet) or a report. The bytes are validated before they are decoded (G-5): this file
 // hands out bytes, it does not parse them.
-func (f *fileIO) readFile(target string) ([]byte, error) {
-	return os.ReadFile(target)
-}
+func (f *fileIO) readFile(target string) ([]byte, error) { return readFile(target) }
+
+// readFile is the package's one read. It is a plain function rather than a method because a reader
+// needs no sync hooks, and it lives here because §9 keeps every os file call in this file: the CLI's
+// Validate reads through it.
+func readFile(target string) ([]byte, error) { return os.ReadFile(target) }
 
 // listDir names the entries of a folder in lexical order.
 func (f *fileIO) listDir(dir string) ([]string, error) {
