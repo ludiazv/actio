@@ -1,0 +1,27 @@
+{
+  "id": "summarizer",
+  "status": "busy",
+  "datetime": "2026-10-24T10:00:30Z",
+  "capability_status": [
+    {
+      "name": "summarize",
+      "running": 1,
+      "queue": 2
+    }
+  ],
+  "tasks": [
+    {
+      "capability": "summarize",
+      "name": "task-1",
+      "title": "Summarize report",
+      "status": "running",
+      "progress": 50,
+      "eta": "00:01:30"
+    },
+    {
+      "capability": "summarize",
+      "name": "task-2",
+      "status": "pending"
+    }
+  ]
+}

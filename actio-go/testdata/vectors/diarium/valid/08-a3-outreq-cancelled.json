@@ -1,0 +1,73 @@
+{
+  "id": "planner",
+  "datetime": "2026-10-24T10:01:14Z",
+  "event": "outreq",
+  "event_data": {
+    "final_status": "cancelled",
+    "req": {
+      "rid": "01JB7Q3W8K2M4N6P8R0S2T4V6X",
+      "src": "planner",
+      "dst": "summarizer",
+      "datetime": "2026-10-24T10:00:00Z",
+      "type": "req",
+      "actio_version": "0.1",
+      "request": {
+        "ts": 1792836000,
+        "nonce": "52ffe97b3a5e6e2f00a69edb27551465",
+        "signature": null,
+        "name": "summarize",
+        "parameters": {
+          "text": "Actio is a simple file/object-based agent coordination protocol ...",
+          "instructions": "one sentence"
+        },
+        "timeout": 300,
+        "attachments": []
+      }
+    },
+    "can": {
+      "rid": "01JB7Q3W8K2M4N6P8R0S2T4V6X",
+      "src": "planner",
+      "dst": "summarizer",
+      "datetime": "2026-10-24T10:00:05Z",
+      "type": "req",
+      "actio_version": "0.1",
+      "cancellation": {
+        "ts": 1792836005,
+        "nonce": "6c5af08dbd854cee463cf51310090f65",
+        "signature": null,
+        "name": "summarize",
+        "force": false
+      }
+    },
+    "res": {
+      "rid": "01JB7Q3W8K2M4N6P8R0S2T4V6X",
+      "src": "planner",
+      "dst": "summarizer",
+      "datetime": "2026-10-24T10:01:10Z",
+      "type": "req",
+      "actio_version": "0.1",
+      "response": {
+        "ts": 1792836070,
+        "nonce": "74c29efdf5eca5ebf6a1ec6ddd33fec3",
+        "signature": null,
+        "error": false,
+        "cancellation": true,
+        "result": null,
+        "attachments": []
+      }
+    },
+    "con": {
+      "rid": "01JB7Q3W8K2M4N6P8R0S2T4V6X",
+      "src": "planner",
+      "dst": "summarizer",
+      "datetime": "2026-10-24T10:01:14Z",
+      "type": "req",
+      "actio_version": "0.1",
+      "confirmation": {
+        "ts": 1792836074,
+        "nonce": "3f8c1d2e4b5a69708192a3b4c5d6e7f8",
+        "signature": null
+      }
+    }
+  }
+}

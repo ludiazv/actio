@@ -1,0 +1,19 @@
+{
+  "id": "ping-agent",
+  "actio_version": "0.1",
+  "datetime": "2026-10-24T09:00:00Z",
+  "description": "Answers pings",
+  "accepts_commands_from": [],
+  "capabilities": [
+    {
+      "name": "ping",
+      "description": "Liveness probe",
+      "parameters": {},
+      "actio": {
+        "result": true
+      }
+    }
+  ],
+  "security_support": [],
+  "security_posture": "trusted"
+}

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "actio.schema.json",
+  "title": "Actio team metadata (.actio/actio.json)",
+  "description": "Optional team-level metadata, read-only for agents. All fields are optional.",
+  "type": "object",
+  "properties": {
+    "actio_version": { "$ref": "common.schema.json#/$defs/actioVersion" },
+    "description": { "type": "string" },
+    "metadata": {
+      "description": "Free content, not subject to any schema.",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false
+}
