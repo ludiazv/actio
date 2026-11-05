@@ -96,6 +96,8 @@ func TestProtocolStructsMatchTheSchemas(t *testing.T) {
 			t.Errorf("%s is embedded but no Go type is pinned to it", name)
 		}
 	}
+
+	checkEnums(t, loaded)
 }
 
 // checkOne compares the properties of one schema shape with the fields of one Go struct.
@@ -136,6 +138,19 @@ func checkOne(t *testing.T, what string, props map[string]schemaLocation, requir
 				t.Errorf("%s: %q is a JSON %s, but %s of type %s cannot hold it", what, name, jsonType, field.field.Name, field.field.Type)
 			}
 		}
+		// D-20 v1.6, rule one: an optional boolean or number must be a pointer, so a written
+		// false or 0 survives a round trip. Two properties are excepted by name: max_parallel
+		// (the schema says "0: unbounded") and recommended_timeout (absent means no
+		// recommendation); absent equals zero there, so a plain type is right.
+		if !required[name] {
+			for _, jsonType := range declaredTypes(declared) {
+				if (jsonType == "boolean" || jsonType == "integer" || jsonType == "number") &&
+					name != "max_parallel" && name != "recommended_timeout" &&
+					field.field.Type.Kind() != reflect.Pointer {
+					t.Errorf("%s: %q is an optional JSON %s, so its Go field %s must be a pointer", what, name, jsonType, field.field.Name)
+				}
+			}
+		}
 	}
 	for name := range fields {
 		if _, ok := props[name]; !ok {
@@ -149,6 +164,124 @@ func checkOne(t *testing.T, what string, props map[string]schemaLocation, requir
 	}
 	if len(extra) > 0 {
 		t.Errorf("%s: Go fields with no schema property: %s", what, strings.Join(extra, ", "))
+	}
+}
+
+// checkEnums is D-20 v1.6, rule two: each protocol enum equals its Go constants, both ways
+// round. The allowed values are read from the embedded schemas at run time — a rule that copied
+// the schema into a second hand-written list would prove nothing.
+func checkEnums(t *testing.T, loaded map[string]*schemaNode) {
+	t.Helper()
+	enumSet(t, "status.schema.json status", enumAt(t, loaded, "status.schema.json", "properties/status"),
+		[]string{string(StatusInactive), string(StatusIdle), string(StatusBusy), string(StatusError)})
+	// The inreq and outreq final statuses are different sets; the Go constants are one group,
+	// so the rule is: every constant belongs to at least one of the schema's sets, and every
+	// schema value has a constant — the union of the two sets equals the constant set.
+	inreq := diariumFinalStatus(t, loaded, "inreq")
+	outreq := diariumFinalStatus(t, loaded, "outreq")
+	seen := map[string]bool{}
+	var union []string
+	for _, v := range append(append([]string{}, inreq...), outreq...) {
+		if !seen[v] {
+			seen[v] = true
+			union = append(union, v)
+		}
+	}
+	enumSet(t, "diarium.schema.json final_status (inreq ∪ outreq)", union,
+		[]string{FinalConfirmed, FinalCompleted, FinalCancelled, FinalDropped, FinalAbandoned, FinalSent})
+	enumSet(t, "common.schema.json header type", enumAt(t, loaded, "common.schema.json", "$defs/header/properties/type"),
+		[]string{TypeRequest, TypeCommand})
+}
+
+// enumAt reads the "enum" list of the node at pointer inside file.
+func enumAt(t *testing.T, loaded map[string]*schemaNode, file, pointer string) []string {
+	t.Helper()
+	root, ok := loaded[file]
+	if !ok {
+		t.Fatalf("%s is not embedded", file)
+	}
+	node, err := walkPointer(root, pointer)
+	if err != nil {
+		t.Fatalf("%s %s: %v", file, pointer, err)
+	}
+	var values []string
+	if len(node.Enum) == 0 {
+		t.Fatalf("%s %s: no enum to pin", file, pointer)
+	}
+	if err := json.Unmarshal(node.Enum, &values); err != nil {
+		t.Fatalf("%s %s: %v", file, pointer, err)
+	}
+	return values
+}
+
+// diariumFinalStatus reads the final_status enum of one diarium branch: the allOf entry whose
+// "if" pins "event" to the name, through "then".properties.event_data.properties.final_status.
+func diariumFinalStatus(t *testing.T, loaded map[string]*schemaNode, event string) []string {
+	t.Helper()
+	root, ok := loaded["diarium.schema.json"]
+	if !ok {
+		t.Fatalf("diarium.schema.json is not embedded")
+	}
+	for _, branch := range root.AllOf {
+		if branch == nil || branch.If == nil || branch.Then == nil {
+			continue
+		}
+		ev, ok := branch.If.Properties["event"]
+		if !ok {
+			continue
+		}
+		var name string
+		if json.Unmarshal(ev.Const, &name) != nil || name != event {
+			continue
+		}
+		data, ok := branch.Then.Properties["event_data"]
+		if !ok || data.Properties == nil {
+			t.Fatalf("the %s branch has no event_data object", event)
+		}
+		final, ok := data.Properties["final_status"]
+		if !ok {
+			t.Fatalf("the %s branch has no final_status property", event)
+		}
+		var values []string
+		if err := json.Unmarshal(final.Enum, &values); err != nil {
+			t.Fatalf("the %s final_status enum: %v", event, err)
+		}
+		return values
+	}
+	t.Fatalf("no %s branch in diarium.schema.json", event)
+	return nil
+}
+
+// enumSet reports the differences both ways round: a schema value with no Go constant, and a Go
+// constant with no schema value.
+func enumSet(t *testing.T, what string, schemaValues, constants []string) {
+	t.Helper()
+	schema := map[string]bool{}
+	for _, v := range schemaValues {
+		schema[v] = true
+	}
+	goSet := map[string]bool{}
+	for _, v := range constants {
+		goSet[v] = true
+	}
+	var noConst, noSchema []string
+	for v := range schema {
+		if !goSet[v] {
+			noConst = append(noConst, v)
+		}
+	}
+	for v := range goSet {
+		if !schema[v] {
+			noSchema = append(noSchema, v)
+		}
+	}
+	sort.Strings(noConst)
+	sort.Strings(noSchema)
+	if len(noConst) > 0 {
+		t.Errorf("%s: schema values with no Go constant: %s", what, strings.Join(noConst, ", "))
+	}
+	if len(noSchema) > 0 {
+		t.Errorf("%s: Go constants with no schema value: %s", what, strings.Join(noSchema, ", "))
 	}
 }
 
@@ -275,7 +408,8 @@ type goField struct {
 	omitEmpty bool
 }
 
-// schemaNode is the part of a JSON Schema this test reads: the shape of an object, not its rules.
+// schemaNode is the part of a JSON Schema this test reads: the shape of an object, its enums, and
+// the conditional branches that carry the diarium's final statuses.
 type schemaNode struct {
 	Ref        string                 `json:"$ref"`
 	Type       json.RawMessage        `json:"type"`
@@ -284,6 +418,10 @@ type schemaNode struct {
 	AllOf      []*schemaNode          `json:"allOf"`
 	Defs       map[string]*schemaNode `json:"$defs"`
 	Items      *schemaNode            `json:"items"`
+	Enum       json.RawMessage        `json:"enum"`
+	Const      json.RawMessage        `json:"const"`
+	If         *schemaNode            `json:"if"`
+	Then       *schemaNode            `json:"then"`
 }
 
 // schemaObject returns the properties and required names one node enforces, following $ref and
