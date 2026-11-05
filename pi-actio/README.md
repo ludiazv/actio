@@ -116,13 +116,20 @@ protocol effect.
 
 Opens an overlay with three tabs. It needs the interactive terminal; in another mode it reports that.
 
+It is a bordered window of **at least 12 rows**: an almost empty tab is padded inside the frame, a
+long one grows the frame. The outer frame uses the theme's `borderAccent`, the header and footer
+rules its `border`.
+
 ```
- Actio Explorer — <agentId> · <actio root> · prompt service: on|off
- [Team]  Calls  Prompts
- Team:    the agents (id, status/health, description); the selected agent's capabilities below
- Calls:   this agent's outgoing calls, newest first: <id>/<capability>  in-flight | confirmed <ms> ms | error <code> | cancelled | abandoned | failed: <msg>
- Prompts: received prompt-service requests, newest first: <time> <src> <capability> [<prompt_id>] <outcome>
- tab switch · ↑↓ select · r refresh · esc close
+╭──────────────────────────────────────────────────────────────────────────────────────────╮
+│ Actio Explorer — <agentId> · <actio root> · prompt service: on|off                      │
+│ [Team]  Calls  Prompts                                                                 │
+├──────────────────────────────────────────────────────────────────────────────────────────┤
+│ Team:    the agents (id, status/health, description); the selected agent's capabilities below
+│ Calls:   this agent's outgoing calls, newest first: <id>/<capability>  in-flight | confirmed <ms> ms | error <code> | cancelled | abandoned | failed: <msg>
+│ Prompts: received prompt-service requests, newest first: <time> <src> <capability> [<prompt_id>] <outcome>
+│ tab switch · ↑↓ select · r refresh · esc close                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 The list updates by itself when a call or a request arrives or finishes; `r` re-scans the team.

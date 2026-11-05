@@ -17,6 +17,16 @@ import type { Team } from "./team.js";
 
 const TABS = ["Team", "Calls", "Prompts"];
 
+/**
+ * The window the explorer draws: a bordered frame of at least this many rows, borders and
+ * header and footer included. Empty space is padded inside the frame, so the window keeps its
+ * shape whether the tab has three rows of content or thirty.
+ */
+const MIN_HEIGHT = 12;
+
+/** Frame glyphs: the outer frame is accented, the inner rules are the plain border color. */
+const FRAME = { top: ["╭", "╮"], middle: ["├", "┤"], bottom: ["╰", "╯"] } as const;
+
 export function openExplorer(
   ctx: ExtensionCommandContext,
   team: Team,
@@ -34,7 +44,7 @@ export function openExplorer(
   );
 }
 
-class ExplorerComponent {
+export class ExplorerComponent {
   private tui: TUI;
   private theme: Theme;
   private team: Team;
@@ -89,21 +99,49 @@ class ExplorerComponent {
 
   render(width: number): string[] {
     const th = this.theme;
+    // The frame takes one column per side plus one space of padding, so the tabs render inside it.
+    const inner = Math.max(1, width - 4);
     const root = this.team.root ?? "$ACTIO_DIR or ~/.actio";
-    const lines: string[] = [
+
+    const header = [
       th.fg(
         "accent",
         `Actio Explorer — ${this.team.id} · ${root} · prompt service: ${this.promptOn ? "on" : "off"}`,
       ),
       TABS.map((name, i) => (i === this.tab ? th.fg("accent", `[${name}]`) : name)).join("  "),
-      th.fg("border", "─".repeat(width)),
     ];
-    if (this.tab === 0) lines.push(...this.teamTab(width, th));
-    else if (this.tab === 1) lines.push(...this.callsTab(width, th));
-    else lines.push(...this.promptsTab(width, th));
-    lines.push(th.fg("border", "─".repeat(width)));
-    lines.push(th.fg("dim", "tab switch · ↑↓ select · r refresh · esc close"));
+    const body =
+      this.tab === 0
+        ? this.teamTab(inner, th)
+        : this.tab === 1
+          ? this.callsTab(inner, th)
+          : this.promptsTab(inner, th);
+    const footer = [th.fg("dim", "tab switch · ↑↓ select · r refresh · esc close")];
+    // The two rules above and below the body, plus the top and bottom of the frame.
+    const filler = Math.max(0, MIN_HEIGHT - (header.length + body.length + footer.length + 4));
+
+    const lines: string[] = [
+      this.rule(FRAME.top, width, "borderAccent"),
+      ...header.map((line) => this.row(line, inner, width)),
+      this.rule(FRAME.middle, width, "border"),
+      ...body.map((line) => this.row(line, inner, width)),
+      ...Array.from({ length: filler }, () => this.row("", inner, width)),
+      this.rule(FRAME.middle, width, "border"),
+      ...footer.map((line) => this.row(line, inner, width)),
+      this.rule(FRAME.bottom, width, "borderAccent"),
+    ];
     return lines.map((line) => truncateToWidth(line, width));
+  }
+
+  /** One horizontal rule: the two corners plus the fill, `width` cells wide. */
+  private rule(corners: readonly [string, string], width: number, token: "border" | "borderAccent"): string {
+    return this.theme.fg(token, `${corners[0]}${"─".repeat(Math.max(0, width - 2))}${corners[1]}`);
+  }
+
+  /** One framed row: the side borders around content padded to exactly the inner width. */
+  private row(content: string, inner: number, width: number): string {
+    const side = this.theme.fg("borderAccent", "│");
+    return `${side} ${truncateToWidth(content, inner, "...", true)} ${side}`;
   }
 
   /** Team tab: the agents (SelectList) and the selected agent's capabilities below it. */
