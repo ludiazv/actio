@@ -4,374 +4,462 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
-// waitForName waits until name is delivered on files, with a two-second deadline. Names delivered
-// in the meantime (the initial batch) are consumed and ignored.
-func waitForName(t *testing.T, files <-chan string, name string) {
+// putWatch writes one file into dir atomically: a dot-file temp in the parent, renamed into place,
+// as the protocol's writes are.
+func putWatch(t *testing.T, dir, name string) {
 	t.Helper()
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case got, ok := <-files:
-			if !ok {
-				t.Fatalf("files channel closed before %q arrived", name)
+	if err := put(dir, name); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func put(dir, name string) error {
+	tmp := filepath.Join(filepath.Dir(dir), "."+filepath.Base(dir)+name+".tmp")
+	if err := os.WriteFile(tmp, []byte("x"), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, name))
+}
+
+// inotifyCount counts this process's inotify file descriptors, via the /proc/self/fd symlinks.
+func inotifyCount(t *testing.T) int {
+	t.Helper()
+	fds, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("reading /proc/self/fd: %v", err)
+	}
+	n := 0
+	for _, fd := range fds {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", fd.Name()))
+		if err == nil && strings.HasSuffix(target, "inotify") {
+			n++
+		}
+	}
+	return n
+}
+
+// The deadlock, ported to the v1.7 seams: a finished request stops reading, more files arrive, a
+// second request subscribes to the same inbox, and the first unsubscribes. Nothing may block, so
+// all of it finishes (D-23).
+func TestWatchDeadlockTwoRequests(t *testing.T) {
+	w, err := newWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close()
+	inbox := filepath.Join(t.TempDir(), "inbox")
+	if err := os.Mkdir(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s1, err := w.subscribe(inbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		putWatch(t, inbox, fmt.Sprintf("f%d", i))
+		time.Sleep(10 * time.Millisecond)
+	}
+	done := make(chan struct{})
+	go func() {
+		s2, err := w.subscribe(inbox)
+		if err == nil {
+			w.unsubscribe(s2)
+		}
+		w.unsubscribe(s1)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("DEADLOCK: a control path blocked on a delivery")
+	}
+}
+
+// The deaf folder, ported to the v1.7 seams: a folder deleted (or renamed away) and recreated
+// under the same name must report a loss — a reported lost() is the only pass, seeing a file in
+// the new folder is not — and the same path must be watchable again (D-22).
+func TestWatchFolderRecreatedIsNotDeaf(t *testing.T) {
+	w, err := newWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close()
+	for _, how := range []string{"delete", "rename"} {
+		for i := 0; i < 20; i++ {
+			dir := filepath.Join(t.TempDir(), "inbox")
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				t.Fatal(err)
 			}
-			if got == name {
+			s, err := w.subscribe(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if how == "delete" {
+				if err := os.RemoveAll(dir); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Rename(dir, dir+".old"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-s.lost():
+			case <-time.After(2 * time.Second):
+				t.Fatalf("DEAF: %s, try %d", how, i)
+			}
+			s2, err := w.subscribe(dir)
+			if err != nil {
+				t.Fatalf("resubscribing the new folder: %s, try %d: %v", how, i, err)
+			}
+			putWatch(t, dir, "again")
+			select {
+			case <-s2.changed():
+			case <-time.After(2 * time.Second):
+				t.Fatalf("watching the new folder: %s, try %d", how, i)
+			}
+			w.unsubscribe(s2)
+		}
+	}
+}
+
+// The inbox owner, ported to the v1.7 seams: every file of a 500-file burst is seen exactly once,
+// files already present are reported by the first look, and a replaced file (a new inode) is seen
+// again (D-23).
+func TestWatchOwnerSeesEveryFileOnce(t *testing.T) {
+	w, err := newWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close()
+	inbox := filepath.Join(t.TempDir(), "inbox")
+	if err := os.Mkdir(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	putWatch(t, inbox, "before")
+	s, err := w.subscribe(inbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]int{}
+	marks := map[string]string{}
+	look := func() {
+		ch, next, err := scanFolder(inbox, marks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		marks = next
+		for _, n := range ch {
+			seen[n]++
+		}
+	}
+	look()
+	const n = 500
+	go func() {
+		for i := 0; i < n; i++ {
+			if err := put(inbox, fmt.Sprintf("f%03d", i)); err != nil {
+				t.Error(err)
 				return
 			}
-		case <-deadline:
-			t.Fatalf("timed out waiting for %q on files", name)
 		}
-	}
-}
-
-// expectQuiet asserts that files stays quiet for ~200 ms: no name, and no closure, in that window.
-func expectQuiet(t *testing.T, files <-chan string) {
-	t.Helper()
-	select {
-	case got, ok := <-files:
-		t.Fatalf("expected files to stay quiet, got %q (open=%v)", got, ok)
-	case <-time.After(200 * time.Millisecond):
-	}
-}
-
-// mustWrite writes one file into dir and fails the test on error.
-func mustWrite(t *testing.T, dir, name, content string) {
-	t.Helper()
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
-		t.Fatalf("write %s: %v", name, err)
-	}
-}
-
-// TestWatchExistingFiles: the files already in the folder are each reported once, after watchDir
-// returns (the first scan reports what was there, D-23).
-func TestWatchExistingFiles(t *testing.T) {
-	dir := t.TempDir()
-	mustWrite(t, dir, "a", "alpha")
-	mustWrite(t, dir, "b", "bravo")
-
-	w, err := watchDir(dir)
-	if err != nil {
-		t.Fatalf("watchDir: %v", err)
-	}
-	defer w.close()
-
-	waitForName(t, w.files(), "a")
-	waitForName(t, w.files(), "b")
-	expectQuiet(t, w.files()) // each exactly once
-}
-
-// TestWatchCreatedFile: a file created after the watch is reported by name. The event's Op and
-// name are never trusted: the scan decides (D-23).
-func TestWatchCreatedFile(t *testing.T) {
-	dir := t.TempDir()
-	w, err := watchDir(dir)
-	if err != nil {
-		t.Fatalf("watchDir: %v", err)
-	}
-	defer w.close()
-
-	mustWrite(t, dir, "new.txt", "hello")
-	waitForName(t, w.files(), "new.txt")
-	expectQuiet(t, w.files())
-}
-
-// TestWatchAtomicWrite: an atomic write (a .x.tmp renamed to x) is reported once, as x; the
-// dot-file temp name never reaches the caller (D-23).
-func TestWatchAtomicWrite(t *testing.T) {
-	dir := t.TempDir()
-	w, err := watchDir(dir)
-	if err != nil {
-		t.Fatalf("watchDir: %v", err)
-	}
-	defer w.close()
-
-	tmp := filepath.Join(dir, ".x.tmp")
-	if err := os.WriteFile(tmp, []byte("payload"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, "x")); err != nil {
-		t.Fatal(err)
-	}
-
-	counts := map[string]int{}
-	gotX := false
-	deadline := time.After(2 * time.Second)
-	for !gotX {
+	}()
+	scans := 0
+	deadline := time.After(10 * time.Second)
+	for len(seen) < n+1 {
 		select {
-		case n, ok := <-w.files():
-			if !ok {
-				t.Fatal("files channel closed before x arrived")
-			}
-			if strings.HasPrefix(n, ".") {
-				t.Fatalf("dot file %q reached the caller", n)
-			}
-			counts[n]++
-			if n == "x" {
-				gotX = true
-			}
+		case <-s.changed():
+			scans++
+			look()
 		case <-deadline:
-			t.Fatalf("timed out waiting for x, got %v", counts)
+			t.Fatalf("saw %d of %d", len(seen), n+1)
 		}
 	}
-	if counts["x"] != 1 {
-		t.Fatalf("x reported %d times, want 1", counts["x"])
-	}
-	expectQuiet(t, w.files())
-}
-
-// TestWatchRenameReplace: a file replaced by a rename over an existing name (same name, new inode,
-// same size) is reported. A rename-in and a replace both arrive as a create; the marker's inode
-// component is what catches the replace (plan §5.4).
-func TestWatchRenameReplace(t *testing.T) {
-	dir := t.TempDir()
-	mustWrite(t, dir, "x", "abcd")
-
-	w, err := watchDir(dir)
-	if err != nil {
-		t.Fatalf("watchDir: %v", err)
-	}
-	defer w.close()
-
-	waitForName(t, w.files(), "x") // the first scan reports what is there
-	expectQuiet(t, w.files())
-
-	staging := t.TempDir()
-	mustWrite(t, staging, "y", "wxyz") // same size, a new inode
-	if err := os.Rename(filepath.Join(staging, "y"), filepath.Join(dir, "x")); err != nil {
-		t.Fatal(err)
-	}
-
-	waitForName(t, w.files(), "x") // reported again: the inode changed
-	expectQuiet(t, w.files())
-}
-
-// TestWatchSameMarkerUnreported: a rewrite with the identical size, the identical millisecond mtime
-// and the same inode is not reported. That is the accepted marker limitation (a same-millisecond,
-// same-size in-place rewrite can be missed), shared with the TS marker (plan §5.4).
-func TestWatchSameMarkerUnreported(t *testing.T) {
-	dir := t.TempDir()
-	p := filepath.Join(dir, "x")
-	mustWrite(t, dir, "x", "abcd")
-
-	w, err := watchDir(dir)
-	if err != nil {
-		t.Fatalf("watchDir: %v", err)
-	}
-	defer w.close()
-
-	waitForName(t, w.files(), "x")
-	expectQuiet(t, w.files())
-
-	orig, err := os.Stat(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(p, []byte("wxyz"), 0o644); err != nil { // same size, same inode
-		t.Fatal(err)
-	}
-	// Force the same millisecond mtime the first scan recorded, so only the content differs.
-	if err := os.Chtimes(p, orig.ModTime(), orig.ModTime()); err != nil {
-		t.Fatal(err)
-	}
-
-	expectQuiet(t, w.files()) // not reported: the marker is unchanged (the accepted limitation)
-}
-
-// TestWatchBurst: a burst of 30 files costs at most two scans (the scanning/dirty pair, D-23). The
-// 30 files are created before the watch, so the whole burst lands in the first scan; the number of
-// scans is read from the counter the watcher exposes for the tests.
-func TestWatchBurst(t *testing.T) {
-	dir := t.TempDir()
-	for i := 0; i < 30; i++ {
-		mustWrite(t, dir, fmt.Sprintf("f%02d", i), "x")
-	}
-
-	w, err := watchDir(dir)
-	if err != nil {
-		t.Fatalf("watchDir: %v", err)
-	}
-	defer w.close()
-
-	counts := map[string]int{}
-	deadline := time.After(2 * time.Second)
-	for len(counts) < 30 {
-		select {
-		case n, ok := <-w.files():
-			if !ok {
-				t.Fatalf("files closed after %d names", len(counts))
-			}
-			counts[n]++
-		case <-deadline:
-			t.Fatalf("timed out with %d names", len(counts))
+	for name, c := range seen {
+		if c != 1 {
+			t.Fatalf("%s seen %d times", name, c)
 		}
 	}
-	expectQuiet(t, w.files())
-	if n := w.scans.Load(); n > 2 {
-		t.Fatalf("the burst cost %d scans, want at most 2", n)
-	}
-}
-
-// TestWatchFolderGone: a folder that disappears is death: one error on lost, then both channels
-// are closed and nothing more is ever sent; a new folder with the same name produces nothing — no
-// re-arm (D-22).
-func TestWatchFolderGone(t *testing.T) {
-	dir := t.TempDir()
-	w, err := watchDir(dir)
-	if err != nil {
-		t.Fatalf("watchDir: %v", err)
-	}
-	defer w.close()
-
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatal(err)
-	}
-
+	t.Logf("%d files in %d scans", n+1, scans)
+	putWatch(t, inbox, "f000") // replaced: a new inode
 	select {
-	case err, ok := <-w.lost():
-		if !ok {
-			t.Fatal("lost closed without an error")
-		}
-		if err == nil {
-			t.Fatal("nil loss error")
-		}
+	case <-s.changed():
+		look()
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for the loss")
+		t.Fatal("no wake for a replaced file")
 	}
-
-	if _, ok := <-w.files(); ok {
-		t.Fatal("files not closed after the loss")
-	}
-	if _, ok := <-w.lost(); ok {
-		t.Fatal("a second loss was reported")
-	}
-
-	// No re-arm: a new folder with the same name produces nothing.
-	if err := os.Mkdir(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	mustWrite(t, dir, "late", "too late")
-	if _, ok := <-w.files(); ok {
-		t.Fatal("an event after the loss: the watcher re-armed")
+	if seen["f000"] != 2 {
+		t.Fatalf("the replaced file was not reported: %d", seen["f000"])
 	}
 }
 
-// TestWatchCloseTwice: close() is idempotent and safe from any goroutine; after it the watcher's
-// goroutine is gone, both channels are closed, and nothing is ever sent again.
-func TestWatchCloseTwice(t *testing.T) {
-	dir := t.TempDir()
-	w, err := watchDir(dir)
+// 200 requests at once to one inbox, half leaving without reading, under -race: nothing left
+// running, and one inotify instance for the whole watcher, from creation through 200 subscribers
+// to close (D-23).
+func TestWatchRequestsUnderLoad(t *testing.T) {
+	goroutines := runtime.NumGoroutine()
+	inotify := inotifyCount(t)
+	w, err := newWatcher()
 	if err != nil {
-		t.Fatalf("watchDir: %v", err)
+		t.Fatal(err)
 	}
-
+	if n := inotifyCount(t); n != inotify+1 {
+		t.Fatalf("the watcher's inotify instances: %d, want %d", n, inotify+1)
+	}
+	inbox := filepath.Join(t.TempDir(), "inbox")
+	if err := os.Mkdir(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Go(func() {
+			s, err := w.subscribe(inbox)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer w.unsubscribe(s)
+			name := fmt.Sprintf("r%d.res.json", i)
+			go func() {
+				if err := put(inbox, name); err != nil {
+					t.Error(err)
+				}
+			}()
+			if i%2 == 0 {
+				return
+			}
+			deadline := time.After(20 * time.Second)
+			for {
+				if _, err := os.Stat(filepath.Join(inbox, name)); err == nil {
+					return
+				}
+				select {
+				case <-s.changed():
+				case <-deadline:
+					t.Errorf("request %d missed its response", i)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if n := inotifyCount(t); n != inotify+1 {
+		t.Fatalf("inotify instances with 200 subscribers: %d, want %d", n, inotify+1)
+	}
 	w.close()
-	w.close() // safe
-
-	if _, ok := <-w.files(); ok {
-		t.Fatal("files not closed after close")
+	time.Sleep(100 * time.Millisecond)
+	if n := inotifyCount(t); n != inotify {
+		t.Fatalf("inotify instances after close: %d, want %d", n, inotify)
 	}
-	if _, ok := <-w.lost(); ok {
-		t.Fatal("lost not closed after close")
+	if n := runtime.NumGoroutine(); n > goroutines+1 {
+		t.Errorf("goroutines left: %d, before %d", n, goroutines)
 	}
 }
 
-// TestWatchHubSharing: two subscriptions on one folder share one watcher (one inotify instance,
-// D-18): one write is seen once by each. The last unsubscribe closes the folder's watcher, and a
-// later subscribe builds a fresh, working one.
-func TestWatchHubSharing(t *testing.T) {
+// An overflow wakes every subscriber: a look again, never a failure (D-23). The handler is called
+// directly, as the event loop would.
+func TestWatchOverflowWakesEverySubscriber(t *testing.T) {
+	w, err := newWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close()
+	dirs := []string{}
+	for _, name := range []string{"a", "b"} {
+		dir := filepath.Join(t.TempDir(), name)
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		dirs = append(dirs, dir)
+	}
+	subs := make([]*folderWatch, len(dirs))
+	for i, dir := range dirs {
+		s, err := w.subscribe(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs[i] = s
+	}
+	w.handleError(fsnotify.ErrEventOverflow)
+	for i, s := range subs {
+		select {
+		case <-s.changed():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("subscriber %d was not woken by the overflow", i)
+		}
+		select {
+		case <-s.lost():
+			t.Fatalf("subscriber %d got a loss from an overflow", i)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// A trailing slash on subscribe: the path is cleaned, so an event's folder matches the table
+// (D-23).
+func TestWatchSubscribeTrailingSlash(t *testing.T) {
+	w, err := newWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close()
+	inbox := filepath.Join(t.TempDir(), "inbox")
+	if err := os.Mkdir(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := w.subscribe(inbox + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	putWatch(t, inbox, "x")
+	select {
+	case <-s.changed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("no wake-up for a trailing-slash subscribe")
+	}
+}
+
+// unsubscribe is safe to call twice, after a loss, and after close (D-23).
+func TestWatchUnsubscribeTwiceAndAfterClose(t *testing.T) {
+	w, err := newWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox := filepath.Join(t.TempDir(), "inbox")
+	if err := os.Mkdir(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := w.subscribe(inbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.unsubscribe(s)
+	w.unsubscribe(s)            // twice: a no-op
+	s, err = w.subscribe(inbox) // the folder is armed again
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(inbox); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-s.lost():
+	case <-time.After(2 * time.Second):
+		t.Fatal("no loss for the deleted folder")
+	}
+	w.unsubscribe(s) // after a loss: a no-op
+	w.close()
+	w.unsubscribe(s) // after close: a no-op
+
+	w2, err := newWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox2 := filepath.Join(t.TempDir(), "inbox")
+	if err := os.Mkdir(inbox2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := w2.subscribe(inbox2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2.close()
+	w2.unsubscribe(s2) // after close, with the folder still in the table
+}
+
+// subscribe after close is an error (D-23).
+func TestWatchSubscribeAfterClose(t *testing.T) {
+	w, err := newWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox := filepath.Join(t.TempDir(), "inbox")
+	if err := os.Mkdir(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w.close()
+	if _, err := w.subscribe(inbox); err == nil {
+		t.Fatal("subscribe after close succeeded, want an error")
+	}
+}
+
+// scanFolder reports new and changed names in lexical order, skips dot files and directories, and
+// fails on a missing folder (D-23).
+func TestScanFolderSkipsDotFilesAndDirectories(t *testing.T) {
 	dir := t.TempDir()
-	h := newWatchHub()
-	defer h.close()
-
-	sub1, err := h.subscribe(dir)
+	if err := os.WriteFile(filepath.Join(dir, "a"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".hidden"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	changed, next, err := scanFolder(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sub2, err := h.subscribe(dir)
+	if len(changed) != 1 || changed[0] != "a" {
+		t.Fatalf("changed %v, want [a]", changed)
+	}
+	if len(next) != 1 {
+		t.Fatalf("markers %v, want one", next)
+	}
+	// A second look with the markers kept reports nothing.
+	changed, _, err = scanFolder(dir, next)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sub1.watcher != sub2.watcher {
-		t.Fatal("the two subscriptions do not share one watcher")
+	if len(changed) != 0 {
+		t.Fatalf("second look changed %v, want none", changed)
 	}
-
-	mustWrite(t, dir, "hello", "world")
-	waitForName(t, sub1.files, "hello")
-	waitForName(t, sub2.files, "hello")
-
-	h.unsubscribe(sub1) // one ref left: the watcher is still alive
-	mustWrite(t, dir, "again", "x")
-	waitForName(t, sub2.files, "again")
-
-	h.unsubscribe(sub2) // the last one: the folder's watcher closes
-	if _, ok := <-sub2.files; ok {
-		t.Fatal("the shared watcher's channels are not closed after the last unsubscribe")
-	}
-	if _, ok := <-sub2.lost; ok {
-		t.Fatal("lost not closed after the last unsubscribe")
-	}
-
-	sub3, err := h.subscribe(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sub3.watcher == sub2.watcher {
-		t.Fatal("the third subscribe reused the closed watcher")
-	}
-	mustWrite(t, dir, "third", "x")
-	waitForName(t, sub3.files, "third")
-	h.unsubscribe(sub3)
-}
-
-// TestWatchHubMissingInbox: a subscribe on a missing folder returns an error and does not create
-// the folder: the request fails locally (D-18).
-func TestWatchHubMissingInbox(t *testing.T) {
-	h := newWatchHub()
-	defer h.close()
-
-	missing := filepath.Join(t.TempDir(), "no-such-inbox")
-	if _, err := h.subscribe(missing); err == nil {
-		t.Fatal("subscribe on a missing folder must fail")
-	}
-	if _, err := os.Stat(missing); !os.IsNotExist(err) {
-		t.Fatal("subscribe created the folder")
+	// A missing folder is an error, and the very map of markers that was given comes back.
+	probe := map[string]string{"p": "1"}
+	if _, back, err := scanFolder(filepath.Join(dir, "nope"), probe); err == nil {
+		t.Fatal("a missing folder scanned fine")
+	} else {
+		back["sentinel"] = "1"
+		if probe["sentinel"] != "1" {
+			t.Fatal("a failed scan did not hand back the markers it was given")
+		}
 	}
 }
 
-// TestWatchHubClose: hub.close() closes every folder's channels, and the hub is usable for a new
-// subscribe afterwards (D-18).
-func TestWatchHubClose(t *testing.T) {
-	dir1 := t.TempDir()
-	dir2 := t.TempDir()
-	h := newWatchHub()
-
-	s1, err := h.subscribe(dir1)
+// The marker is mtime:size:inode, with the mtime in nanoseconds (D-23).
+func TestMarkerIsMtimeSizeInode(t *testing.T) {
+	dir := t.TempDir()
+	name := filepath.Join(dir, "m")
+	if err := os.WriteFile(name, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2, err := h.subscribe(dir2)
-	if err != nil {
-		t.Fatal(err)
+	parts := strings.SplitN(markerOf(st), ":", 3)
+	if len(parts) != 3 {
+		t.Fatalf("marker %q: want three parts", markerOf(st))
 	}
-
-	h.close()
-	if _, ok := <-s1.files; ok {
-		t.Fatal("dir1's channels are not closed by hub.close")
+	if parts[0] != strconv.FormatInt(st.ModTime().UnixNano(), 10) {
+		t.Fatalf("marker mtime %q, want %d", parts[0], st.ModTime().UnixNano())
 	}
-	if _, ok := <-s2.files; ok {
-		t.Fatal("dir2's channels are not closed by hub.close")
+	if parts[1] != strconv.FormatInt(st.Size(), 10) {
+		t.Fatalf("marker size %q, want %d", parts[1], st.Size())
 	}
-
-	s3, err := h.subscribe(dir1)
-	if err != nil {
-		t.Fatalf("the hub is not usable after close: %v", err)
+	if _, err := strconv.ParseUint(parts[2], 10, 64); err != nil {
+		t.Fatalf("marker inode %q: %v", parts[2], err)
 	}
-	mustWrite(t, dir1, "after", "x")
-	waitForName(t, s3.files, "after")
-	h.unsubscribe(s3)
 }

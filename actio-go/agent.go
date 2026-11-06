@@ -99,7 +99,7 @@ type agentState struct {
 	files   *fileIO
 	sync    syncProvider
 	diaria  *diaria
-	hub     *watchHub
+	watch   *watcher
 	now     func() time.Time
 	// emit hands an observability event to the callbacks; logf is the shortcut for a LogEvent.
 	emit func(event Event)

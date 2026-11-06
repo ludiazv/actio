@@ -1,15 +1,3 @@
-// The folder watcher: one fsnotify watcher and one goroutine per watched folder, non-recursive
-// (*Announcement and Discovery*, D-23).
-//
-// An fsnotify event means exactly one thing: "scan this folder again". Its Op is never acted on and
-// its name is never trusted — a file renamed in and a file replaced by a rename both arrive as a
-// create. What decides what changed is one scan (ReadDir plus stat) compared with the previous one
-// by the per-file marker "mtime:size:inode". The watcher is armed before the first scan, so nothing
-// written in between is lost; files already present are reported once, as changed.
-//
-// A folder that disappears, or a watcher that dies, is reported once on the lost channel and never
-// re-armed: there is no retry, no polling fallback (D-22). The owner decides what a loss means — the
-// agent fails, a request abandons.
 package actio
 
 import (
@@ -17,411 +5,176 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
-	"sync/atomic"
-	"syscall"
 
 	"github.com/fsnotify/fsnotify"
 )
 
-// dirWatcher is the watcher of one folder.
-type dirWatcher struct {
+// watcher is a whole agent's watching: one fsnotify.Watcher (one inotify instance) and one
+// goroutine, however many folders it watches (D-23). An event only means "look at this folder
+// again"; the watcher does no file I/O, so it can't block on a consumer.
+type watcher struct {
+	fsw     *fsnotify.Watcher
+	gone    chan struct{}
+	mu      sync.Mutex
+	folders map[string]map[*folderWatch]struct{}
+}
+
+type folderWatch struct {
 	dir    string
-	fsw    *fsnotify.Watcher
-	direct bool // the watcher's own files/lost channels are a delivery target (watchDir) or not (hub)
-
-	// The watcher's own subscription channels (buffer 1 each). A delivery target when direct;
-	// closed on death or close() either way.
-	filesCh chan string
-	lostCh  chan error
-
-	done chan struct{} // closed once, by death or by close(); the run goroutine exits on it
-	once sync.Once     // guards the close of done
-	gone chan struct{} // closed by the run goroutine on exit; close() waits on it
-	subs chan subReq   // subscription add/remove requests, processed by the run goroutine
-
-	// dead, marked and targets are owned by the run goroutine: it is the only goroutine that
-	// reads or writes them, so no lock is needed around the scan state.
-	dead    bool
-	marked  map[string]string
-	targets map[target]struct{}
-
-	// scans counts the scan passes; the tests read it to check D-23's burst bound.
-	scans atomic.Int64
+	wakeCh chan struct{} // capacity 1: "look again"
+	lostCh chan error    // capacity 1: once, then silent (D-22)
 }
 
-// target is one delivery destination: a subscriber's files channel and the lost channel that
-// receives the one death error. release is closed when the subscription leaves, so a delivery that
-// is parked on it can move on.
-type target struct {
-	files   chan string
-	lost    chan error
-	release chan struct{}
-}
-
-// subReq is one subscription change for the run goroutine to apply.
-type subReq struct {
-	t   target
-	add bool
-}
-
-// entry is one watched file and its change marker.
-type entry struct {
-	name   string
-	marker string
-}
-
-// newDirWatcher arms the watcher on dir and starts its goroutine. A missing dir is an error, not a
-// watcher that reports nothing. direct selects whether the watcher's own files/lost channels
-// receive the scans (watchDir) or only the hub's subscriptions do.
-func newDirWatcher(dir string, direct bool) (*dirWatcher, error) {
+// newWatcher creates the agent's watcher and starts its one goroutine (created at Start, closed by Stop).
+func newWatcher() (*watcher, error) {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
-	// Arm before scanning: a write between the arm and the first scan is not lost (plan §5.4).
-	if err := fsw.Add(dir); err != nil {
-		_ = fsw.Close()
-		return nil, err
-	}
-	w := &dirWatcher{
-		dir:     dir,
-		fsw:     fsw,
-		direct:  direct,
-		filesCh: make(chan string, 1),
-		lostCh:  make(chan error, 1),
-		done:    make(chan struct{}),
-		gone:    make(chan struct{}),
-		subs:    make(chan subReq),
-		marked:  make(map[string]string),
-		targets: make(map[target]struct{}),
-	}
-	if direct {
-		w.targets[target{files: w.filesCh, lost: w.lostCh, release: make(chan struct{})}] = struct{}{}
-	}
+	w := &watcher{fsw: fsw, gone: make(chan struct{}), folders: map[string]map[*folderWatch]struct{}{}}
 	go w.run()
 	return w, nil
 }
 
-// watchDir arms the watcher on dir and runs the first scan. A missing dir is an error, not a watcher
-// that reports nothing.
-func watchDir(dir string) (*dirWatcher, error) {
-	return newDirWatcher(dir, true)
-}
-
-// files carries each name that appeared or changed, in lexical order, after every scan. The first
-// scan reports what was already there.
-func (w *dirWatcher) files() <-chan string { return w.filesCh }
-
-// lost carries one error when the folder or the watcher died, and the channels stop after it.
-func (w *dirWatcher) lost() <-chan error { return w.lostCh }
-
-// close stops the goroutine and the fsnotify watcher; idempotent, and it never sends again.
-func (w *dirWatcher) close() {
-	w.once.Do(func() { close(w.done) })
+// close stops the watcher and waits for its goroutine to end.
+func (w *watcher) close() {
+	w.mu.Lock()
+	w.folders = map[string]map[*folderWatch]struct{}{}
+	w.mu.Unlock()
+	w.fsw.Close()
 	<-w.gone
 }
 
-// run is the watcher's single goroutine. It owns the dead/marked/targets state, so nothing around
-// it needs a lock. It consumes events and discards them: every one of them only means "scan again",
-// and one scan covers every event that is pending when it runs — a burst of N writes costs at most
-// two scans (D-23).
-func (w *dirWatcher) run() {
-	defer close(w.gone)
-	defer func() {
-		if !w.direct {
-			// The hub's watchers deliver only to subscriptions: the own channels close here.
-			close(w.filesCh)
-			close(w.lostCh)
+// subscribe arms dir if nobody watches it yet and returns the subscription. The path is cleaned so
+// an event's folder matches the table (D-23); a subscriber looks first, so nothing is missed (D-18).
+func (w *watcher) subscribe(dir string) (*folderWatch, error) {
+	dir = filepath.Clean(dir)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.folders[dir] == nil {
+		if err := w.fsw.Add(dir); err != nil {
+			return nil, err
 		}
-	}()
-	defer w.closeTargets()
-	defer func() { _ = w.fsw.Close() }()
+		w.folders[dir] = map[*folderWatch]struct{}{}
+	}
+	s := &folderWatch{dir: dir, wakeCh: make(chan struct{}, 1), lostCh: make(chan error, 1)}
+	w.folders[dir][s] = struct{}{}
+	return s, nil
+}
 
-	w.scan() // the first scan: what was already there is reported once, as changed
+// unsubscribe removes the subscription. It is safe to call twice, after a loss, and after close.
+func (w *watcher) unsubscribe(s *folderWatch) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	subs := w.folders[s.dir]
+	if subs == nil {
+		return
+	}
+	delete(subs, s)
+	if len(subs) == 0 {
+		delete(w.folders, s.dir)
+		_ = w.fsw.Remove(s.dir)
+	}
+}
 
+// run is the watcher's one goroutine. An event only means "look at this folder again" (D-23), so it
+// wakes the folder's subscribers, never acting on the event's Op or name. The one exception (D-22):
+// a REMOVE or RENAME naming a watched folder is a loss, reported at once, because a folder
+// recreated under the same name would otherwise read fine with nobody watching it.
+func (w *watcher) run() {
+	defer close(w.gone)
 	for {
 		select {
-		case <-w.done:
-			return
-		case r := <-w.subs:
-			if r.add {
-				w.targets[r.t] = struct{}{}
-			} else {
-				delete(w.targets, r.t)
-			}
-		case _, ok := <-w.fsw.Events:
+		case ev, ok := <-w.fsw.Events:
 			if !ok {
 				return
 			}
-			// The event's Op and name are ignored: drain what is pending and scan once.
-			w.drainEvents()
-			w.scan()
+			if ev.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+				w.mu.Lock()
+				known := w.folders[ev.Name] != nil
+				w.mu.Unlock()
+				if known {
+					w.lose(ev.Name, fmt.Errorf("actio: the watched folder %s was removed or renamed", ev.Name))
+					continue
+				}
+			}
+			w.wake(filepath.Dir(ev.Name))
 		case err, ok := <-w.fsw.Errors:
 			if !ok {
 				return
 			}
-			// In fsnotify v1.10 the Errors channel carries plain errors: an overflow arrives
-			// as ErrEventOverflow itself. An overflow means rescan, not failure; any other
-			// fsnotify error is death (D-22).
-			if errors.Is(err, fsnotify.ErrEventOverflow) {
-				w.scan()
-				continue
-			}
-			w.die(err)
-			return
+			w.handleError(err)
 		}
 	}
 }
 
-// drainEvents discards every event already in the queue: each one means "scan this folder again",
-// and one scan covers them all.
-func (w *dirWatcher) drainEvents() {
-	for {
-		select {
-		case _, ok := <-w.fsw.Events:
-			if !ok {
-				return
+// handleError is what an fsnotify error means (D-23): an overflow is a "look again" for every
+// subscriber, never a failure; anything else is a loss for every folder.
+func (w *watcher) handleError(err error) {
+	if errors.Is(err, fsnotify.ErrEventOverflow) {
+		w.wake("")
+		return
+	}
+	w.lose("", err)
+}
+
+// wake sends the "look again" wake-up to the subscribers of dir, or to everyone when dir is "" (D-23).
+func (w *watcher) wake(dir string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for d, subs := range w.folders {
+		if dir != "" && d != dir {
+			continue
+		}
+		for s := range subs {
+			select {
+			case s.wakeCh <- struct{}{}:
+			default:
 			}
-		default:
-			return
 		}
 	}
 }
 
-// scan runs one ReadDir+stat pass and delivers the changed names. Events that arrive while it runs
-// sit in the event queue: the run loop hands them back as exactly one more scan — the Go form of
-// the TS scanning/dirty pair.
-func (w *dirWatcher) scan() {
-	if w.dead {
-		return
+// lose reports the loss of dir to each subscriber and removes the folder from the table, or every
+// folder when dir is "" (D-22); it happens once, because the folder leaves the table at the same time.
+func (w *watcher) lose(dir string, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for d, subs := range w.folders {
+		if dir != "" && d != dir {
+			continue
+		}
+		for s := range subs {
+			s.lostCh <- err
+		}
+		delete(w.folders, d)
 	}
-	entries, err := w.readEntries()
-	if err != nil {
-		w.die(err) // a ReadDir that fails is death: the folder is gone (D-22)
-		return
-	}
-	w.report(entries)
 }
 
-// readEntries is one non-recursive pass over the folder: regular files only. Dot files never reach
-// a caller — an atomic write names its temp file .<base>.<nonce>.tmp in the agent's own folder
-// (D-23). A file that vanishes between the ReadDir and the Stat is skipped silently; the next scan
-// tells the truth.
-func (w *dirWatcher) readEntries() ([]entry, error) {
-	w.scans.Add(1)
-	dirents, err := os.ReadDir(w.dir)
+func (s *folderWatch) changed() <-chan struct{} { return s.wakeCh } // capacity 1, "look again" (D-23)
+func (s *folderWatch) lost() <-chan error       { return s.lostCh } // capacity 1, once, then silent (D-22)
+
+// scanFolder is the Go form of TS's diffMarkers (D-23): the names that are new or changed, in
+// lexical order, and the markers to keep. It has no lock: its caller is the folder's owner, on its
+// own goroutine, after a wake-up. It skips dot files and non-regular files.
+func scanFolder(dir string, prev map[string]string) ([]string, map[string]string, error) {
+	dirents, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, prev, err
 	}
-	entries := make([]entry, 0, len(dirents))
+	next := make(map[string]string, len(dirents))
+	var changed []string
 	for _, d := range dirents {
-		name := d.Name()
-		if strings.HasPrefix(name, ".") {
+		st, err := os.Stat(filepath.Join(dir, d.Name()))
+		if d.Name()[0] == '.' || err != nil || !st.Mode().IsRegular() {
 			continue
 		}
-		st, err := os.Stat(filepath.Join(w.dir, name))
-		if err != nil {
-			continue
-		}
-		if !st.Mode().IsRegular() {
-			continue
-		}
-		sys, ok := st.Sys().(*syscall.Stat_t)
-		if !ok {
-			continue
-		}
-		// The marker "mtime:size:inode", with mtime at millisecond resolution: a rewrite in
-		// place with the same size in the same millisecond can be missed — the documented
-		// limitation of the TS marker too (plan §5.4).
-		entries = append(entries, entry{
-			name:   name,
-			marker: fmt.Sprintf("%d:%d:%d", st.ModTime().UnixMilli(), st.Size(), sys.Ino),
-		})
-	}
-	return entries, nil
-}
-
-// report is the Go form of the TS diffMarkers: names whose marker is new or different are delivered
-// in lexical order (ReadDir is name-sorted), and the markers of the reported names are kept — a
-// name that disappeared loses its marker. Delivery never blocks a consumer: a name goes to each
-// subscriber's buffered channel, and a subscriber that is not ready slows only the loop's walk of
-// the batch, never the consumer — the loop resumes as soon as the receiver reads, and a
-// subscription that leaves (release closed) is skipped without waiting.
-func (w *dirWatcher) report(entries []entry) {
-	next := make(map[string]string, len(entries))
-	for _, e := range entries {
-		next[e.name] = e.marker
-	}
-	changed := make([]entry, 0, len(entries))
-	for _, e := range entries {
-		if prev, seen := w.marked[e.name]; !seen || prev != e.marker {
-			changed = append(changed, e)
+		m := markerOf(st)
+		next[d.Name()] = m
+		if prev[d.Name()] != m {
+			changed = append(changed, d.Name())
 		}
 	}
-	for _, e := range changed {
-		for t := range w.targets {
-			select {
-			case t.files <- e.name:
-			case <-w.done:
-				return
-			case <-t.release:
-				// the subscription left while the loop was walking the batch: skip it
-			}
-		}
-	}
-	w.marked = next
-}
-
-// die is the death path (D-22): report once on every subscriber's lost channel, stop the loop,
-// close the channels (in run's defers), and never send again. There is no retry, no re-arm, no
-// polling fallback — the owner decides what a loss means.
-func (w *dirWatcher) die(err error) {
-	if w.dead {
-		return
-	}
-	w.dead = true
-	for t := range w.targets {
-		t.lost <- err // each buffered 1 and sent at most once: this send never blocks
-	}
-	w.once.Do(func() { close(w.done) })
-}
-
-// closeTargets closes every delivery channel exactly once, on death or on close: after it, nothing
-// is ever sent.
-func (w *dirWatcher) closeTargets() {
-	for t := range w.targets {
-		close(t.lost)
-		close(t.files)
-	}
-}
-
-// watchHub holds the watchers of destination inboxes: one per inbox, shared by the requests that are
-// waiting on it and released when the last one leaves (D-18). A watcher holds an inotify instance,
-// which systems limit per user, so requests never hold one of their own.
-type watchHub struct {
-	// The mutex of the destination-watcher table: one of the four the concurrency contract
-	// allows (D-18).
-	mu    sync.Mutex
-	table map[string]*hubEntry
-}
-
-// hubEntry is one folder's watcher and its subscriber count.
-type hubEntry struct {
-	watcher *dirWatcher
-	refs    int
-}
-
-// inboxWatch is one request's subscription to an inbox watcher.
-type inboxWatch struct {
-	hub     *watchHub
-	inbox   string
-	watcher *dirWatcher
-
-	// This subscription's delivery channels (buffer 1 each). Closed with the watcher, on death
-	// or on the last unsubscribe.
-	files    chan string
-	lost     chan error
-	release  chan struct{}
-	released bool
-}
-
-// newWatchHub creates an empty hub.
-func newWatchHub() *watchHub {
-	return &watchHub{table: make(map[string]*hubEntry)}
-}
-
-// newSub builds one subscription's channels; it does not register them.
-func (h *watchHub) newSub(inbox string, w *dirWatcher) *inboxWatch {
-	return &inboxWatch{
-		hub:     h,
-		inbox:   inbox,
-		watcher: w,
-		files:   make(chan string, 1),
-		lost:    make(chan error, 1),
-		release: make(chan struct{}),
-	}
-}
-
-// target is the subscription as a delivery destination of its watcher.
-func (s *inboxWatch) target() target {
-	return target{files: s.files, lost: s.lost, release: s.release}
-}
-
-// subscribe returns the subscription of one request to inbox, creating and reference-counting the
-// watcher when it is the first subscriber. A missing inbox is an error: the request fails locally.
-func (h *watchHub) subscribe(inbox string) (*inboxWatch, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for {
-		if e, seen := h.table[inbox]; seen {
-			e.refs++
-			sub := h.newSub(inbox, e.watcher)
-			select {
-			case e.watcher.subs <- subReq{t: sub.target(), add: true}:
-				return sub, nil
-			case <-e.watcher.done:
-				// The watcher died or closed in the meantime: roll back the reference and
-				// fall through to a fresh watcher for the same folder.
-				e.refs--
-				if e.refs == 0 {
-					delete(h.table, inbox)
-				}
-				continue
-			}
-		}
-
-		w, err := newDirWatcher(inbox, false)
-		if err != nil {
-			return nil, err
-		}
-		sub := h.newSub(inbox, w)
-		h.table[inbox] = &hubEntry{watcher: w, refs: 1}
-		select {
-		case w.subs <- subReq{t: sub.target(), add: true}:
-			return sub, nil
-		case <-w.done:
-			// The folder vanished between creation and registration: retry, and
-			// newDirWatcher fails with a missing-dir error if it is still gone.
-			delete(h.table, inbox)
-		}
-	}
-}
-
-// unsubscribe releases one subscription; at zero the watcher closes and its channels close.
-func (h *watchHub) unsubscribe(sub *inboxWatch) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if sub.released {
-		return
-	}
-	sub.released = true
-	e, seen := h.table[sub.inbox]
-	if !seen || e.watcher != sub.watcher {
-		return
-	}
-	e.refs--
-	if e.refs > 0 {
-		// Close release first: a delivery parked on this subscription moves on, and the run
-		// goroutine can process the removal.
-		close(sub.release)
-		select {
-		case e.watcher.subs <- subReq{t: sub.target(), add: false}:
-		case <-e.watcher.done:
-		}
-		return
-	}
-	delete(h.table, sub.inbox)
-	e.watcher.close()
-}
-
-// close releases every watcher in the hub.
-func (h *watchHub) close() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for inbox, e := range h.table {
-		delete(h.table, inbox)
-		e.watcher.close()
-	}
+	return changed, next, nil
 }

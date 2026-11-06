@@ -6,8 +6,9 @@
 // response up to CancelWaitTimeout, because the protocol requires the exchange to end with a
 // confirmation or a timeout.
 //
-// Watching the destination is shared: one watcher per inbox, reference-counted by the requests
-// waiting on it (D-18), so a hundred concurrent requests do not hold a hundred inotify instances.
+// Watching the destination uses the agent's one watcher (D-23): a request subscribes to the
+// destination inbox before it writes (D-18), so a hundred concurrent requests still hold one
+// inotify instance. Call and SendCommand, which run with no agent, create their own watcher.
 package actio
 
 import "context"
@@ -15,8 +16,8 @@ import "context"
 // requestor is the lane-B machinery of one agent (or of one CLI call).
 type requestor struct{}
 
-// newRequestor builds it on the shared state: the folders, the file primitives, the hub of
-// destination watchers, the diarium and the clock.
+// newRequestor builds it on the shared state: the folders, the file primitives, the agent's one
+// watcher, the diarium and the clock.
 func newRequestor(st *agentState) *requestor { panic("actio: not implemented") }
 
 // request runs B1–B5 for one request and reports how the exchange ended. It returns a nil error for
