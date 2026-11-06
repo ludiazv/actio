@@ -13,6 +13,8 @@ package actio
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -266,7 +268,7 @@ func (r *requestor) capture(ex *outbound) (resRaw []byte, body *ResponseBody, ok
 		return nil, nil, false // a broken peer file: stay in B2 until the give-up paths
 	}
 	if !sameHeader(&file.Header, ex.header) {
-		r.reportIgnored(path, "header mismatch (D-11)")
+		r.reportIgnored(path, raw, "header mismatch (D-11)")
 		return nil, nil, false
 	}
 	body, err = validateResponseBody(file.Response)
@@ -338,7 +340,11 @@ func (r *requestor) abandon(ex *outbound) Outcome {
 		r.st.logf("abandon of %s failed: %v", ex.rid, err)
 	}
 	r.st.emit(OutreqEvent{RID: ex.rid, FinalStatus: FinalAbandoned})
-	_ = r.deleteAttachments(ex)
+	// A failed B5 deletion is logged, not returned: the exchange has ended, and the reference
+	// reports it the same way (the agent's log path, as the receiver's housekeeping does).
+	if err := r.deleteAttachments(ex); err != nil {
+		r.st.logf("abandon of %s: the attachment deletion failed: %v", ex.rid, err)
+	}
 	return Outcome{FinalStatus: FinalAbandoned}
 }
 
@@ -418,9 +424,13 @@ func (r *requestor) buildConfirmation(header *Header) ([]byte, error) {
 	return raw, nil
 }
 
-// reportIgnored is the D-11 report: one log per path, in the diarium and to the event callbacks.
-func (r *requestor) reportIgnored(path, reason string) {
-	if !r.once(r.ignored, path) {
+// reportIgnored is the D-11 report: one log per file state, in the diarium and to the event
+// callbacks. The reference dedups per (path, mtime); the Go file primitives expose no mtime
+// outside the five files (§9), so the key is (path, content): a rewrite that changes a byte is
+// reported again, and a byte-identical re-send is not.
+func (r *requestor) reportIgnored(path string, raw []byte, reason string) {
+	sum := sha256.Sum256(raw)
+	if !r.once(r.ignored, path+":"+hex.EncodeToString(sum[:])) {
 		return
 	}
 	message := "ignored " + path + ": " + reason
@@ -450,17 +460,11 @@ func (r *requestor) once(set map[string]struct{}, key string) bool {
 	return true
 }
 
-// fireAfter arms a timer whose callback only sends on a buffered channel and selects on stop: a
-// stopped agent never keeps a timer alive, and a lost wake-up is harmless because the exchange
-// re-looks on its next pass.
+// fireAfter arms a one-shot timer whose callback only sends on a buffered channel; the caller
+// stops the timer, and a lost wake-up is harmless because the exchange re-looks on its next pass.
 func (r *requestor) fireAfter(d time.Duration) (<-chan struct{}, *time.Timer) {
 	fired := make(chan struct{}, 1)
-	timer := time.AfterFunc(d, func() {
-		select {
-		case fired <- struct{}{}:
-		case <-r.stopCh:
-		}
-	})
+	timer := time.AfterFunc(d, func() { fired <- struct{}{} })
 	return fired, timer
 }
 

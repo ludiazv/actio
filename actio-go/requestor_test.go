@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -37,6 +38,39 @@ type reqTest struct {
 	events   chan Event
 	inbox    string
 	agentDir string
+	logs     *logSink
+}
+
+// logSink is the harness's capture of the agent's log path, for the log assertions.
+type logSink struct {
+	mu sync.Mutex
+	ls []string
+}
+
+func (s *logSink) logf(format string, a ...any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ls = append(s.ls, fmt.Sprintf(format, a...))
+}
+
+func (s *logSink) lines() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.ls))
+	copy(out, s.ls)
+	return out
+}
+
+func (s *logSink) count(fragment string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, l := range s.ls {
+		if strings.Contains(l, fragment) {
+			n++
+		}
+	}
+	return n
 }
 
 func newReqTest(t *testing.T, src, dst AgentID, events chan Event) *reqTest {
@@ -64,6 +98,7 @@ func newReqTest(t *testing.T, src, dst AgentID, events chan Event) *reqTest {
 		Capabilities:        []Capability{testCapability()},
 		SecurityPosture:     "trusted",
 	}
+	logs := &logSink{}
 	st := &agentState{
 		id:     src,
 		config: Config{Root: root, Sync: "none", CancelWaitTimeout: 300 * time.Millisecond, Clock: time.Now},
@@ -80,7 +115,7 @@ func newReqTest(t *testing.T, src, dst AgentID, events chan Event) *reqTest {
 		watch:  w,
 		now:    time.Now,
 		emit:   func(e Event) { events <- e },
-		logf:   func(string, ...any) {},
+		logf:   logs.logf,
 		spec:   func() *Spec { return &Spec{ID: src, ActioVersion: ProtocolVersion, SecurityPosture: "trusted"} },
 		state:  func() StatusState { return StatusIdle },
 	}
@@ -103,7 +138,7 @@ func newReqTest(t *testing.T, src, dst AgentID, events chan Event) *reqTest {
 			Health: HealthHealthy, Commands: true, Capabilities: caps,
 		}
 	}
-	return &reqTest{t: t, root: root, src: src, dst: dst, r: r, events: events, inbox: inbox, agentDir: agentDir}
+	return &reqTest{t: t, root: root, src: src, dst: dst, r: r, events: events, inbox: inbox, agentDir: agentDir, logs: logs}
 }
 
 // answer writes a valid response file for rid into the destination inbox.
@@ -793,4 +828,218 @@ func (x *reqTest) assertDiariumStatus(t *testing.T, rid RID, want string) {
 		return
 	}
 	t.Fatalf("no outreq line for %s in the diarium", rid)
+}
+
+// mismatchFile builds a schema-valid response for rid whose header names a different
+// destination: it validates, but the D-11 header match fails, so the capture reports it as
+// ignored. The body and datetime are fixed, so two calls with the same dst are byte-identical.
+func (x *reqTest) mismatchFile(rid RID, dst AgentID) []byte {
+	x.t.Helper()
+	bodyRaw, err := json.Marshal(ResponseBody{
+		TS: 1767323045, Nonce: "b1468606ed4e34f887287403c4dfd506", Error: false, Cancellation: false,
+		Result: json.RawMessage(`{"ok":true}`), Attachments: []string{},
+	})
+	if err != nil {
+		x.t.Fatal(err)
+	}
+	h := Header{RID: rid, Src: x.src, Dst: dst, Datetime: "2026-01-02T03:04:05Z", Type: TypeRequest, ActioVersion: ProtocolVersion}
+	raw, err := json.Marshal(ResponseFile{Header: h, Response: bodyRaw})
+	if err != nil {
+		x.t.Fatal(err)
+	}
+	return raw
+}
+
+// waitForLogCount blocks until at least n log lines contain fragment.
+func waitForLogCount(t *testing.T, sink *logSink, fragment string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if sink.count(fragment) >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("only %d log lines with %q, want %d", sink.count(fragment), fragment, n)
+}
+
+func waitForLog(t *testing.T, sink *logSink, fragment string) {
+	t.Helper()
+	waitForLogCount(t, sink, fragment, 1)
+}
+
+// A failed B5 deletion on the abandon path is logged on the agent's log path (the same one the
+// receiver's housekeeping uses); the exchange still ends abandoned with its diarium line.
+func TestRequestAbandonLogsAttachmentDeletionFailure(t *testing.T) {
+	events := make(chan Event, 64)
+	x := newReqTest(t, "me", "peer", events)
+	before := runtime.NumGoroutine()
+
+	src := filepath.Join(t.TempDir(), "att.bin")
+	if err := os.WriteFile(src, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan struct{})
+	var out Outcome
+	go func() {
+		out, _ = x.r.request(ctx, "peer", "cap", nil, RequestOptions{Attachments: []string{src}})
+		close(done)
+	}()
+	rid := waitForRequest(t, x.inbox)
+	forum := filepath.Join(x.root, FolderForum)
+	waitForFile(t, filepath.Join(forum, "att.bin"))
+	// The attachment is published: make the forum read-only so B5's deletion fails with a real
+	// error (a removed forum would not do: removePath treats a missing file as success).
+	if err := os.Chmod(forum, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(forum, 0o755) })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the exchange never ended after the cancellation")
+	}
+	if out.FinalStatus != FinalAbandoned {
+		t.Fatalf("final status: %s, want abandoned", out.FinalStatus)
+	}
+	found := false
+	for _, l := range x.logs.lines() {
+		if strings.Contains(l, string(rid)) && strings.Contains(l, "attachment deletion failed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the failed attachment deletion was not logged; log lines: %v", x.logs.lines())
+	}
+	x.assertDiariumStatus(t, rid, FinalAbandoned)
+	settleGoroutines(t, before)
+}
+
+// D-18's look half: the response is written while the watcher's delivery is stalled, so its
+// event cannot wake the exchange; the exchange still ends confirmed, found by a look.
+//
+// The exact "the first look is the sole finder" state is not constructable without a production
+// seam: the request file's own wake is already queued by the first look, and a stale wake would
+// let a loop without the initial look pass the same way. This test pins the reachable half: a
+// response present on disk while its event is undelivered ends the exchange confirmed.
+func TestRequestResponseFoundByLookWhenEventStalled(t *testing.T) {
+	events := make(chan Event, 64)
+	x := newReqTest(t, "me", "peer", events)
+	before := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan struct{})
+	var out Outcome
+	go func() {
+		out, _ = x.r.request(ctx, "peer", "cap", nil, RequestOptions{Timeout: 5 * time.Second})
+		close(done)
+	}()
+	rid := waitForRequest(t, x.inbox)
+	// Stall the watcher's delivery: its wake and loss paths take the table mutex, so while it is
+	// held no wake-up can reach the subscription, whatever events land.
+	x.r.st.watch.mu.Lock()
+	x.answer(rid, okBody())
+	x.r.st.watch.mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the exchange never ended: the response written while the delivery was stalled was not found")
+	}
+	if out.FinalStatus != FinalConfirmed {
+		t.Fatalf("final status: %s, want confirmed: the look must find a response whose event is missed", out.FinalStatus)
+	}
+	x.assertDiariumStatus(t, rid, FinalConfirmed)
+	if _, err := os.Stat(filepath.Join(x.inbox, string(rid)+".con.json")); err != nil {
+		t.Fatalf("the confirmation file is missing: %v", err)
+	}
+	settleGoroutines(t, before)
+}
+
+// D-11 dedup is per file state, not per path: a broken response rewritten is reported again, and
+// a byte-identical re-send is not. (The reference keys on (path, mtime); the Go file primitives
+// expose no mtime outside the five files (§9), so the key is (path, content) — reportIgnored.)
+func TestRequestIgnoredRewriteReportedAgain(t *testing.T) {
+	events := make(chan Event, 64)
+	x := newReqTest(t, "me", "peer", events)
+	before := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan struct{})
+	go func() {
+		_, _ = x.r.request(ctx, "peer", "cap", nil, RequestOptions{})
+		close(done)
+	}()
+	rid := waitForRequest(t, x.inbox)
+	path := filepath.Join(x.inbox, string(rid)+".res.json")
+	fragment := "ignored " + path
+
+	// v1: schema-valid, header mismatched: reported once, though the loop looks at it many times.
+	writeFileAtomic(t, path, x.mismatchFile(rid, "someone-else"))
+	waitForLog(t, x.logs, fragment)
+	// v2: the same path rewritten with different content: reported again.
+	writeFileAtomic(t, path, x.mismatchFile(rid, "someone-else-2"))
+	waitForLogCount(t, x.logs, fragment, 2)
+	// v3: the same bytes re-sent (new mtime, identical content): not reported again.
+	writeFileAtomic(t, path, x.mismatchFile(rid, "someone-else-2"))
+	time.Sleep(150 * time.Millisecond) // let v3's wake pace a look
+	if n := x.logs.count(fragment); n != 2 {
+		t.Fatalf("the ignored report for the re-sent file: %d lines, want 2", n)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the exchange never ended after the cancellation")
+	}
+	settleGoroutines(t, before)
+}
+
+// The D-13 guard, archived variant: the peer answered and archived the request (the request file
+// is gone) before we confirmed. The guard sees no request file: no confirmation is written, and
+// the diarium line carries con: null — the final status is still confirmed.
+func TestRequestD13ArchivedBeforeConfirm(t *testing.T) {
+	events := make(chan Event, 64)
+	x := newReqTest(t, "me", "peer", events)
+	before := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan struct{})
+	var out Outcome
+	go func() {
+		out, _ = x.r.request(ctx, "peer", "cap", nil, RequestOptions{})
+		close(done)
+	}()
+	rid := waitForRequest(t, x.inbox)
+	// The archive deletes the request file; the answer follows. Deleting before writing is
+	// deterministic and puts the guard in the same state a between-capture-and-confirm archive
+	// does: the answer is present, the request is gone.
+	if err := os.Remove(filepath.Join(x.inbox, string(rid)+".json")); err != nil {
+		t.Fatal(err)
+	}
+	x.answer(rid, okBody())
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the exchange never ended")
+	}
+	if out.FinalStatus != FinalConfirmed {
+		t.Fatalf("final status: %s, want confirmed", out.FinalStatus)
+	}
+	if _, err := os.Stat(filepath.Join(x.inbox, string(rid)+".con.json")); err == nil {
+		t.Fatal("a confirmation was written although the peer had archived the request")
+	}
+	raw, err := os.ReadFile(filepath.Join(x.agentDir, "diarium.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"con":null`) {
+		t.Fatal("the diarium line does not carry con: null")
+	}
+	settleGoroutines(t, before)
 }
