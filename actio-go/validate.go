@@ -131,10 +131,10 @@ func checkRaw(pointer string, raw []byte, out any) error {
 	}
 	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
 	if err != nil {
-		return fmt.Errorf("actio: %s: %v", pointer, err)
+		return fmt.Errorf("actio: %s: %v", pointer, failureText(err))
 	}
 	if err := sch.Validate(doc); err != nil {
-		return fmt.Errorf("actio: %s: %v", pointer, err)
+		return fmt.Errorf("actio: %s: %v", pointer, failureText(err))
 	}
 	return decodeInto(doc, out)
 }
@@ -469,10 +469,11 @@ func failureText(err error) string {
 	return text
 }
 
-// firstCause descends single-cause chains (a $ref hop, a branch with one failing schema) to the
-// most specific failure, as the reference validator hands back its first error.
+// firstCause descends to the first cause at every level — a $ref hop, a branch with one failing
+// schema, the first of several failures — to the most specific one, as the reference validator
+// hands back its first error.
 func firstCause(ve *jsonschema.ValidationError) *jsonschema.ValidationError {
-	for len(ve.Causes) == 1 {
+	for len(ve.Causes) > 0 {
 		ve = ve.Causes[0]
 	}
 	return ve

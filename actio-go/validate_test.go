@@ -472,3 +472,44 @@ func TestValidatePath(t *testing.T) {
 		}
 	})
 }
+
+// What a rejection's reason says: it must not depend on the working directory.
+func TestPvReasonHasNoFileURI(t *testing.T) {
+	for _, raw := range []string{
+		`{"id":"a"}`,
+		`{"id":"a","status":"nope","datetime":"x","capability_status":[]}`,
+	} {
+		_, err := validateStatus([]byte(raw))
+		if err != nil && strings.Contains(err.Error(), "file://") {
+			t.Errorf("a reason names a local path: %s", err.Error())
+		}
+	}
+	_, err := validateDiariumLine([]byte(`{"id":"a","datetime":"2026-01-01T00:00:00Z","event":"log","event_data":5}`))
+	if err != nil && strings.Contains(err.Error(), "file://") {
+		t.Errorf("a diarium reason names a local path: %s", err.Error())
+	}
+
+	// The reasons are single lines that start with "actio: " plus the schema pointer; a newline
+	// in a reason is the same bug in another shape.
+	statusErr := func(raw string) error { _, e := validateStatus([]byte(raw)); return e }
+	diariumErr := func(raw string) error { _, e := validateDiariumLine([]byte(raw)); return e }
+	reasons := []struct {
+		prefix string
+		err    error
+	}{
+		{"actio: status.schema.json:", statusErr(`{"id":"a"}`)},
+		{"actio: status.schema.json:", statusErr(`{"id":"a","status":"nope","datetime":"x","capability_status":[]}`)},
+		{"actio: diarium.schema.json:", diariumErr(`{"id":"a","datetime":"2026-01-01T00:00:00Z","event":"log","event_data":5}`)},
+	}
+	for _, r := range reasons {
+		if r.err == nil {
+			t.Fatal("a document that must be rejected was accepted")
+		}
+		if strings.Contains(r.err.Error(), "\n") {
+			t.Errorf("a reason is not a single line: %q", r.err.Error())
+		}
+		if !strings.HasPrefix(r.err.Error(), r.prefix) {
+			t.Errorf("a reason does not start with %q: %q", r.prefix, r.err.Error())
+		}
+	}
+}
