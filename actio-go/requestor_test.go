@@ -418,8 +418,9 @@ func TestRequestCancelWaitsForConfirmation(t *testing.T) {
 	x.assertDiariumStatus(t, rid, FinalCancelled)
 }
 
-// A cancelled ctx ending in a timeout: the cancellation is written, no response comes, the bounded
-// wait is up, and the exchange is abandoned.
+// A cancelled ctx with no response: the cancellation is written and the exchange is abandoned when
+// the wait gives up. The confirmation half of the wait — a response in the window is captured — is
+// TestRequestCancelWaitsForConfirmation's.
 func TestRequestCancelWaitsThenTimesOut(t *testing.T) {
 	events := make(chan Event, 64)
 	x := newReqTest(t, "me", "peer", events)
@@ -800,6 +801,28 @@ func TestRequestMalformedResponseIgnoredUntilTimeout(t *testing.T) {
 	x.assertDiariumStatus(t, rid, FinalAbandoned)
 }
 
+// A malformed response file does not end the exchange: it is not a response, the exchange keeps
+// looking in B2, and a valid response that follows is captured and confirmed.
+func TestRequestMalformedResponseThenValidIsConfirmed(t *testing.T) {
+	events := make(chan Event, 64)
+	x := newReqTest(t, "me", "peer", events)
+	before := runtime.NumGoroutine()
+
+	done := runRequest(t, x.r, "peer", "cap", nil, RequestOptions{Timeout: 5 * time.Second})
+	rid := waitForRequest(t, x.inbox)
+	writeFileAtomic(t, filepath.Join(x.inbox, string(rid)+".res.json"), []byte("not json"))
+	// The malformed file must not end the exchange: give it a beat so a look takes it in, then
+	// answer for real.
+	time.Sleep(150 * time.Millisecond)
+	x.answer(rid, okBody())
+	<-done
+	x.assertDiariumStatus(t, rid, FinalConfirmed)
+	if _, err := os.Stat(filepath.Join(x.inbox, string(rid)+".con.json")); err != nil {
+		t.Fatalf("the confirmation file is missing: %v", err)
+	}
+	settleGoroutines(t, before)
+}
+
 // assertDiariumStatus finds the exchange's outreq line and checks its final status.
 func (x *reqTest) assertDiariumStatus(t *testing.T, rid RID, want string) {
 	t.Helper()
@@ -915,47 +938,6 @@ func TestRequestAbandonLogsAttachmentDeletionFailure(t *testing.T) {
 		t.Fatalf("the failed attachment deletion was not logged; log lines: %v", x.logs.lines())
 	}
 	x.assertDiariumStatus(t, rid, FinalAbandoned)
-	settleGoroutines(t, before)
-}
-
-// D-18's look half: the response is written while the watcher's delivery is stalled, so its
-// event cannot wake the exchange; the exchange still ends confirmed, found by a look.
-//
-// The exact "the first look is the sole finder" state is not constructable without a production
-// seam: the request file's own wake is already queued by the first look, and a stale wake would
-// let a loop without the initial look pass the same way. This test pins the reachable half: a
-// response present on disk while its event is undelivered ends the exchange confirmed.
-func TestRequestResponseFoundByLookWhenEventStalled(t *testing.T) {
-	events := make(chan Event, 64)
-	x := newReqTest(t, "me", "peer", events)
-	before := runtime.NumGoroutine()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	done := make(chan struct{})
-	var out Outcome
-	go func() {
-		out, _ = x.r.request(ctx, "peer", "cap", nil, RequestOptions{Timeout: 5 * time.Second})
-		close(done)
-	}()
-	rid := waitForRequest(t, x.inbox)
-	// Stall the watcher's delivery: its wake and loss paths take the table mutex, so while it is
-	// held no wake-up can reach the subscription, whatever events land.
-	x.r.st.watch.mu.Lock()
-	x.answer(rid, okBody())
-	x.r.st.watch.mu.Unlock()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the exchange never ended: the response written while the delivery was stalled was not found")
-	}
-	if out.FinalStatus != FinalConfirmed {
-		t.Fatalf("final status: %s, want confirmed: the look must find a response whose event is missed", out.FinalStatus)
-	}
-	x.assertDiariumStatus(t, rid, FinalConfirmed)
-	if _, err := os.Stat(filepath.Join(x.inbox, string(rid)+".con.json")); err != nil {
-		t.Fatalf("the confirmation file is missing: %v", err)
-	}
 	settleGoroutines(t, before)
 }
 

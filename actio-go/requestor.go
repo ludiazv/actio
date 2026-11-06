@@ -109,7 +109,9 @@ func (r *requestor) request(ctx context.Context, dst AgentID, name string, param
 		defer timer.Stop()
 	}
 
-	// B2: look, then select; a wake-up only means "look again".
+	// B2: look, then select; a wake-up only means "look again". The first look is not a race fix —
+	// the rid is new and our own write queues a wake-up — but the loop's correctness does not rest
+	// on that event, and B4 has the same shape.
 	for {
 		if resRaw, body, ok := r.capture(ex); ok {
 			return r.finishAnswered(ex, capObj, resRaw, body)
