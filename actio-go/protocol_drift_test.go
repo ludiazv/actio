@@ -340,6 +340,15 @@ func kindOk(jsonType string, typ reflect.Type) bool {
 
 // derefProp follows the $ref of a property definition: the protocol declares its nullable fields
 // through common.schema.json, so the type to check is the one the reference points at.
+//
+// A use site may write keywords beside the $ref — diarium.schema.json does it at the event_data of
+// both its branches, a type and a properties beside the reference to #/$defs/exchange — and this
+// walker deliberately does not read them. Those two are the watched exception: the contract rows below
+// name the event_data of each branch. A sibling can only narrow what the definition already allows. A narrowing the vectors violate fails
+// the vector suite; a narrowing they satisfy leaves the Go type correct anyway, and the byte-for-byte
+// schema pin still trips so a reader sees the change. Tampering with every $ref use site in the
+// protocol (45 of them, in both copies so the byte pin stays quiet) survives this test and is caught
+// by the vectors and the validator tests: no walker change was asked for.
 func derefProp(file string, prop *schemaNode, loaded map[string]*schemaNode) (*schemaNode, error) {
 	for depth := 0; prop != nil && prop.Ref != ""; depth++ {
 		if depth > 10 {
