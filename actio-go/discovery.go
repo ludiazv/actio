@@ -29,7 +29,7 @@ var reservedFolder = map[string]struct{}{
 type publicationState int
 
 const (
-	missing    publicationState = iota // the file is not there: the folder is not an agent
+	missing    publicationState = iota // the file is not there: the folder is not an agent (silence, as in TS)
 	unparsable                         // it is there, and it is JSON, but it is not valid JSON
 	unreadable                         // it is there, but it cannot be read (a directory, a permission failure, …)
 	jsonDoc                            // it is JSON; the bytes are returned
@@ -56,10 +56,11 @@ func readPublication(file string) ([]byte, publicationState) {
 // Scan reads the agent folders of root (*Announcement and Discovery* scan rules 1–4).
 //
 // Reserved names (tools, forum, nuntium) and dotted folders are never agents. A folder without the
-// spec.json/status.json pair, with a file that cannot be read, with a file that is not valid JSON,
-// or with a file that does not conform to its schema is not an agent: it is reported in
-// ScanResult.Ignored with a one-line reason. Two folders that declare the same id: the first in
-// lexical order keeps it (D-3), the rest are ScanResult.Duplicates.
+// spec.json/status.json pair is not an agent yet, and it is silent — as in the reference, which
+// tests the silence on purpose. A file that cannot be read, a file that is not valid JSON, and a
+// file that does not conform to its schema are reported in ScanResult.Ignored with a one-line
+// reason. Two folders that declare the same id: the first in lexical order keeps it (D-3), the
+// rest are ScanResult.Duplicates.
 func Scan(root string) (ScanResult, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -82,9 +83,7 @@ func Scan(root string) (ScanResult, error) {
 		folder := filepath.Join(root, name)
 		info, err := os.Stat(folder)
 		if err != nil {
-			// listed, then gone (or unreadable): an ignored entry, not an error out of Scan
-			result.Ignored = append(result.Ignored, IgnoredFile{Path: folder, Reason: "the folder disappeared"})
-			continue
+			continue // listed, then gone (or unreadable): silence, as in TS — not an error out of Scan
 		}
 		if !info.IsDir() {
 			continue // `actio.json` and the like are not agent folders
@@ -93,15 +92,11 @@ func Scan(root string) (ScanResult, error) {
 		statusFile := filepath.Join(folder, "status.json")
 		specRaw, specState := readPublication(specFile)
 		statusRaw, statusState := readPublication(statusFile)
-		// Rule 2: a folder without the pair is not an agent yet; the first gap, in the reference's
-		// order, is the one reported. A file that cannot be read is said so as unreadable — it is
-		// not "not valid JSON", which is reserved for bytes that were read and are not JSON.
+		// Rule 2: a folder without the pair is not an agent yet — silence, as in the reference, which
+		// tests it on purpose. A file that cannot be read is said so as unreadable — it is not
+		// "not valid JSON", which is reserved for bytes that were read and are not JSON.
 		switch {
-		case specState == missing:
-			result.Ignored = append(result.Ignored, IgnoredFile{Path: specFile, Reason: "missing"})
-			continue
-		case statusState == missing:
-			result.Ignored = append(result.Ignored, IgnoredFile{Path: statusFile, Reason: "missing"})
+		case specState == missing || statusState == missing:
 			continue
 		case specState == unreadable:
 			result.Ignored = append(result.Ignored, IgnoredFile{Path: specFile, Reason: "unreadable"})

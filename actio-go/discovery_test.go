@@ -298,38 +298,24 @@ func TestScanReservedAndHiddenExcluded(t *testing.T) {
 	}
 }
 
-// A folder without spec.json is not an agent: it is reported as an ignored file with a reason.
-func TestScanMissingSpec(t *testing.T) {
+// Ported from ../actio-ts/test/unit/discovery.test.ts:299, "scan ignores silently a folder
+// missing spec.json or status.json (rule 2)": an empty folder, a folder with only spec.json and a
+// folder with only status.json are all silent — the result is empty in all three fields, as the
+// reference asserts with a deepEqual against its empty result.
+func TestScanIgnoresSilentlyAFolderMissingSpecOrStatus(t *testing.T) {
 	root := t.TempDir()
-	writeAgent(t, root, "lone", "", peerStatusJSON)
+	if err := os.Mkdir(filepath.Join(root, "empty"), 0o755); err != nil { // no publication at all
+		t.Fatal(err)
+	}
+	writeAgent(t, root, "no-status", peerSpecJSON, "") // spec.json only
+	writeAgent(t, root, "no-spec", "", peerStatusJSON) // status.json only
 	result, err := Scan(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Agents) != 0 {
-		t.Fatalf("a folder without spec.json was counted as an agent")
+	if len(result.Agents) != 0 || len(result.Ignored) != 0 || len(result.Duplicates) != 0 {
+		t.Fatalf("rule 2 is not silent: %+v", result)
 	}
-	if len(result.Ignored) != 1 || !strings.HasSuffix(result.Ignored[0].Path, "spec.json") {
-		t.Fatalf("the missing spec.json was not reported: %+v", result.Ignored)
-	}
-	assertOneLineReason(t, result.Ignored[0])
-}
-
-// A folder without status.json is not an agent: it is reported as an ignored file with a reason.
-func TestScanMissingStatus(t *testing.T) {
-	root := t.TempDir()
-	writeAgent(t, root, "lone", peerSpecJSON, "")
-	result, err := Scan(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result.Agents) != 0 {
-		t.Fatalf("a folder without status.json was counted as an agent")
-	}
-	if len(result.Ignored) != 1 || !strings.HasSuffix(result.Ignored[0].Path, "status.json") {
-		t.Fatalf("the missing status.json was not reported: %+v", result.Ignored)
-	}
-	assertOneLineReason(t, result.Ignored[0])
 }
 
 // A file that is not valid JSON is not an agent: it is reported, and the reason is one line.
@@ -512,8 +498,8 @@ func TestScanResultsSortedLexical(t *testing.T) {
 }
 
 // §5.4: a folder that is gone by the time the scan reaches it (a dangling link plays the part)
-// is an ignored entry, not an error out of Scan.
-func TestScanVanishedFolderIgnored(t *testing.T) {
+// is silent — as in the reference — and not an error out of Scan.
+func TestScanVanishedFolderIsSilent(t *testing.T) {
 	root := t.TempDir()
 	writeAgent(t, root, "peer", peerSpecJSON, peerStatusJSON)
 	ghost := filepath.Join(root, "ghost")
@@ -527,14 +513,7 @@ func TestScanVanishedFolderIgnored(t *testing.T) {
 	if len(result.Agents) != 1 {
 		t.Fatalf("the surviving agent was lost: %+v", result.Agents)
 	}
-	found := false
-	for _, f := range result.Ignored {
-		if f.Path == ghost {
-			found = true
-			assertOneLineReason(t, f)
-		}
-	}
-	if !found {
-		t.Errorf("the vanished folder was not reported: %+v", result.Ignored)
+	if len(result.Ignored) != 0 {
+		t.Errorf("the vanished folder was not silent: %+v", result.Ignored)
 	}
 }
