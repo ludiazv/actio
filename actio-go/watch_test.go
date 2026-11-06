@@ -307,6 +307,112 @@ func TestWatchOverflowWakesEverySubscriber(t *testing.T) {
 	}
 }
 
+// The real kernel overflow, not a call to handleError: stall the watch path (holding the table's
+// mutex stops run() at its next wake, and fsnotify stops reading once its send blocks), overflow
+// the kernel's event queue, and resume. The overflow must reach the overflow path, wake every
+// subscriber of every folder, change nothing about what a scan sees, and leave the folder watched
+// (D-23: an overflow is "look again", never a lost folder).
+func TestWatchRealOverflowWakesEverySubscriber(t *testing.T) {
+	w, err := newWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close()
+	dir := filepath.Join(t.TempDir(), "inbox")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := w.subscribe(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(t.TempDir(), "other")
+	if err := os.Mkdir(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := w.subscribe(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The kernel's queue limit; the write count is adapted to it. The default is the fallback for a
+	// platform where the value is not readable, where there is no inotify queue to overflow anyway.
+	limit := 16384
+	if raw, rerr := os.ReadFile("/proc/sys/fs/inotify/max_queued_events"); rerr == nil {
+		var n int
+		if _, serr := fmt.Sscan(string(raw), &n); serr == nil && n > 0 {
+			limit = n
+		}
+	}
+	t.Logf("inotify queue limit: %d", limit)
+
+	// Stall the watch path and overflow the queue in one piece: the deferred unlock also runs if a
+	// Fatal fires in between, so the deferred watcher close can never block on the mutex.
+	stallAndFlood := func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		flooded := make(chan struct{})
+		go func() {
+			putWatch(t, dir, "first")
+			time.Sleep(50 * time.Millisecond)
+			for i := 0; i < limit+1000; i++ { // an empty file makes one event, so go well past the limit
+				if werr := os.WriteFile(filepath.Join(dir, fmt.Sprintf("n%06d", i)), nil, 0o644); werr != nil {
+					t.Errorf("flood write %d: %v", i, werr)
+				}
+			}
+			close(flooded)
+		}()
+		<-flooded
+	}
+	stallAndFlood()
+
+	// The overflow reaches the watcher's overflow path: the folder's subscriber is woken, and it is
+	// a wake-up, never a loss.
+	select {
+	case <-s.changed():
+	case <-s.lost():
+		t.Fatal("an overflow was reported as a loss")
+	case <-time.After(20 * time.Second):
+		t.Fatal("nothing after the overflow")
+	}
+
+	// Every subscriber is woken: the other folder has no event of its own, so only the overflow's
+	// wake of everyone can reach it.
+	select {
+	case <-s2.changed():
+	case <-s2.lost():
+		t.Fatal("an overflow was reported as a loss, for the other folder")
+	case <-time.After(10 * time.Second):
+		t.Error("the overflow did not reach every subscriber")
+	}
+
+	// A scan after the overflow sees every file that was written.
+	changed, _, err := scanFolder(dir, map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != limit+1001 {
+		t.Errorf("a scan after the overflow saw %d files of %d", len(changed), limit+1001)
+	}
+
+	// The folder is still watched: drain the buffered wake-ups, then a new write must wake again.
+	for ok := true; ok; {
+		select {
+		case <-s.changed():
+		case <-time.After(300 * time.Millisecond):
+			ok = false
+		}
+	}
+	putWatch(t, dir, "after-the-overflow")
+	select {
+	case <-s.changed():
+	case <-s.lost():
+		t.Fatal("the folder was lost by the overflow")
+	case <-time.After(3 * time.Second):
+		t.Error("DEAF after the overflow")
+	}
+}
+
 // A trailing slash on subscribe: the path is cleaned, so an event's folder matches the table
 // (D-23).
 func TestWatchSubscribeTrailingSlash(t *testing.T) {
