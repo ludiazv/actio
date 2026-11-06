@@ -136,6 +136,7 @@ type heartbeat struct {
 	interval time.Duration
 	tick     func() error
 	mu       sync.Mutex
+	started  bool // start was called: one heartbeat, one goroutine, no second start
 	stopped  bool
 	stopCh   chan struct{} // closed by stop(): the heartbeat's own end, beside the agent's stop
 }
@@ -146,9 +147,19 @@ func newHeartbeat(interval time.Duration, tick func() error) *heartbeat {
 	return &heartbeat{interval: interval, tick: tick, stopCh: make(chan struct{})}
 }
 
-// start runs it on one tracked goroutine; it ends when stop closes, and stop ends it early. After
-// stop no timer is armed (D-9).
+// start runs it on one tracked goroutine; it ends when stop closes, and stop ends it early. A
+// second start — while running, or after a stop — does nothing: one heartbeat, one goroutine, and
+// after Stop nothing is armed (D-9). The tracked goroutine ends when the in-flight tick returns,
+// so a tick that blocks delays the agent's wait for Stop: a caller whose publish can block must
+// bound the tick itself (a deadline in its context).
 func (h *heartbeat) start(wg *sync.WaitGroup, stop <-chan struct{}) {
+	h.mu.Lock()
+	if h.started || h.stopped {
+		h.mu.Unlock()
+		return
+	}
+	h.started = true
+	h.mu.Unlock()
 	wg.Go(func() {
 		ticker := time.NewTicker(h.interval)
 		defer ticker.Stop()

@@ -350,3 +350,85 @@ func TestHeartbeatStopIdempotentAndEndsLoop(t *testing.T) {
 	}
 	h2.stop() // idempotent after the loop has ended
 }
+
+// TestHeartbeatStartTwiceAddsNoTicks: a second start on a running heartbeat adds no goroutine and
+// no ticks — the stream stays one tick per interval. The reviewer's shape: at a 10 ms interval,
+// one start gives ~5–6 ticks in 60 ms, an unguarded second start ~11. The ticks are received over
+// a channel (the handshake, no sleeps ordering events), and the assertion is on the rate, so a
+// slow machine slows both windows equally.
+func TestHeartbeatStartTwiceAddsNoTicks(t *testing.T) {
+	const interval = 10 * time.Millisecond
+	ticks := make(chan struct{}, 32)
+	h := newHeartbeat(interval, func() error { ticks <- struct{}{}; return nil })
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	h.start(&wg, stop)
+
+	recv := func(n int, what string) {
+		for i := 0; i < n; i++ {
+			select {
+			case <-ticks:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("timed out waiting for tick %d (%s)", i+1, what)
+			}
+		}
+	}
+	recv(2, "warming up")
+
+	t0 := time.Now()
+	recv(6, "one start")
+	one := time.Since(t0)
+
+	h.start(&wg, stop) // the misuse the guard must swallow
+
+	t1 := time.Now()
+	recv(6, "after the second start")
+	two := time.Since(t1)
+
+	close(stop)
+	wg.Wait()
+
+	// One ticker: both windows are stretches of the same stream and take the same time. A second
+	// goroutine would double the rate and halve the second window; 3/5 leaves it on its side.
+	if two < one*3/5 {
+		t.Fatalf("six ticks after a second start took %v where one start took %v: the stream ticked faster (a second goroutine)", two, one)
+	}
+}
+
+// TestHeartbeatStartAfterStopDoesNothing: after a stop — the heartbeat's own, or the agent's — a
+// start arms nothing and produces no ticks (D-9). The 100 ms is ten intervals: the absence check
+// is a bounded detector, not an ordering pause.
+func TestHeartbeatStartAfterStopDoesNothing(t *testing.T) {
+	run := func(ownStop bool) {
+		name := "after the agent's stop"
+		if ownStop {
+			name = "after stop()"
+		}
+		ticks := make(chan struct{}, 8)
+		h := newHeartbeat(10*time.Millisecond, func() error { ticks <- struct{}{}; return nil })
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		if ownStop {
+			h.stop()
+			h.start(&wg, stop) // must do nothing
+		} else {
+			h.start(&wg, stop)
+			select {
+			case <-ticks:
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for the first tick")
+			}
+			close(stop)
+			wg.Wait()
+			h.start(&wg, stop) // the loop already ended with the agent's stop: must do nothing
+		}
+		select {
+		case <-ticks:
+			t.Fatalf("a start %s armed a ticker", name)
+		case <-time.After(100 * time.Millisecond):
+		}
+		wg.Wait() // nothing tracked to wait for
+	}
+	run(true)
+	run(false)
+}
