@@ -118,7 +118,7 @@ func compileProtocolSchemas() (*protocolSchemas, error) {
 }
 
 // checkRaw is the shared core of every validate*: validate the bytes against the compiled schema
-// at pointer, then decode the validated document into the pinned struct. The error names the
+// at pointer, then decode the original bytes into the pinned struct. The error names the
 // schema and the first failure.
 func checkRaw(pointer string, raw []byte, out any) error {
 	set, err := compiledSchemas()
@@ -136,19 +136,20 @@ func checkRaw(pointer string, raw []byte, out any) error {
 	if err := sch.Validate(doc); err != nil {
 		return fmt.Errorf("actio: %s: %v", pointer, failureText(err))
 	}
-	return decodeInto(doc, out)
+	return decodeInto(raw, out)
 }
 
-// decodeInto turns a validated document (numbers kept as json.Number) into the pinned struct. The
-// document is re-marshalled and read back with UseNumber so the any and json.RawMessage fields
-// keep the numbers and the raw bytes exactly as the file wrote them. DisallowUnknownFields is
-// deliberately not set: the schema decides what is allowed, not the decoder.
+// decodeInto reads a validated document into the pinned struct from the original bytes — not from
+// a re-marshalled map, which would sort every object's keys — so a json.RawMessage field keeps the
+// bytes exactly as the file wrote them, keys and all. UseNumber keeps the numbers that land in any
+// fields as json.Number. DisallowUnknownFields is deliberately not set: the schema decides what is
+// allowed, not the decoder.
 func decodeInto(doc any, out any) error {
-	enc, err := json.Marshal(doc)
-	if err != nil {
-		return fmt.Errorf("actio: %v", err)
+	raw, ok := doc.([]byte)
+	if !ok {
+		return fmt.Errorf("actio: decodeInto: the document must be the original bytes, got %T", doc)
 	}
-	dec := json.NewDecoder(bytes.NewReader(enc))
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	if err := dec.Decode(out); err != nil {
 		return fmt.Errorf("actio: %v", err)

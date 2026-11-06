@@ -4,6 +4,7 @@
 package actio
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -511,5 +512,74 @@ func TestPvReasonHasNoFileURI(t *testing.T) {
 		if !strings.HasPrefix(r.err.Error(), r.prefix) {
 			t.Errorf("a reason does not start with %q: %q", r.prefix, r.err.Error())
 		}
+	}
+}
+
+// The read path must hand back the json.RawMessage fields with the bytes exactly as the file
+// wrote them: the envelopes are stored as exchanged, and an audit that diffs a diarium envelope
+// against the inbox files byte-for-byte depends on it. The write path was always byte-exact; the
+// read path used to re-marshal the parsed document, and json.Marshal sorts every object's keys.
+
+// writtenRequestVector is the real request vector as one JSON document, its surrounding
+// whitespace removed. The diarium test compacts it further, because a diarium line is one line.
+func writtenRequestVector(t *testing.T) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "vectors", "request", "valid", "01-a1-request.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	compact, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return compact
+}
+
+// A diarium line whose keys are not alphabetical at any level reads back through ReadDiarium
+// with the event_data and the envelope bytes exactly as written.
+func TestDiariumReadKeepsEnvelopesAsWritten(t *testing.T) {
+	vector := writtenRequestVector(t)
+	eventData := `{"final_status":"sent","req":` + string(vector) + `,"can":null,"res":null,"con":null}`
+	line := `{"id":"agent-a","datetime":"2026-10-24T10:05:00Z","event":"outreq","event_data":` + eventData + `}`
+	folder := t.TempDir()
+	if err := os.WriteFile(filepath.Join(folder, "diarium.jsonl"), []byte(line+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	read, err := ReadDiarium(folder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(read.Lines) != 1 || len(read.Ignored) != 0 {
+		t.Fatalf("the line was not read back: lines=%d ignored=%+v", len(read.Lines), read.Ignored)
+	}
+	got := read.Lines[0].EventData
+	if !bytes.Equal(got, []byte(eventData)) {
+		t.Errorf("event_data came back reordered:\n got %s\nwant %s", got, eventData)
+	}
+	var envelopes ExchangeEnvelopes
+	if err := json.Unmarshal(got, &envelopes); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(envelopes.Req, vector) {
+		t.Errorf("the req envelope came back reordered:\n got %s\nwant %s", envelopes.Req, vector)
+	}
+}
+
+// A request file read through validateRequestFile hands back the envelope with the bytes as
+// written, since the same decodeInto serves it. The file is the real vector's values with its
+// keys not alphabetical at any level.
+func TestRequestFileKeepsTheEnvelopeAsWritten(t *testing.T) {
+	body := `{"ts":1792836000,"nonce":"52ffe97b3a5e6e2f00a69edb27551465","signature":null,"name":"summarize","parameters":{"text":"Actio is a simple file/object-based agent coordination protocol ...","instructions":"one sentence"},"timeout":300,"attachments":[]}`
+	fileBytes := []byte(`{"rid":"01JB7Q3W8K2M4N6P8R0S2T4V6X","src":"planner","dst":"summarizer","datetime":"2026-10-24T10:00:00Z","type":"req","actio_version":"0.1","request":` + body + `}`)
+	file, err := validateRequestFile(fileBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(file.Request, []byte(body)) {
+		t.Errorf("the request envelope came back reordered:\n got %s\nwant %s", file.Request, body)
 	}
 }
