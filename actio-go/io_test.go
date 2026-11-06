@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/fsnotify/fsnotify"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -110,42 +111,34 @@ func TestWriteBytesAtomicTempNameAndCleanup(t *testing.T) {
 	target := filepath.Join(dir, "payload.bin")
 	tmpDir := filepath.Join(dir, "agent")
 	f := newFileIO(&hookRecorder{})
-	payload := make([]byte, 4<<20) // big enough that the temp is observable while the write runs
+	payload := make([]byte, 4<<10)
 	tmpRe := regexp.MustCompile(`^\.payload\.bin\.[0-9a-f]{32}\.tmp$`)
 
-	caught := ""
-	inflight := make(chan struct{})
-outer:
-	for attempt := 0; attempt < 20; attempt++ {
-		done := make(chan struct{})
-		inflight = done
-		go func() {
-			if err := f.writeBytesAtomic(target, payload, tmpDir); err != nil {
-				t.Error(err)
-			}
-			close(done)
-		}()
-		for {
-			names, err := f.listDir(tmpDir) // the temp dir may not exist yet: keep polling
-			if err == nil {
-				for _, n := range names {
-					if tmpRe.MatchString(n) {
-						caught = n
-						break outer
-					}
-				}
-			}
-			select {
-			case <-done:
-				// this attempt finished before the temp was seen; try again
-			case <-time.After(time.Millisecond):
-			}
+	// The kernel records the name whatever the scheduler does, so the check needs no timing.
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.Add(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.writeBytesAtomic(target, payload, tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ev := <-w.Events:
+		if !tmpRe.MatchString(filepath.Base(ev.Name)) {
+			t.Fatalf("the temp file is named %q", filepath.Base(ev.Name))
 		}
+	case err := <-w.Errors:
+		t.Fatal(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no event for the temp file")
 	}
-	if caught == "" {
-		t.Fatal("the temp file was never observed while the write was in flight")
-	}
-	<-inflight // let the in-flight write finish before the temp dir goes away
 
 	// A successful write leaves no temp file behind.
 	names, err := f.listDir(tmpDir)
