@@ -30,20 +30,22 @@ type publicationState int
 
 const (
 	missing    publicationState = iota // the file is not there: the folder is not an agent
-	unparsable                         // it is there, but it is not valid JSON
+	unparsable                         // it is there, and it is JSON, but it is not valid JSON
+	unreadable                         // it is there, but it cannot be read (a directory, a permission failure, …)
 	jsonDoc                            // it is JSON; the bytes are returned
 )
 
-// readPublication reads one of the two publication files. A file that exists but cannot be read,
-// or is not valid JSON, is unparsable — the same reading the reference's readJson-then-exists pair
-// gives it.
+// readPublication reads one of the two publication files. A file that cannot be read is
+// unreadable — a directory is not "invalid JSON", it is not a file at all; a file that is read
+// but is not valid JSON is unparsable — the same two readings the reference's readJson-then-
+// exists pair gives them.
 func readPublication(file string) ([]byte, publicationState) {
 	raw, err := os.ReadFile(file)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, missing
 		}
-		return nil, unparsable
+		return nil, unreadable
 	}
 	if !json.Valid(raw) {
 		return nil, unparsable
@@ -54,10 +56,10 @@ func readPublication(file string) ([]byte, publicationState) {
 // Scan reads the agent folders of root (*Announcement and Discovery* scan rules 1–4).
 //
 // Reserved names (tools, forum, nuntium) and dotted folders are never agents. A folder without the
-// spec.json/status.json pair, with a file that is not valid JSON, or with a file that does not
-// conform to its schema is not an agent: it is reported in ScanResult.Ignored with a one-line
-// reason. Two folders that declare the same id: the first in lexical order keeps it (D-3), the rest
-// are ScanResult.Duplicates.
+// spec.json/status.json pair, with a file that cannot be read, with a file that is not valid JSON,
+// or with a file that does not conform to its schema is not an agent: it is reported in
+// ScanResult.Ignored with a one-line reason. Two folders that declare the same id: the first in
+// lexical order keeps it (D-3), the rest are ScanResult.Duplicates.
 func Scan(root string) (ScanResult, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -92,13 +94,20 @@ func Scan(root string) (ScanResult, error) {
 		specRaw, specState := readPublication(specFile)
 		statusRaw, statusState := readPublication(statusFile)
 		// Rule 2: a folder without the pair is not an agent yet; the first gap, in the reference's
-		// order, is the one reported.
+		// order, is the one reported. A file that cannot be read is said so as unreadable — it is
+		// not "not valid JSON", which is reserved for bytes that were read and are not JSON.
 		switch {
 		case specState == missing:
 			result.Ignored = append(result.Ignored, IgnoredFile{Path: specFile, Reason: "missing"})
 			continue
 		case statusState == missing:
 			result.Ignored = append(result.Ignored, IgnoredFile{Path: statusFile, Reason: "missing"})
+			continue
+		case specState == unreadable:
+			result.Ignored = append(result.Ignored, IgnoredFile{Path: specFile, Reason: "unreadable"})
+			continue
+		case statusState == unreadable:
+			result.Ignored = append(result.Ignored, IgnoredFile{Path: statusFile, Reason: "unreadable"})
 			continue
 		case specState == unparsable:
 			result.Ignored = append(result.Ignored, IgnoredFile{Path: specFile, Reason: "not valid JSON"})

@@ -251,9 +251,12 @@ func writeAgent(t *testing.T, root, name, spec, status string) string {
 	return folder
 }
 
-// assertOneLineReason pins the portable shape of a reason: one line, no local path.
+// assertOneLineReason pins the portable shape of a reason: one line, no local path, non-empty.
 func assertOneLineReason(t *testing.T, f IgnoredFile) {
 	t.Helper()
+	if f.Reason == "" {
+		t.Errorf("a reason is empty: %+v", f)
+	}
 	if strings.Contains(f.Reason, "\n") {
 		t.Errorf("a reason is not a single line: %q", f.Reason)
 	}
@@ -342,6 +345,58 @@ func TestScanBrokenJSON(t *testing.T) {
 	}
 	if len(result.Ignored) != 1 || result.Ignored[0].Reason != "not valid JSON" {
 		t.Fatalf("the broken spec.json was not reported as not valid JSON: %+v", result.Ignored)
+	}
+	assertOneLineReason(t, result.Ignored[0])
+}
+
+// A spec.json that is a directory is not an agent — and it is not "not valid JSON", it is
+// unreadable. The healthy sibling agent is still returned.
+func TestScanDirectorySpecIsUnreadable(t *testing.T) {
+	root := t.TempDir()
+	folder := writeAgent(t, root, "dirspec", "", peerStatusJSON)
+	if err := os.Mkdir(filepath.Join(folder, "spec.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeAgent(t, root, "ok", peerSpecJSON, peerStatusJSON)
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Agents) != 1 || !strings.HasSuffix(result.Agents[0].Folder, "ok") {
+		t.Fatalf("the healthy sibling was not returned: %+v", result.Agents)
+	}
+	if len(result.Ignored) != 1 || !strings.HasSuffix(result.Ignored[0].Path, "spec.json") {
+		t.Fatalf("the directory spec.json was not reported: %+v", result.Ignored)
+	}
+	if result.Ignored[0].Reason != "unreadable" {
+		t.Fatalf("a directory spec.json was not reported as unreadable: %+v", result.Ignored)
+	}
+	assertOneLineReason(t, result.Ignored[0])
+}
+
+// A spec.json that cannot be read (mode 000) is not an agent — and it is not "not valid JSON", it
+// is unreadable. The healthy sibling agent is still returned.
+func TestScanUnreadableFileSpecIsUnreadable(t *testing.T) {
+	root := t.TempDir()
+	folder := writeAgent(t, root, "locked", "hidden", peerStatusJSON)
+	locked := filepath.Join(folder, "spec.json")
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o644) })
+	writeAgent(t, root, "ok", peerSpecJSON, peerStatusJSON)
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Agents) != 1 || !strings.HasSuffix(result.Agents[0].Folder, "ok") {
+		t.Fatalf("the healthy sibling was not returned: %+v", result.Agents)
+	}
+	if len(result.Ignored) != 1 || !strings.HasSuffix(result.Ignored[0].Path, "spec.json") {
+		t.Fatalf("the unreadable spec.json was not reported: %+v", result.Ignored)
+	}
+	if result.Ignored[0].Reason != "unreadable" {
+		t.Fatalf("an unreadable spec.json was not reported as unreadable: %+v", result.Ignored)
 	}
 	assertOneLineReason(t, result.Ignored[0])
 }
