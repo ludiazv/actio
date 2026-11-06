@@ -5,6 +5,7 @@
 package actio
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -701,8 +702,9 @@ func TestRecvStopAnswers300WithinGrace(t *testing.T) {
 	rid := tt.newRID()
 	tt.writeRequest(t, rid, "echo", json.RawMessage(`{}`), 0)
 	tt.waitForBusy(t, 3*time.Second)
-	// The work finishes within the grace: stop lets it, and the response is its real result.
-	go func() { time.Sleep(50 * time.Millisecond); close(release) }()
+	// The work is released from a state (closed right away), not the wall clock: it settles on
+	// the normal path or in the stop's grace drain; both answer it with its real result, not 300.
+	close(release)
 	if err := tt.r.stop(false, 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
@@ -840,4 +842,177 @@ func TestRecvFolderLossEndsLoop(t *testing.T) {
 		ig, ok := e.(IgnoredEvent)
 		return ok && ig.Path == inbox
 	})
+}
+
+// --- the diarium envelopes as exchanged, and the start state -------------------
+
+// writeRawEnvelope writes one pre-built envelope file: the bytes land exactly as given.
+func (tt *recvTest) writeRawEnvelope(t *testing.T, name string, raw []byte) {
+	t.Helper()
+	path := filepath.Join(tt.st.folders.inbox, name)
+	if err := tt.st.files.writeBytesAtomic(path, raw, tt.st.folders.agent); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// craftEnvelope builds one envelope file whose key order differs from the Go struct order (the
+// body key first, the body keys reversed): a re-marshal of the decoded struct would not produce
+// these bytes, so a diarium slot that equals them is the file's bytes as exchanged.
+func craftEnvelope(rid RID, now time.Time, bodyKey, body string) []byte {
+	return []byte(`{"` + bodyKey + `":` + body + `,"rid":"` + string(rid) + `","src":"peer","dst":"agent","datetime":"` + formatISO(now) + `","type":"req","actio_version":"1.0"}`)
+}
+
+func craftedRes(rid RID, now time.Time) []byte {
+	return craftEnvelope(rid, now, "response", `{"attachments":[],"cancellation":false,"error":false,"nonce":"`+newNonce()+`","result":{},"signature":null,"ts":`+fmt.Sprint(now.Unix())+`}`)
+}
+
+func craftedCan(rid RID, now time.Time) []byte {
+	return craftEnvelope(rid, now, "cancellation", `{"force":false,"name":"echo","nonce":"`+newNonce()+`","signature":null,"ts":`+fmt.Sprint(now.Unix())+`}`)
+}
+
+func craftedCon(rid RID, now time.Time) []byte {
+	return craftEnvelope(rid, now, "confirmation", `{"nonce":"`+newNonce()+`","signature":null,"ts":`+fmt.Sprint(now.Unix())+`}`)
+}
+
+// TestRecvDiariumEnvelopesAsExchanged pins the as-exchanged rule on the normal path: the .con is
+// delivered after the response, and the diarium must carry the confirmation and the response with
+// the file's exact bytes (key order and all), not a re-marshal of the decoded structs.
+func TestRecvDiariumEnvelopesAsExchanged(t *testing.T) {
+	tt := newRecvTest(t, 5*time.Second)
+	tt.registerEcho()
+	tt.start()
+	rid := tt.newRID()
+	tt.writeRequest(t, rid, "echo", json.RawMessage(`{}`), 0)
+	resRaw := tt.waitForFile(t, tt.resPath(rid), 3*time.Second) // the receiver's own response, as written
+	conRaw := craftedCon(rid, tt.now())
+	tt.writeRawEnvelope(t, string(rid)+".con.json", conRaw)
+	tt.waitForInboxEmpty(t, 3*time.Second)
+	lines := tt.inreqLines(t)
+	if len(lines) != 1 {
+		t.Fatalf("want one inreq line, got %d", len(lines))
+	}
+	var env ExchangeEnvelopes
+	if err := json.Unmarshal(lines[0].EventData, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.FinalStatus != FinalConfirmed {
+		t.Fatalf("final status = %q, want %q", env.FinalStatus, FinalConfirmed)
+	}
+	if !bytes.Equal(env.Con, conRaw) {
+		t.Fatalf("the diarium con is not the file's bytes as exchanged:\n file: %s\n diarium: %s", conRaw, env.Con)
+	}
+	if !bytes.Equal(env.Res, resRaw) {
+		t.Fatalf("the diarium res is not the file's bytes as exchanged:\n file: %s\n diarium: %s", resRaw, env.Res)
+	}
+	if !isJSONNull(env.Can) {
+		t.Fatalf("the cancellation was recorded though it never arrived: %s", env.Can)
+	}
+}
+
+// TestRecvRetrackKeepsEnvelopes is the D-4 retrack at start: a previous run left the response and
+// the cancellation (no request file). The retracked exchange must archive with the files' bytes
+// as exchanged — "null" in the diarium means the file was never written, not that we lost it.
+func TestRecvRetrackKeepsEnvelopes(t *testing.T) {
+	tt := newRecvTest(t, 300*time.Millisecond) // the archive lands on the confirmation timeout
+	tt.registerEcho()
+	rid := tt.newRID()
+	resRaw := craftedRes(rid, tt.now())
+	canRaw := craftedCan(rid, tt.now())
+	tt.writeRawEnvelope(t, string(rid)+".res.json", resRaw)
+	tt.writeRawEnvelope(t, string(rid)+".can.json", canRaw)
+	tt.start()
+	tt.waitForInboxEmpty(t, 3*time.Second)
+	lines := tt.inreqLines(t)
+	if len(lines) != 1 {
+		t.Fatalf("want one inreq line, got %d", len(lines))
+	}
+	var env ExchangeEnvelopes
+	if err := json.Unmarshal(lines[0].EventData, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.FinalStatus != FinalCancelled {
+		t.Fatalf("final status = %q, want %q", env.FinalStatus, FinalCancelled)
+	}
+	if !bytes.Equal(env.Res, resRaw) {
+		t.Fatalf("the diarium res is not the file's bytes as exchanged:\n file: %s\n diarium: %s", resRaw, env.Res)
+	}
+	if !bytes.Equal(env.Can, canRaw) {
+		t.Fatalf("the diarium can is null or re-marshalled, want the file's bytes:\n file: %s\n diarium: %s", canRaw, env.Can)
+	}
+	if !isJSONNull(env.Req) || !isJSONNull(env.Con) {
+		t.Fatalf("the absent envelopes must be null: req=%s con=%s", env.Req, env.Con)
+	}
+}
+
+// TestRecvStaleResponseAtStartDoesNotRunWork is the start state a previous run can leave: the
+// response of the rid and its request are both in the inbox. The work must not run (the exchange
+// is already answered); the stale response is applied, the exchange archives, and nothing leaks.
+func TestRecvStaleResponseAtStartDoesNotRunWork(t *testing.T) {
+	tt := newRecvTest(t, 300*time.Millisecond) // the archive lands on the confirmation timeout
+	tt.registerCap(echoCap(), func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
+		if _, err := call.PublishAttachment("leak.bin", []byte("leak")); err != nil {
+			return nil, err
+		}
+		return map[string]any{}, nil
+	})
+	rid := tt.newRID()
+	resRaw := craftedRes(rid, tt.now())
+	tt.writeRawEnvelope(t, string(rid)+".res.json", resRaw)   // the previous run's answer
+	tt.writeRequest(t, rid, "echo", json.RawMessage(`{}`), 0) // and its request
+	tt.start()
+	tt.waitForInboxEmpty(t, 3*time.Second)
+	if tt.calls() != 0 {
+		t.Fatalf("the handler ran %d times, want 0: the exchange was already answered", tt.calls())
+	}
+	entries, err := os.ReadDir(tt.st.folders.forum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("the work's attachments leaked in the forum: %d entries", len(entries))
+	}
+	lines := tt.inreqLines(t)
+	if len(lines) != 1 {
+		t.Fatalf("want one inreq line, got %d", len(lines))
+	}
+	var env ExchangeEnvelopes
+	if err := json.Unmarshal(lines[0].EventData, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.FinalStatus != FinalCompleted {
+		t.Fatalf("final status = %q, want %q", env.FinalStatus, FinalCompleted)
+	}
+	if !bytes.Equal(env.Res, resRaw) {
+		t.Fatalf("the diarium res is not the file's bytes as exchanged:\n file: %s\n diarium: %s", resRaw, env.Res)
+	}
+}
+
+// TestRecvDeferredEnvelopeKeepsRaw pins the deferred path white-box: an envelope parked before its
+// request is tracked must hand its file bytes (not a re-marshal) to the exchange.
+func TestRecvDeferredEnvelopeKeepsRaw(t *testing.T) {
+	tt := newRecvTest(t, 5*time.Second)
+	tt.registerEcho()
+	rid := tt.newRID()
+	hdr := Header{RID: rid, Src: "peer", Dst: "agent", Datetime: formatISO(tt.now()), Type: TypeRequest, ActioVersion: "1.0"}
+	ex := &exchange{rid: rid, header: hdr, phase: phaseAccepting}
+	tt.r.exchanges[rid] = ex
+	canRaw := craftedCan(rid, tt.now())
+	resRaw := craftedRes(rid, tt.now())
+	can, err := validateCancellationFile(canRaw)
+	if err != nil {
+		t.Fatalf("the crafted cancellation is not valid: %v", err)
+	}
+	res, err := validateResponseFile(resRaw)
+	if err != nil {
+		t.Fatalf("the crafted response is not valid: %v", err)
+	}
+	tt.r.parkDeferred(rid, deferredEnv{kind: BodyCancellation, can: can, raw: canRaw})
+	tt.r.parkDeferred(rid, deferredEnv{kind: BodyResponse, res: res, raw: resRaw})
+	tt.r.drainDeferred(ex)
+	if !bytes.Equal(ex.canRaw, canRaw) {
+		t.Fatalf("the deferred can is not the file's bytes as exchanged:\n file: %s\n exchange: %s", canRaw, ex.canRaw)
+	}
+	if !bytes.Equal(ex.resRaw, resRaw) {
+		t.Fatalf("the deferred res is not the file's bytes as exchanged:\n file: %s\n exchange: %s", resRaw, ex.resRaw)
+	}
 }

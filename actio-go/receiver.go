@@ -77,12 +77,13 @@ type exchange struct {
 }
 
 // deferredEnv is one envelope that arrived before its request (the watcher delivers in lexical order,
-// so .can.json precedes .json).
+// so .can.json precedes .json). raw is the file's bytes as exchanged, kept for the diarium.
 type deferredEnv struct {
 	kind string
 	can  *CancellationFile
 	res  *ResponseFile
 	con  *ConfirmationFile
+	raw  json.RawMessage
 }
 
 // completion is the result of one accepted request, sent back by the work goroutine. Attachments are
@@ -363,7 +364,10 @@ func (r *receiver) anyWorking() bool {
 }
 
 // capabilityStatus is the capability_status list for status.json; it reads the atomic counters, so it
-// is safe from the publication path while the loop runs.
+// is safe from the publication path while the loop runs. The counters are loaded one per capability at
+// different instants, so the list is a snapshot of a moving system that can mix instants (e.g. the
+// agent state "idle" alongside a running count); publishing it is safe and the next publication
+// corrects it.
 func (r *receiver) capabilityStatus() []CapabilityStatus {
 	view := r.view.Load()
 	out := make([]CapabilityStatus, 0, len(view.caps))
@@ -426,7 +430,7 @@ func (r *receiver) processName(name string) {
 		if file, err := validateCancellationFile(raw); err != nil {
 			r.ignore(full, name, oneLine(err))
 		} else {
-			r.dispatchCancellation(full, name, file)
+			r.dispatchCancellation(full, name, file, raw)
 		}
 	case BodyResponse:
 		if file, err := validateResponseFile(raw); err != nil {
@@ -438,7 +442,7 @@ func (r *receiver) processName(name string) {
 		if file, err := validateConfirmationFile(raw); err != nil {
 			r.ignore(full, name, oneLine(err))
 		} else {
-			r.dispatchConfirmation(full, name, file)
+			r.dispatchConfirmation(full, name, file, raw)
 		}
 	}
 }
@@ -592,11 +596,11 @@ func (r *receiver) drainDeferred(ex *exchange) {
 		full := filepath.Join(r.st.folders.inbox, name)
 		switch d.kind {
 		case BodyCancellation:
-			r.applyCancellation(ex, d.can, full, name)
+			r.applyCancellation(ex, d.can, full, name, d.raw)
 		case BodyResponse:
-			r.applyResponse(ex, d.res, full, name)
+			r.applyResponse(ex, d.res, full, name, d.raw)
 		case BodyConfirmation:
-			r.applyConfirmation(ex, d.con, full, name)
+			r.applyConfirmation(ex, d.con, full, name, d.raw)
 		}
 	}
 }
@@ -604,24 +608,25 @@ func (r *receiver) drainDeferred(ex *exchange) {
 // dispatchResponse: ours (echoed by the watcher) or a leftover of a previous run (D-4).
 func (r *receiver) dispatchResponse(full, name string, file *ResponseFile, raw json.RawMessage) {
 	if ex := r.exchanges[file.RID]; ex != nil { // D-2: match exchanges by rid, never by file name
-		r.applyResponse(ex, file, full, name)
+		r.applyResponse(ex, file, full, name, raw)
 		return
 	}
 	if r.st.files.exists(filepath.Join(r.st.folders.inbox, string(file.RID)+".json")) {
-		r.parkDeferred(file.RID, deferredEnv{kind: BodyResponse, res: file}) // the request is still pending
+		r.parkDeferred(file.RID, deferredEnv{kind: BodyResponse, res: file, raw: raw}) // the request is still pending
 		return
 	}
 	r.retrackFromResponse(file, raw) // D-4: a bare .res.json left by a previous run
 }
 
 // applyResponse is the effect of one matched response, by phase; a D-11 header mismatch is ignored.
-func (r *receiver) applyResponse(ex *exchange, file *ResponseFile, full, name string) {
+// raw is the file's bytes as exchanged, kept for the diarium (never re-marshal what we read).
+func (r *receiver) applyResponse(ex *exchange, file *ResponseFile, full, name string, raw json.RawMessage) {
 	if !sameHeader(&file.Header, &ex.header) {
 		r.ignore(full, name, "header mismatch for rid "+string(ex.rid)+" (D-11)")
 		return
 	}
 	if ex.resRaw == nil {
-		ex.resRaw, _ = json.Marshal(file)
+		ex.resRaw = raw
 	}
 	ex.res = file
 	if ex.phase == phaseResponded {
@@ -636,21 +641,21 @@ func (r *receiver) applyResponse(ex *exchange, file *ResponseFile, full, name st
 }
 
 // dispatchCancellation: matched by rid (D-2).
-func (r *receiver) dispatchCancellation(full, name string, file *CancellationFile) {
+func (r *receiver) dispatchCancellation(full, name string, file *CancellationFile, raw json.RawMessage) {
 	if ex := r.exchanges[file.RID]; ex != nil {
-		r.applyCancellation(ex, file, full, name)
+		r.applyCancellation(ex, file, full, name, raw)
 		return
 	}
 	if r.st.files.exists(filepath.Join(r.st.folders.inbox, string(file.RID)+".json")) {
-		r.parkDeferred(file.RID, deferredEnv{kind: BodyCancellation, can: file})
+		r.parkDeferred(file.RID, deferredEnv{kind: BodyCancellation, can: file, raw: raw})
 		return
 	}
 	r.ignore(full, name, "unmatched rid "+string(file.RID)+" (no tracked exchange)")
 }
 
 // applyCancellation is the effect of one matched cancellation, by phase; a D-11 header or name
-// mismatch is ignored.
-func (r *receiver) applyCancellation(ex *exchange, file *CancellationFile, full, name string) {
+// mismatch is ignored. raw is the file's bytes as exchanged, kept for the diarium.
+func (r *receiver) applyCancellation(ex *exchange, file *CancellationFile, full, name string, raw json.RawMessage) {
 	if !sameHeader(&file.Header, &ex.header) {
 		r.ignore(full, name, "header mismatch for rid "+string(ex.rid)+" (D-11)")
 		return
@@ -660,10 +665,7 @@ func (r *receiver) applyCancellation(ex *exchange, file *CancellationFile, full,
 			r.ignore(full, name, "cancellation name mismatch for rid "+string(ex.rid))
 			return
 		}
-		ex.can = file
-		if ex.canRaw == nil {
-			ex.canRaw, _ = json.Marshal(file)
-		}
+		ex.can, ex.canRaw = file, raw
 	}
 	ex.canSeen = true
 	if ex.phase == phaseWorking && ex.cancel != nil {
@@ -672,21 +674,21 @@ func (r *receiver) applyCancellation(ex *exchange, file *CancellationFile, full,
 }
 
 // dispatchConfirmation: matched by rid (D-2).
-func (r *receiver) dispatchConfirmation(full, name string, file *ConfirmationFile) {
+func (r *receiver) dispatchConfirmation(full, name string, file *ConfirmationFile, raw json.RawMessage) {
 	if ex := r.exchanges[file.RID]; ex != nil {
-		r.applyConfirmation(ex, file, full, name)
+		r.applyConfirmation(ex, file, full, name, raw)
 		return
 	}
 	if r.st.files.exists(filepath.Join(r.st.folders.inbox, string(file.RID)+".json")) {
-		r.parkDeferred(file.RID, deferredEnv{kind: BodyConfirmation, con: file})
+		r.parkDeferred(file.RID, deferredEnv{kind: BodyConfirmation, con: file, raw: raw})
 		return
 	}
 	r.ignore(full, name, "unmatched rid "+string(file.RID)+" (no tracked exchange)")
 }
 
 // applyConfirmation is the effect of one matched confirmation, by phase; a D-11 header mismatch is
-// ignored.
-func (r *receiver) applyConfirmation(ex *exchange, file *ConfirmationFile, full, name string) {
+// ignored. raw is the file's bytes as exchanged, kept for the diarium.
+func (r *receiver) applyConfirmation(ex *exchange, file *ConfirmationFile, full, name string, raw json.RawMessage) {
 	if !sameHeader(&file.Header, &ex.header) {
 		r.ignore(full, name, "header mismatch for rid "+string(ex.rid)+" (D-11)")
 		return
@@ -694,8 +696,7 @@ func (r *receiver) applyConfirmation(ex *exchange, file *ConfirmationFile, full,
 	if ex.con != nil {
 		return // the confirmation file is written once; later ones are no-ops
 	}
-	ex.con = file
-	ex.conRaw, _ = json.Marshal(file)
+	ex.con, ex.conRaw = file, raw
 	if ex.phase == phaseResponded && ex.res != nil {
 		if ex.timer != nil {
 			ex.timer.Stop()
@@ -709,11 +710,19 @@ func (r *receiver) acceptAndRun(ex *exchange) {
 	if _, ok := r.exchanges[ex.rid]; !ok {
 		return // drainDeferred archived it: a leftover response+confirmation from a previous run
 	}
+	if ex.res != nil {
+		return // drainDeferred applied a leftover response: the exchange is answered, only the
+		// confirmation or the timeout can end it — no work, no second answer
+	}
+	if r.st.files.exists(filepath.Join(r.st.folders.inbox, string(ex.rid)+".res.json")) {
+		return // D-4: a previous run already answered this request and left its .res.json in the
+		// inbox; the work would run for nothing and its attachments would leak in the forum
+	}
 	var body RequestBody
 	_ = json.Unmarshal(ex.request.Request, &body)
 	if !ex.canSeen {
-		if pending := r.readCancellation(ex.rid, ex.header); pending != nil {
-			ex.can, ex.canRaw, ex.canSeen = pending, mustRaw(pending), true
+		if pending, raw := r.readCancellation(ex.rid, ex.header); pending != nil {
+			ex.can, ex.canRaw, ex.canSeen = pending, raw, true
 		}
 	}
 	if ex.canSeen {
@@ -962,7 +971,8 @@ func (r *receiver) archive(ex *exchange) {
 }
 
 // retrackFromResponse is D-4: re-track a pending .res.json (a previous run) and restart the
-// confirmation wait from now.
+// confirmation wait from now. The envelopes are kept as exchanged: a "null" in the diarium means the
+// file was never written, so the bytes of every file that is present must land on the line.
 func (r *receiver) retrackFromResponse(file *ResponseFile, raw json.RawMessage) {
 	if r.stopped() {
 		return
@@ -974,11 +984,11 @@ func (r *receiver) retrackFromResponse(file *ResponseFile, raw json.RawMessage) 
 		return
 	}
 	ex := &exchange{rid: file.RID, header: file.Header, phase: phaseResponded, res: file, resRaw: raw}
-	if can := r.readCancellation(file.RID, file.Header); can != nil {
-		ex.can, ex.canSeen = can, true
+	if can, canRaw := r.readCancellation(file.RID, file.Header); can != nil {
+		ex.can, ex.canRaw, ex.canSeen = can, canRaw, true
 	}
-	if con := r.readConfirmation(file.RID, file.Header); con != nil {
-		ex.con = con
+	if con, conRaw := r.readConfirmation(file.RID, file.Header); con != nil {
+		ex.con, ex.conRaw = con, conRaw
 	}
 	r.exchanges[file.RID] = ex
 	if ex.con == nil {
@@ -988,33 +998,35 @@ func (r *receiver) retrackFromResponse(file *ResponseFile, raw json.RawMessage) 
 	r.archive(ex) // confirmed before this run started
 }
 
-// readCancellation reads <inbox>/<rid>.can.json, validates it, and checks the header (D-11).
-func (r *receiver) readCancellation(rid RID, hdr Header) *CancellationFile {
+// readCancellation reads <inbox>/<rid>.can.json, validates it, and checks the header (D-11). It
+// returns the file and its bytes as exchanged (the diarium keeps the bytes, never a re-marshal).
+func (r *receiver) readCancellation(rid RID, hdr Header) (*CancellationFile, json.RawMessage) {
 	raw, err := r.st.files.readFile(filepath.Join(r.st.folders.inbox, string(rid)+".can.json"))
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	file, err := validateCancellationFile(raw)
 	if err != nil || !sameHeader(&file.Header, &hdr) {
-		return nil
+		return nil, nil
 	}
 	if !cancellationNameOK(r.exchanges[rid], file) {
-		return nil
+		return nil, nil
 	}
-	return file
+	return file, raw
 }
 
-// readConfirmation reads <inbox>/<rid>.con.json, validates it, and checks the header (D-11).
-func (r *receiver) readConfirmation(rid RID, hdr Header) *ConfirmationFile {
+// readConfirmation reads <inbox>/<rid>.con.json, validates it, and checks the header (D-11). It
+// returns the file and its bytes as exchanged (the diarium keeps the bytes, never a re-marshal).
+func (r *receiver) readConfirmation(rid RID, hdr Header) (*ConfirmationFile, json.RawMessage) {
 	raw, err := r.st.files.readFile(filepath.Join(r.st.folders.inbox, string(rid)+".con.json"))
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	file, err := validateConfirmationFile(raw)
 	if err != nil || !sameHeader(&file.Header, &hdr) {
-		return nil
+		return nil, nil
 	}
-	return file
+	return file, raw
 }
 
 // cancellationNameOK reports whether a cancellation's name matches the exchange's request (the
@@ -1098,12 +1110,6 @@ func intp(v int) *int { return &v }
 // stoppingResult is the work error 300 result of a stop that preempts an accepted, unanswered request.
 func stoppingResult() json.RawMessage {
 	raw, _ := marshalJSON(ErrorResult{Code: intp(CodeAgentStopping), Msg: "agent_stopping: the agent stops before answering"})
-	return raw
-}
-
-// mustRaw marshals a value, ignoring the error (used for the as-exchanged diarium copies).
-func mustRaw(v any) json.RawMessage {
-	raw, _ := json.Marshal(v)
 	return raw
 }
 
