@@ -434,8 +434,10 @@ func (a *Agent) logf(format string, args ...any) {
 }
 
 // tick is the heartbeat's tick (D-9 v1.8): it publishes under the publication mutex, and it writes
-// nothing once the state is inactive, so it can never overwrite C1. It is a refresh: the status
-// file with a fresh datetime, no diarium event, no announce.
+// nothing once the state is inactive, so it can never overwrite C1. The guard is belt-and-braces:
+// every stop waits for the heartbeat before C1, so only a tick in the start window, before the first
+// idle, can see inactive. It is a refresh: the status file with a fresh datetime, no diarium event,
+// no announce.
 func (a *Agent) tick() error {
 	a.st.pubMu.Lock()
 	defer a.st.pubMu.Unlock()

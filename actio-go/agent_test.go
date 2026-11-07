@@ -78,6 +78,26 @@ func waitFor(t *testing.T, bound time.Duration, what string, f func() bool) {
 	t.Fatalf("gave up waiting for %s after %s", what, bound)
 }
 
+// waitForName polls one folder until a name matching f appears, and returns it. The bound is the
+// deadline the poll gives up at.
+func waitForName(t *testing.T, bound time.Duration, what, folder string, f func(string) bool) string {
+	t.Helper()
+	deadline := time.Now().Add(bound)
+	for time.Now().Before(deadline) {
+		entries, err := os.ReadDir(folder)
+		if err == nil {
+			for _, e := range entries {
+				if !e.IsDir() && f(e.Name()) {
+					return e.Name()
+				}
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("gave up waiting for %s after %s", what, bound)
+	return ""
+}
+
 // statusState reads the state of one status.json.
 func statusState(t *testing.T, root, id string) string {
 	t.Helper()
@@ -422,6 +442,211 @@ func TestAgentBusyWhileWorking(t *testing.T) {
 			return false
 		}
 		return s.Status == "idle"
+	})
+}
+
+// TestAgentSelfCall: a request to one's own inbox. The requestor writes the request into the folder
+// the agent's own receiver is already watching on the agent's one watcher, and the receiver answers
+// it like any peer's: the exchange ends confirmed, the handler ran exactly once, and the diarium
+// lines carry the exchange — req, res, con — byte for byte as the files were.
+func TestAgentSelfCall(t *testing.T) {
+	root := t.TempDir()
+	ran := make(chan struct{})
+	release := make(chan struct{})
+	a := newTestAgent(t, root, "alpha", nil)
+	if err := a.Capability(echoCap(), func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
+		ran <- struct{}{} // a second run would block here and stall the exchange: exactly once
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return params, nil
+	}); err != nil {
+		t.Fatalf("Capability: %v", err)
+	}
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	inbox := filepath.Join(root, "alpha", "inbox")
+	outCtx, cancelOut := context.WithTimeout(startCtx(t), 15*time.Second)
+	defer cancelOut()
+	done := make(chan Outcome, 1)
+	go func() {
+		out, err := a.Request(outCtx, "alpha", "echo", map[string]any{"msg": "self"}, RequestOptions{Timeout: 10 * time.Second})
+		if err != nil {
+			t.Errorf("Request(self): %v", err)
+		}
+		done <- out
+	}()
+	// The request file lands in our own inbox. Read its bytes while the handler holds the exchange
+	// open: the archive deletes the files only at the end.
+	reqName := waitForName(t, 5*time.Second, "the request file in our own inbox", inbox, func(name string) bool {
+		return strings.HasSuffix(name, ".json") &&
+			!strings.HasSuffix(name, ".res.json") &&
+			!strings.HasSuffix(name, ".con.json") &&
+			!strings.HasSuffix(name, ".can.json")
+	})
+	reqRaw := mustRead(t, filepath.Join(inbox, reqName))
+	rid := strings.TrimSuffix(reqName, ".json")
+	select {
+	case <-ran: // the handler ran, once
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handler never ran: the request was not delivered to our own receiver")
+	}
+	close(release)
+	var out Outcome
+	select {
+	case out = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the self-call did not finish")
+	}
+	if out.FinalStatus != "confirmed" {
+		t.Fatalf("final status of the self-call: %q, want confirmed", out.FinalStatus)
+	}
+	// The diarium lines of the exchange, read raw: the envelopes land on the lines as raw bytes.
+	// The inreq line lands when the receiver archives, which is after the confirmation write, so
+	// poll for both lines of this rid.
+	type envLine struct {
+		Event     string `json:"event"`
+		EventData struct {
+			FinalStatus string          `json:"final_status"`
+			Req         json.RawMessage `json:"req"`
+			Can         json.RawMessage `json:"can"`
+			Res         json.RawMessage `json:"res"`
+			Con         json.RawMessage `json:"con"`
+		} `json:"event_data"`
+	}
+	var inreq, outreq *envLine
+	waitFor(t, 5*time.Second, "the diarium lines of the exchange", func() bool {
+		inreq, outreq = nil, nil
+		raw, err := os.ReadFile(filepath.Join(root, "alpha", "diarium.jsonl"))
+		if err != nil {
+			return false
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			var l envLine
+			if json.Unmarshal([]byte(line), &l) != nil || l.EventData.Req == nil {
+				continue
+			}
+			var head struct {
+				Header
+			}
+			if json.Unmarshal(l.EventData.Req, &head) != nil || head.RID != RID(rid) {
+				continue
+			}
+			if l.Event == "inreq" {
+				inreq = &l
+			} else if l.Event == "outreq" && l.EventData.FinalStatus == "confirmed" {
+				outreq = &l
+			}
+		}
+		return inreq != nil && outreq != nil
+	})
+	if inreq.EventData.FinalStatus != "confirmed" || outreq.EventData.FinalStatus != "confirmed" {
+		t.Errorf("final statuses: inreq=%q outreq=%q, want confirmed", inreq.EventData.FinalStatus, outreq.EventData.FinalStatus)
+	}
+	// Byte for byte: the receiver's line against the requestor's line, and both against the file
+	// the test read. The res and con files are deleted by the archive, so the two lines — one the
+	// bytes written, the other the bytes read back — are the files.
+	if !bytes.Equal(inreq.EventData.Req, outreq.EventData.Req) || !bytes.Equal(inreq.EventData.Req, reqRaw) {
+		t.Error("the req envelope is not the request file's bytes on both lines")
+	}
+	if !bytes.Equal(inreq.EventData.Res, outreq.EventData.Res) {
+		t.Error("the res envelope is not the response file's bytes on both lines")
+	}
+	if !bytes.Equal(inreq.EventData.Con, outreq.EventData.Con) {
+		t.Error("the con envelope is not the confirmation file's bytes on both lines")
+	}
+	// The response file is the one our own receiver wrote into our own inbox: the header says so.
+	var resFile struct {
+		Header
+		Response json.RawMessage `json:"response"`
+	}
+	if err := json.Unmarshal(inreq.EventData.Res, &resFile); err != nil {
+		t.Fatalf("the res envelope is not a response file: %v", err)
+	}
+	if resFile.RID != RID(rid) || resFile.Src != "alpha" || resFile.Dst != "alpha" {
+		t.Errorf("the response header: %+v, want rid %s from alpha to alpha", resFile.Header, rid)
+	}
+	var resBody struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if json.Unmarshal(resFile.Response, &resBody) == nil {
+		if !bytes.Equal(resBody.Result, reqBodyParams(reqRaw)) {
+			t.Errorf("the response result %s is not the echo of the request parameters", resBody.Result)
+		}
+	}
+}
+
+// reqBodyParams extracts the parameters bytes from one request file's raw bytes.
+func reqBodyParams(reqRaw []byte) []byte {
+	var f struct {
+		Request json.RawMessage `json:"request"`
+	}
+	if json.Unmarshal(reqRaw, &f) != nil {
+		return nil
+	}
+	var body struct {
+		Parameters json.RawMessage `json:"parameters"`
+	}
+	if json.Unmarshal(f.Request, &body) != nil {
+		return nil
+	}
+	return body.Parameters
+}
+
+// TestAgentBusyOutbound (D-8): the outbound half of busy. While A's request to B is in flight, A
+// publishes busy even though A's own receiver has no work; after the exchange settles, A publishes
+// idle again.
+func TestAgentBusyOutbound(t *testing.T) {
+	root := t.TempDir()
+	release := make(chan struct{})
+	b := newTestAgent(t, root, "beta", nil)
+	cap := echoCap()
+	cap.Name = "slow"
+	if err := b.Capability(cap, func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return map[string]any{}, nil
+	}); err != nil {
+		t.Fatalf("Capability: %v", err)
+	}
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	a := newTestAgent(t, root, "alpha", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	outCtx, cancelOut := context.WithTimeout(startCtx(t), 10*time.Second)
+	defer cancelOut()
+	done := make(chan Outcome, 1)
+	go func() {
+		out, err := a.Request(outCtx, "beta", "slow", map[string]any{}, RequestOptions{Timeout: 10 * time.Second})
+		if err != nil {
+			t.Errorf("Request: %v", err)
+		}
+		done <- out
+	}()
+	// While the exchange is in flight, A's status says busy: the outbound count is the half this
+	// test pins.
+	waitFor(t, 5*time.Second, "alpha's status to say busy", func() bool {
+		return statusState(t, root, "alpha") == "busy"
+	})
+	close(release)
+	var out Outcome
+	select {
+	case out = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request did not finish")
+	}
+	if out.FinalStatus != "confirmed" {
+		t.Errorf("final status: %q, want confirmed", out.FinalStatus)
+	}
+	waitFor(t, 5*time.Second, "alpha's status to say idle again", func() bool {
+		return statusState(t, root, "alpha") == "idle"
 	})
 }
 
