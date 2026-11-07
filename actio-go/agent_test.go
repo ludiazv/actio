@@ -2049,3 +2049,67 @@ func TestAgentStopCommandShrunkGrace(t *testing.T) {
 		t.Errorf("status after the stop command: %q, want inactive", got)
 	}
 }
+
+// TestAgentE21OwnInboxLossFailsInOrder: a lost own inbox is D-22 — the LogEvent goes on the stream
+// first, then the agent fails (status → error), and the diarium keeps its log line. The fail comes
+// from the failWatch hook, not from an IgnoredEvent-matching hack.
+func TestAgentE21OwnInboxLossFailsInOrder(t *testing.T) {
+	root := t.TempDir()
+	var mu sync.Mutex
+	var events []Event
+	a := newTestAgent(t, root, "alpha", nil)
+	a.OnEvent(func(e Event) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	})
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	inbox := filepath.Join(root, "alpha", "inbox")
+	if err := os.Rename(inbox, inbox+".gone"); err != nil {
+		t.Fatal(err)
+	}
+	// The agent fails (D-22): the status goes to error.
+	waitFor(t, 5*time.Second, "the agent to fail after the inbox loss", func() bool {
+		return statusState(t, root, "alpha") == "error"
+	})
+	// The LogEvent is on the stream and comes before the failure (the StatusEvent{error}).
+	mu.Lock()
+	defer mu.Unlock()
+	logIdx, errIdx := -1, -1
+	for i, e := range events {
+		if le, ok := e.(LogEvent); ok && strings.HasPrefix(le.Message, "watch lost "+inbox+":") {
+			logIdx = i
+		}
+		if se, ok := e.(StatusEvent); ok && se.State == StatusError && errIdx == -1 {
+			errIdx = i
+		}
+	}
+	if logIdx == -1 {
+		t.Fatalf("no LogEvent for the inbox loss on the stream: %+v", events)
+	}
+	if errIdx == -1 {
+		t.Fatalf("no StatusEvent{error} on the stream: %+v", events)
+	}
+	if logIdx > errIdx {
+		t.Fatalf("the LogEvent (index %d) came after the failure (index %d): D-22 wants the log first", logIdx, errIdx)
+	}
+	// The diarium keeps its log line.
+	read, err := ReadDiarium(filepath.Join(root, "alpha"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, l := range read.Lines {
+		if l.Event == "log" {
+			var msg string
+			if json.Unmarshal(l.EventData, &msg) == nil && strings.HasPrefix(msg, "watch lost "+inbox+":") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("the diarium has no log line for the inbox loss")
+	}
+}

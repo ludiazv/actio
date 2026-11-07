@@ -275,9 +275,8 @@ func TestHealthOf(t *testing.T) {
 func TestHeartbeatTicksOnInterval(t *testing.T) {
 	ticks := make(chan struct{}, 16)
 	h := newHeartbeat(20*time.Millisecond, func() error { ticks <- struct{}{}; return nil })
-	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	h.start(&wg, stop)
+	h.start(&wg)
 
 	got := 0
 	for i := 0; i < 3; i++ {
@@ -288,7 +287,7 @@ func TestHeartbeatTicksOnInterval(t *testing.T) {
 			t.Fatalf("timed out waiting for tick %d", i+1)
 		}
 	}
-	close(stop)
+	h.stop()
 	wg.Wait() // the loop ended: from here on no tick can arrive, nothing is armed (D-9)
 	if got != 3 {
 		t.Fatalf("got %d ticks, want 3", got)
@@ -310,9 +309,8 @@ func TestHeartbeatSurvivesTickError(t *testing.T) {
 		}
 		return nil
 	})
-	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	h.start(&wg, stop)
+	h.start(&wg)
 	// The errored tick and the two that follow it: the error did not stop the chain.
 	for i := 0; i < 3; i++ {
 		select {
@@ -321,7 +319,7 @@ func TestHeartbeatSurvivesTickError(t *testing.T) {
 			t.Fatalf("timed out waiting for tick %d: the tick error stopped the chain", i+1)
 		}
 	}
-	close(stop)
+	h.stop()
 	wg.Wait()
 }
 
@@ -333,8 +331,7 @@ func TestHeartbeatStopIdempotentAndEndsLoop(t *testing.T) {
 	ticks := make(chan struct{}, 16)
 	h2 := newHeartbeat(20*time.Millisecond, func() error { ticks <- struct{}{}; return nil })
 	var wg sync.WaitGroup
-	stop := make(chan struct{})
-	h2.start(&wg, stop)
+	h2.start(&wg)
 	select {
 	case <-ticks:
 	case <-time.After(2 * time.Second):
@@ -360,9 +357,8 @@ func TestHeartbeatStartTwiceAddsNoTicks(t *testing.T) {
 	const interval = 10 * time.Millisecond
 	ticks := make(chan struct{}, 32)
 	h := newHeartbeat(interval, func() error { ticks <- struct{}{}; return nil })
-	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	h.start(&wg, stop)
+	h.start(&wg)
 
 	recv := func(n int, what string) {
 		for i := 0; i < n; i++ {
@@ -379,13 +375,13 @@ func TestHeartbeatStartTwiceAddsNoTicks(t *testing.T) {
 	recv(6, "one start")
 	one := time.Since(t0)
 
-	h.start(&wg, stop) // the misuse the guard must swallow
+	h.start(&wg) // the misuse the guard must swallow
 
 	t1 := time.Now()
 	recv(6, "after the second start")
 	two := time.Since(t1)
 
-	close(stop)
+	h.stop()
 	wg.Wait()
 
 	// One ticker: both windows are stretches of the same stream and take the same time. A second
@@ -406,21 +402,20 @@ func TestHeartbeatStartAfterStopDoesNothing(t *testing.T) {
 		}
 		ticks := make(chan struct{}, 8)
 		h := newHeartbeat(10*time.Millisecond, func() error { ticks <- struct{}{}; return nil })
-		stop := make(chan struct{})
 		var wg sync.WaitGroup
 		if ownStop {
 			h.stop()
-			h.start(&wg, stop) // must do nothing
+			h.start(&wg) // must do nothing
 		} else {
-			h.start(&wg, stop)
+			h.start(&wg)
 			select {
 			case <-ticks:
 			case <-time.After(2 * time.Second):
 				t.Fatal("timed out waiting for the first tick")
 			}
-			close(stop)
+			h.stop()
 			wg.Wait()
-			h.start(&wg, stop) // the loop already ended with the agent's stop: must do nothing
+			h.start(&wg) // the loop already ended with the agent's stop: must do nothing
 		}
 		select {
 		case <-ticks:

@@ -347,8 +347,9 @@ func TestRequestSequentialAndConcurrentSameDestination(t *testing.T) {
 	settleGoroutines(t, before)
 }
 
-// The destination folder deleted mid-exchange: the loss path, an abandoned exchange, an
-// IgnoredEvent, and no goroutine left.
+// The destination folder deleted mid-exchange: the loss path, an abandoned exchange, a LogEvent
+// (D-22 names only the own inbox and nuntium for the fail, so the agent stays up), and no
+// goroutine left.
 func TestRequestDestinationFolderDeleted(t *testing.T) {
 	events := make(chan Event, 64)
 	x := newReqTest(t, "me", "peer", events)
@@ -360,13 +361,13 @@ func TestRequestDestinationFolderDeleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-done
-	// The ignored report for the folder we can no longer watch.
+	// The log report for the folder we can no longer watch (not an IgnoredEvent, and no fail).
 	found := false
 	deadline := time.Now().Add(2 * time.Second)
 	for !found && time.Now().Before(deadline) {
 		select {
 		case ev := <-events:
-			if ig, ok := ev.(IgnoredEvent); ok && ig.Path == x.inbox {
+			if le, ok := ev.(LogEvent); ok && strings.HasPrefix(le.Message, "watch lost "+x.inbox+":") {
 				found = true
 			}
 		default:
@@ -374,7 +375,7 @@ func TestRequestDestinationFolderDeleted(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatal("no IgnoredEvent for the deleted destination inbox")
+		t.Fatal("no LogEvent for the deleted destination inbox")
 	}
 	settleGoroutines(t, before)
 }

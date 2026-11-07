@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,7 +25,6 @@ type recvTest struct {
 	r     *receiver
 	watch *watcher
 	wg    sync.WaitGroup
-	stop  chan struct{}
 
 	spec *Spec
 
@@ -43,7 +43,6 @@ func newRecvTest(t *testing.T, confirmTimeout time.Duration) *recvTest {
 		t:      t,
 		root:   root,
 		nowVal: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
-		stop:   make(chan struct{}),
 	}
 	agentFolder := filepath.Join(root, "agent")
 	inbox := filepath.Join(agentFolder, "inbox")
@@ -92,8 +91,11 @@ func newRecvTest(t *testing.T, confirmTimeout time.Duration) *recvTest {
 		now:     tt.now,
 		emit:    emit,
 		logf:    func(format string, args ...any) { emit(LogEvent{Message: fmt.Sprintf(format, args...)}) },
-		spec:    func() *Spec { return tt.spec },
-		state:   func() StatusState { return StatusIdle },
+		// The harness's failWatch mirrors the stream half of the agent's D-22 hook: the LogEvent.
+		// The diarium line and the Fail are agent-level and tested there.
+		failWatch: func(path string, err error) { emit(LogEvent{Message: "watch lost " + path + ": " + err.Error()}) },
+		spec:      func() *Spec { return tt.spec },
+		state:     func() StatusState { return StatusIdle },
 	}
 	tt.watch = watch
 	tt.r = newReceiver(tt.st)
@@ -118,7 +120,7 @@ func (tt *recvTest) setNow(v time.Time) {
 }
 
 func (tt *recvTest) start() {
-	if err := tt.r.start(&tt.wg, tt.stop); err != nil {
+	if err := tt.r.start(&tt.wg); err != nil {
 		tt.t.Fatal(err)
 	}
 }
@@ -273,16 +275,6 @@ func (tt *recvTest) waitForBusy(t *testing.T, timeout time.Duration) {
 	t.Fatal("the receiver is not busy after the timeout")
 }
 
-func (tt *recvTest) waitForLoopExit(t *testing.T, timeout time.Duration) {
-	t.Helper()
-	select {
-	case <-tt.r.done:
-	case <-time.After(timeout):
-		t.Fatal("the receiver loop did not end")
-	}
-}
-
-// inreqLines returns the inreq events of the diarium, in file order.
 func (tt *recvTest) inreqLines(t *testing.T) []DiariumLine {
 	t.Helper()
 	read, err := ReadDiarium(tt.st.folders.agent)
@@ -829,18 +821,177 @@ func TestRecvMalformedInboxFileIgnored(t *testing.T) {
 	}
 }
 
-func TestRecvFolderLossEndsLoop(t *testing.T) {
+// --- lost inbox: the loop stays, the stop settles (R2) -------------------------
+
+// A lost empty inbox must not crash the loop: 60 runs, no panic, the loss is a LogEvent (D-22),
+// and the stop still settles. The probe this adopts is the oracle's TestR2InboxRemoved.
+func TestRecvInboxRemovedEmptyNoCrash(t *testing.T) {
+	for i := 0; i < 60; i++ {
+		tt := newRecvTest(t, 5*time.Second)
+		tt.registerEcho()
+		tt.start()
+		inbox := tt.st.folders.inbox
+		if err := os.Rename(inbox, inbox+".gone"); err != nil {
+			t.Fatal(err)
+		}
+		// The loss is a LogEvent, and the loop is still up (it does not end on a loss).
+		tt.hasEvent(t, 3*time.Second, func(e Event) bool {
+			le, ok := e.(LogEvent)
+			return ok && strings.HasPrefix(le.Message, "watch lost "+inbox+":")
+		})
+		// The loop is alive: a stop runs the settle path and returns.
+		if err := tt.r.stop(true, 0); err != nil {
+			t.Fatalf("run %d: stop after an empty-inbox loss: %v", i, err)
+		}
+		tt.wg.Wait()
+	}
+}
+
+// A lost inbox with files in it must not crash the loop. The oracle's probe panicked here (a nil
+// dereference in the loop after the loss); a bounded number of runs, a named bound, no dependence
+// on the scheduler. The probe this adopts is the oracle's TestR2InboxRemovedWithFiles.
+const inboxLossFileRuns = 200
+
+func TestRecvInboxRemovedWithFilesNoCrash(t *testing.T) {
+	for i := 0; i < inboxLossFileRuns; i++ {
+		tt := newRecvTest(t, 5*time.Second)
+		tt.registerEcho()
+		tt.start()
+		inbox := tt.st.folders.inbox
+		// Junk that is not an envelope: the loss must not trip on it.
+		if err := os.WriteFile(filepath.Join(inbox, "junk.json"), []byte("not json"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(inbox, inbox+".gone"); err != nil {
+			t.Fatal(err)
+		}
+		tt.hasEvent(t, 3*time.Second, func(e Event) bool {
+			le, ok := e.(LogEvent)
+			return ok && strings.HasPrefix(le.Message, "watch lost "+inbox+":")
+		})
+		if err := tt.r.stop(true, 0); err != nil {
+			t.Fatalf("run %d: stop after a with-files-inbox loss: %v", i, err)
+		}
+		tt.wg.Wait()
+	}
+}
+
+// After a loss, a Stop(Force) cancels the running handler and settles the exchange: the work is
+// cancelled, and the archive (inreq) lands as dropped (the 300 answer cannot be written to a lost
+// inbox). The probe this adopts is the oracle's TestR2InboxLostHandlerNotCancelled, with the
+// settle assertion added.
+func TestRecvInboxLostStopForceSettles(t *testing.T) {
 	tt := newRecvTest(t, 5*time.Second)
-	tt.registerEcho()
+	tt.registerCap(echoCap(), func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
+		<-ctx.Done() // the handler blocks until the stop cancels it
+		return nil, ctx.Err()
+	})
 	tt.start()
+	rid := tt.newRID()
+	tt.writeRequest(t, rid, "echo", json.RawMessage(`{}`), 0)
+	tt.waitForBusy(t, 3*time.Second)
 	inbox := tt.st.folders.inbox
 	if err := os.Rename(inbox, inbox+".gone"); err != nil {
 		t.Fatal(err)
 	}
-	tt.waitForLoopExit(t, 3*time.Second)
-	tt.hasEvent(t, time.Second, func(e Event) bool {
+	tt.hasEvent(t, 3*time.Second, func(e Event) bool {
+		le, ok := e.(LogEvent)
+		return ok && strings.HasPrefix(le.Message, "watch lost "+inbox+":")
+	})
+	// The loss does not stop the agent: a Stop(Force) is what settles the work.
+	if err := tt.r.stop(true, 0); err != nil {
+		t.Fatalf("stop after the loss: %v", err)
+	}
+	tt.wg.Wait()
+	// The exchange was settled: the work was cancelled and the archive landed as dropped (the 300
+	// answer could not be written to a lost inbox).
+	ins := tt.inreqLines(t)
+	if len(ins) != 1 {
+		t.Fatalf("the inreq diarium has %d lines, want 1: the exchange was not settled", len(ins))
+	}
+	var env ExchangeEnvelopes
+	if err := json.Unmarshal(ins[0].EventData, &env); err != nil {
+		t.Fatalf("unmarshal the inreq event_data: %v", err)
+	}
+	if env.FinalStatus != FinalDropped {
+		t.Fatalf("the settled exchange has final_status %q, want %q", env.FinalStatus, FinalDropped)
+	}
+	if !isJSONNull(env.Res) {
+		t.Fatalf("the diarium res is not null, want null (the answer was not written): %s", env.Res)
+	}
+}
+
+// A second stop that enters during the first stop's drain must not race and must not settle
+// anything twice. The race the oracle found: stop() read r.inbox while performStop() wrote
+// r.inbox = nil. The started flag removes the read; this pins that two concurrent stops settle the
+// exchange once. Run under -race.
+func TestRecvStopAfterLossSettlesOnce(t *testing.T) {
+	tt := newRecvTest(t, 5*time.Second)
+	tt.registerCap(echoCap(), func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	tt.start()
+	rid := tt.newRID()
+	tt.writeRequest(t, rid, "echo", json.RawMessage(`{}`), 0)
+	tt.waitForBusy(t, 3*time.Second)
+	inbox := tt.st.folders.inbox
+	if err := os.Rename(inbox, inbox+".gone"); err != nil {
+		t.Fatal(err)
+	}
+	// Two concurrent stops: the first runs the settle path, the second takes the done branch.
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Go(func() { errs <- tt.r.stop(true, 0) })
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("a concurrent stop errored: %v", err)
+		}
+	}
+	tt.wg.Wait()
+	// Settled exactly once: one inreq line, dropped (the answer was not written to the lost inbox).
+	ins := tt.inreqLines(t)
+	if len(ins) != 1 {
+		t.Fatalf("the inreq diarium has %d lines, want 1: the exchange was settled %d times", len(ins), len(ins))
+	}
+	var env ExchangeEnvelopes
+	if err := json.Unmarshal(ins[0].EventData, &env); err != nil {
+		t.Fatalf("unmarshal the inreq event_data: %v", err)
+	}
+	if env.FinalStatus != FinalDropped {
+		t.Fatalf("the settled exchange has final_status %q, want %q", env.FinalStatus, FinalDropped)
+	}
+}
+
+// An inbox file whose bytes are not JSON uses the "malformed JSON: <parser error>" reason, not a
+// schema message about a schema the file never reached. A JSON object that is not an envelope keeps
+// the schema's words (E14).
+func TestRecvMalformedJSONPrefix(t *testing.T) {
+	tt := newRecvTest(t, 5*time.Second)
+	tt.registerEcho()
+	tt.start()
+	inbox := tt.st.folders.inbox
+	// Not JSON at all: the malformed JSON prefix.
+	bad := filepath.Join(inbox, "01MALFORMED000000000000000001.json")
+	if err := os.WriteFile(bad, []byte("this is not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tt.hasEvent(t, 3*time.Second, func(e Event) bool {
 		ig, ok := e.(IgnoredEvent)
-		return ok && ig.Path == inbox
+		return ok && ig.Path == bad && strings.HasPrefix(ig.Reason, "malformed JSON:")
+	})
+	// A JSON object that is not an envelope: the schema's words, not the malformed JSON prefix.
+	obj := filepath.Join(inbox, "01NOTENVELOPE000000000000000001.json")
+	if err := os.WriteFile(obj, []byte(`{ "this": "is a json object, not an envelope" }`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tt.hasEvent(t, 3*time.Second, func(e Event) bool {
+		ig, ok := e.(IgnoredEvent)
+		return ok && ig.Path == obj && !strings.HasPrefix(ig.Reason, "malformed JSON:")
 	})
 }
 

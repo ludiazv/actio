@@ -114,7 +114,8 @@ type commandJob struct {
 
 // receiver owns all inbound exchange state of one agent.
 type receiver struct {
-	st *agentState
+	started bool // start ran: written before the loop, and every stop after it runs the settle path
+	st      *agentState
 
 	// Lane A state, owned by the loop (no lock).
 	exchanges   map[RID]*exchange
@@ -133,7 +134,6 @@ type receiver struct {
 	markers      map[string]string
 	initialNames []string
 
-	agentStop   <-chan struct{}
 	stopReq     chan stopParams
 	done        chan struct{}
 	completions chan completion
@@ -223,7 +223,7 @@ func (r *receiver) registerCommand(name string, handler CommandHandler) error {
 
 // start subscribes our inbox on the agent's one watcher (D-23) and runs lanes A and D on one tracked
 // goroutine. It scans once after subscribing, so the files present at start are reported once.
-func (r *receiver) start(wg *sync.WaitGroup, stop <-chan struct{}) error {
+func (r *receiver) start(wg *sync.WaitGroup) error {
 	sub, err := r.st.watch.subscribe(r.st.folders.inbox)
 	if err != nil {
 		return err
@@ -233,7 +233,8 @@ func (r *receiver) start(wg *sync.WaitGroup, stop <-chan struct{}) error {
 		r.st.watch.unsubscribe(sub)
 		return err
 	}
-	r.inbox, r.markers, r.initialNames, r.agentStop = sub, next, changed, stop
+	r.inbox, r.markers, r.initialNames = sub, next, changed
+	r.started = true // from here on, every stop runs the settle path, loss or no loss
 	wg.Go(func() { r.loop() })
 	return nil
 }
@@ -245,18 +246,21 @@ func (r *receiver) loop() {
 		r.processName(name)
 	}
 	for {
+		// After a loss the inbox is nil: nothing more arrives, and the loop stays to answer stop.
+		// A lost own inbox is fatal to the agent (D-22), not to this loop.
+		var changed <-chan struct{}
+		var lost <-chan error
+		if r.inbox != nil {
+			changed, lost = r.inbox.changed(), r.inbox.lost()
+		}
 		select {
-		case <-r.agentStop:
-			r.performStop(true, 0) // the agent is stopping without asking: end as a force stop (D-9)
-			return
 		case p := <-r.stopReq:
 			r.performStop(p.force, p.grace)
 			return
-		case <-r.inbox.changed():
+		case <-changed:
 			r.scanAndProcess()
-		case err := <-r.inbox.lost():
+		case err := <-lost:
 			r.handleLoss(err)
-			return
 		case rid := <-r.timerFired:
 			r.onConfirmTimeout(rid)
 		case c := <-r.completions:
@@ -280,22 +284,22 @@ func (r *receiver) scanAndProcess() {
 	}
 }
 
-// handleLoss is the inbox's D-22: report it, release the watch, and end the loop. No retry, no
-// re-arm, no polling fallback; the agent fails itself from the event.
+// handleLoss is the inbox's D-22: release the watch and fail the agent. No retry, no re-arm, no
+// polling fallback. The loop stays alive (the inbox channels go nil), so a stop can still settle the
+// work in flight.
 func (r *receiver) handleLoss(err error) {
 	if r.inbox != nil {
 		r.st.watch.unsubscribe(r.inbox)
 		r.inbox = nil
 	}
-	r.st.emit(IgnoredEvent{Path: r.st.folders.inbox, Reason: "watch lost: " + err.Error()})
-	r.st.logf("watch lost %s: %v", r.st.folders.inbox, err)
+	r.st.failWatch(r.st.folders.inbox, err)
 }
 
 // stop answers the accepted work that has not answered yet with 300 (agent_stopping), lets it finish
 // within the grace period or cancels it when force is set, and ends the loop. After it nothing is
 // armed (D-9). It blocks until the loop has finished the stop sequence, so every archive has landed.
 func (r *receiver) stop(force bool, grace time.Duration) error {
-	if r.inbox == nil {
+	if !r.started {
 		return nil // not started
 	}
 	select {
@@ -344,9 +348,7 @@ func (r *receiver) performStop(force bool, grace time.Duration) {
 		}
 	}
 	for _, ex := range r.exchanges {
-		if ex.res != nil {
-			r.archive(ex)
-		}
+		r.archive(ex) // settled by the stop: answered, or dropped when the answer could not be written
 	}
 }
 
@@ -404,10 +406,12 @@ func (r *receiver) processName(name string) {
 	}
 	kind, ok := envelopeKind(raw)
 	if !ok {
-		_, verr := validateRequestFile(raw) // not an envelope: report the first schema failure (D-15)
 		reason := "no envelope body key"
-		if verr != nil {
-			reason = oneLine(verr)
+		var probe map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &probe); err != nil {
+			reason = "malformed JSON: " + oneLine(err) // the bytes never reached a schema (E14)
+		} else if _, verr := validateRequestFile(raw); verr != nil {
+			reason = oneLine(verr) // a JSON object that is not an envelope: the schema's words
 		}
 		r.ignore(full, name, reason)
 		return
@@ -953,7 +957,9 @@ func (r *receiver) archive(ex *exchange) {
 		ex.timer.Stop()
 	}
 	finalStatus := FinalCompleted
-	if ex.canSeen {
+	if ex.res == nil {
+		finalStatus = FinalDropped // the answer was not written (e.g. the inbox was lost)
+	} else if ex.canSeen {
 		finalStatus = FinalCancelled
 	} else if ex.con != nil {
 		finalStatus = FinalConfirmed

@@ -353,7 +353,9 @@ func (r *requestor) abandon(ex *outbound) Outcome {
 // finishLost is the D-22 loss of the destination inbox mid-exchange: the folder we can no longer
 // watch is reported as ignored, and the exchange is abandoned.
 func (r *requestor) finishLost(inbox string, err error, ex *outbound) Outcome {
-	r.st.emit(IgnoredEvent{Path: inbox, Reason: "watch lost: " + err.Error()})
+	// D-22 names only the own inbox and nuntium for the fail: a destination watch loss is already
+	// answered by the abandon, so the agent stays up and the loss is a log message.
+	r.st.emit(LogEvent{Message: "watch lost " + inbox + ": " + err.Error()})
 	return r.abandon(ex)
 }
 

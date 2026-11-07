@@ -147,12 +147,12 @@ func newHeartbeat(interval time.Duration, tick func() error) *heartbeat {
 	return &heartbeat{interval: interval, tick: tick, stopCh: make(chan struct{})}
 }
 
-// start runs it on one tracked goroutine; it ends when stop closes, and stop ends it early. A
-// second start — while running, or after a stop — does nothing: one heartbeat, one goroutine, and
-// after Stop nothing is armed (D-9). The tracked goroutine ends when the in-flight tick returns,
-// so a tick that blocks delays the agent's wait for Stop: that wait is bounded by Stop's own
-// context, which tells the caller; a tick takes no context, since a file write can't be cancelled.
-func (h *heartbeat) start(wg *sync.WaitGroup, stop <-chan struct{}) {
+// start runs it on one tracked goroutine; it ends when stop() closes. A second start — while
+// running, or after a stop — does nothing: one heartbeat, one goroutine, and after Stop nothing is
+// armed (D-9). The tracked goroutine ends when the in-flight tick returns, so a tick that blocks
+// delays the agent's wait for Stop: that wait is bounded by Stop's own context, which tells the
+// caller; a tick takes no context, since a file write can't be cancelled.
+func (h *heartbeat) start(wg *sync.WaitGroup) {
 	h.mu.Lock()
 	if h.started || h.stopped {
 		h.mu.Unlock()
@@ -165,8 +165,6 @@ func (h *heartbeat) start(wg *sync.WaitGroup, stop <-chan struct{}) {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-stop:
-				return
 			case <-h.stopCh:
 				return
 			case <-ticker.C:

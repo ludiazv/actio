@@ -59,7 +59,7 @@ func New(opts Options) (*Agent, error) {
 	}
 	st := &agentState{
 		agentShared: sh, id: opts.ID, now: time.Now,
-		emit: func(Event) {}, logf: func(string, ...any) {},
+		emit: func(Event) {}, logf: func(string, ...any) {}, failWatch: func(string, error) {},
 		spec: func() *Spec { return nil }, state: func() StatusState { return StatusInactive },
 		current: StatusInactive,
 	}
@@ -194,13 +194,20 @@ func (a *Agent) startUp(ctx context.Context, st *agentState) error {
 	st.files = newFileIO(provider)
 	st.diaria = newDiaria(st.files, st.folders.agent, st.id)
 	st.now, st.emit, st.logf = cfg.Clock, a.onEvent, a.logf
+	// D-22: a lost own inbox or nuntium is fatal — the log event on the stream, the diarium line,
+	// and then the fail, in that order.
+	st.failWatch = func(path string, err error) {
+		st.emit(LogEvent{Message: "watch lost " + path + ": " + err.Error()})
+		st.logf("watch lost %s: %v", path, err)
+		_ = a.Fail("watch lost " + path)
+	}
 	st.spec = func() *Spec { return st.specNow.Load() }
 	st.state = func() StatusState {
 		st.pubMu.Lock()
 		defer st.pubMu.Unlock()
 		return a.publishedStateLocked()
 	}
-	st.haltCh, st.discStop = make(chan struct{}), make(chan struct{})
+	st.discStop = make(chan struct{})
 	for _, dir := range []string{cfg.Root, st.folders.nuntium, st.folders.forum, st.folders.agent, st.folders.inbox} {
 		if err := st.files.makeDir(dir); err != nil {
 			return err // abortStart closes the provider
@@ -247,11 +254,11 @@ func (a *Agent) startUp(ctx context.Context, st *agentState) error {
 	a.run.Store(st)
 	st.discArmed = true
 	st.wg.Go(func() { a.discoveryLoop(nuntium) })
-	if err := recv.start(&st.wg, st.haltCh); err != nil {
+	if err := recv.start(&st.wg); err != nil {
 		return err
 	}
 	st.hbDone = make(chan struct{})
-	st.hb.start(&st.hbWg, st.haltCh)
+	st.hb.start(&st.hbWg)
 	st.wg.Go(func() {
 		st.hbWg.Wait()
 		close(st.hbDone)
@@ -523,21 +530,10 @@ func (a *Agent) onEvent(e Event) {
 		for _, fn := range listeners {
 			fn(next)
 		}
-		a.observe(next)
 		sh.dispatchMu.Lock()
 	}
 	sh.dispatching = false
 	sh.dispatchMu.Unlock()
-}
-
-// observe is the agent's own reading of the events: a lost own inbox or nuntium is D-22 — the log
-// event came with it, and the agent fails itself from it.
-func (a *Agent) observe(e Event) {
-	ig, ok := e.(IgnoredEvent)
-	if !ok || (ig.Path != a.cur().folders.inbox && ig.Path != a.cur().folders.nuntium) {
-		return
-	}
-	a.Fail("watch lost " + ig.Path)
 }
 
 // logf is the agent's log shortcut: a diarium log line, no event. A failed append is dropped: the
@@ -684,7 +680,7 @@ func (a *Agent) discoveryLoop(nuntium *folderWatch) {
 			a.rescan()
 		case err := <-nuntium.lost():
 			st.watch.unsubscribe(nuntium)
-			st.emit(IgnoredEvent{Path: st.folders.nuntium, Reason: "watch lost: " + err.Error()})
+			st.failWatch(st.folders.nuntium, err) // D-22: the own nuntium is fatal
 			return
 		}
 	}
@@ -882,6 +878,9 @@ type agentState struct {
 	// emit hands an observability event to the callbacks; logf is the shortcut for a LogEvent.
 	emit func(event Event)
 	logf func(format string, args ...any)
+	// failWatch is the D-22 fail for a lost own inbox or nuntium: the log event, the diarium line,
+	// and the Fail, in that order. The requestor's destination losses do not use it (they only log).
+	failWatch func(path string, err error)
 	// spec and state read what the agent has published, for the code that needs the current view.
 	spec  func() *Spec
 	state func() StatusState
@@ -894,7 +893,6 @@ type agentState struct {
 	hbWg       sync.WaitGroup // the heartbeat's one tracked goroutine
 	hbDone     chan struct{}
 	wg         sync.WaitGroup // the agent's own tracked goroutines: discovery, the hb join, the stop runner
-	haltCh     chan struct{}  // the hard abort of a failed Start: the receiver's force path
 	discStop   chan struct{}
 	discClosed atomic.Bool // the discovery stop's close has run for this run: stopInternal is re-entrant
 	discArmed  bool        // the discovery loop is running: abortStart's close and wait apply
