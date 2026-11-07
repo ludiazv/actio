@@ -101,7 +101,11 @@ func newRecvTest(t *testing.T, confirmTimeout time.Duration) *recvTest {
 	tt.r = newReceiver(tt.st)
 	t.Cleanup(func() {
 		_ = tt.r.stop(false, 2*time.Second)
-		tt.wg.Wait()
+		// Bounded: a loop that never settled (a regression) must not hang the cleanup.
+		select {
+		case <-tt.r.done:
+		case <-time.After(5 * time.Second):
+		}
 		watch.close()
 	})
 	return tt
@@ -306,6 +310,18 @@ func (tt *recvTest) hasEvent(t *testing.T, timeout time.Duration, check func(Eve
 	}
 	t.Fatal("the expected event was not emitted")
 	return nil
+}
+
+// waitForSettled bounds the wait for the receiver's loop to end after a stop, so a regression that
+// leaves the loop un-settled (performStop never ran) fails with a named message, not a hang. The
+// loop closes r.done as it ends, so a closed r.done is the settle.
+func (tt *recvTest) waitForSettled(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	select {
+	case <-tt.r.done:
+	case <-time.After(timeout):
+		t.Fatalf("the receiver loop did not settle within %v after the stop: performStop did not run", timeout)
+	}
 }
 
 func (tt *recvTest) newRID() RID { return newULID(tt.now()) }
@@ -843,7 +859,7 @@ func TestRecvInboxRemovedEmptyNoCrash(t *testing.T) {
 		if err := tt.r.stop(true, 0); err != nil {
 			t.Fatalf("run %d: stop after an empty-inbox loss: %v", i, err)
 		}
-		tt.wg.Wait()
+		tt.waitForSettled(t, 5*time.Second)
 	}
 }
 
@@ -872,7 +888,7 @@ func TestRecvInboxRemovedWithFilesNoCrash(t *testing.T) {
 		if err := tt.r.stop(true, 0); err != nil {
 			t.Fatalf("run %d: stop after a with-files-inbox loss: %v", i, err)
 		}
-		tt.wg.Wait()
+		tt.waitForSettled(t, 5*time.Second)
 	}
 }
 
@@ -902,7 +918,9 @@ func TestRecvInboxLostStopForceSettles(t *testing.T) {
 	if err := tt.r.stop(true, 0); err != nil {
 		t.Fatalf("stop after the loss: %v", err)
 	}
-	tt.wg.Wait()
+	// The loop is observably settled (a bounded wait, not an unbounded signal): performStop ran and
+	// the loop ended. If it never ran, this fails fast with a named message, not a hang.
+	tt.waitForSettled(t, 5*time.Second)
 	// The exchange was settled: the work was cancelled and the archive landed as dropped (the 300
 	// answer could not be written to a lost inbox).
 	ins := tt.inreqLines(t)
@@ -952,7 +970,7 @@ func TestRecvStopAfterLossSettlesOnce(t *testing.T) {
 			t.Fatalf("a concurrent stop errored: %v", err)
 		}
 	}
-	tt.wg.Wait()
+	tt.waitForSettled(t, 5*time.Second)
 	// Settled exactly once: one inreq line, dropped (the answer was not written to the lost inbox).
 	ins := tt.inreqLines(t)
 	if len(ins) != 1 {
