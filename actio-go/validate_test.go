@@ -5,11 +5,13 @@ package actio
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The good documents, built here rather than copied from the vectors: one per validated shape.
@@ -416,8 +418,8 @@ func TestValidatePath(t *testing.T) {
 		if err := Validate(write("actio.json", goodTeamMetadata), ""); err != nil {
 			t.Errorf("actio.json was not inferred as team metadata: %v", err)
 		}
-		if err := Validate(write("summarizer.12.json", goodAnnounce), ""); err != nil {
-			t.Errorf("an announce file name was not inferred as an announce: %v", err)
+		if err := Validate(write("summarizer.n.json", goodAnnounce), ""); err != nil {
+			t.Errorf("the protocol's announce file name <agent_id>.n.json was not inferred as an announce: %v", err)
 		}
 		if err := Validate(write("nuntium.json", goodAnnounce), ""); err != nil {
 			t.Errorf("nuntium.json was not inferred as an announce: %v", err)
@@ -472,6 +474,223 @@ func TestValidatePath(t *testing.T) {
 			t.Errorf("the error does not say the kind cannot be inferred: %v", err)
 		}
 	})
+}
+
+// TestKindOfRoundTripsTheNamesTheLibraryWrites is the guard whose absence let R2b-3 through:
+// the two file names the library itself writes into nuntium/ — <agent_id>.n.json (publishAnnounce)
+// and nuntium.json (Broadcast) — must come back as "announce" from the library's own kind
+// inference and must validate under it. If a future change to announceFileNames or KindOf breaks
+// this, the message says exactly which name stopped round-tripping.
+// TestKindOfFileFallsBackToTheBytes pins the library's own resolution: the published name
+// wins, and a name that publishes nothing is settled by the bytes — the window the CLI uses,
+// so the CLI never carries a second rule of its own.
+func TestKindOfFileFallsBackToTheBytes(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatalf("writing %s: %v", name, err)
+		}
+		return p
+	}
+	requestBody, err := os.ReadFile(filepath.Join("testdata", "vectors", "request", "valid", "01-a1-request.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A real envelope body under a non-rid stem: the bytes settle it as a request.
+	kind, err := KindOfFile(write("copy.json", string(requestBody)))
+	if err != nil || kind != KindRequest {
+		t.Errorf("KindOfFile(copy.json) = (%q, %v), want (%q, nil): the bytewise fallback is the library's", kind, err, KindRequest)
+	}
+
+	// Garbage under a nameless file: the library's diagnosis, naming the file.
+	kind, err = KindOfFile(write("junk.json", "not json at all"))
+	if err == nil || kind != "" {
+		t.Fatalf("KindOfFile(junk.json) = (%q, %v), want (\"\", an error)", kind, err)
+	}
+	if !strings.Contains(err.Error(), "not a published name and not an envelope") {
+		t.Errorf("the diagnosis %q does not say what it is: not a published name and not an envelope", err)
+	}
+
+	// A published name wins over the bytes: a request body in spec.json is a spec.
+	kind, err = KindOfFile(write("spec.json", string(requestBody)))
+	if err != nil || kind != KindSpec {
+		t.Errorf("KindOfFile(spec.json with a request body) = (%q, %v), want (%q, nil): the name decides first", kind, err, KindSpec)
+	}
+}
+
+func TestKindOfRoundTripsTheNamesTheLibraryWrites(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", nil)
+	if err := a.Start(context.Background()); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	announcePath := filepath.Join(root, "nuntium", "alpha.n.json")
+	waitFor(t, 5*time.Second, "the agent's announce file", func() bool {
+		_, err := os.Stat(announcePath)
+		return err == nil
+	})
+	if kind := KindOf(announcePath); kind != KindAnnounce {
+		t.Fatalf("KindOf(%q) = %q, want %q: the announce file name the library writes (<agent_id>.n.json, protocol :83) no longer parses as an announce", announcePath, kind, KindAnnounce)
+	}
+	if err := Validate(announcePath, ""); err != nil {
+		t.Fatalf("Validate(%q, \"\") = %v: the announce the library wrote does not validate under its own inference", announcePath, err)
+	}
+	cfg := testConfig
+	cfg.Root = root
+	cfg, err := LoadConfig(cfg) // the timers and the clock
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if err := Broadcast(cfg, "a broadcast"); err != nil {
+		t.Fatalf("Broadcast: %v", err)
+	}
+	bcastPath := filepath.Join(root, "nuntium", "nuntium.json")
+	if kind := KindOf(bcastPath); kind != KindAnnounce {
+		t.Fatalf("KindOf(%q) = %q, want %q: nuntium/nuntium.json uses the announce format (protocol :193)", bcastPath, kind, KindAnnounce)
+	}
+	if err := Validate(bcastPath, ""); err != nil {
+		t.Fatalf("Validate(%q, \"\") = %v: the broadcast the library wrote does not validate under its own inference", bcastPath, err)
+	}
+}
+
+// TestKindOfRoundTripsTheEnvelopeNamesTheLibraryWrites is the guard for the protocol's envelope
+// table: the four names <rid>.json, <rid>.can.json, <rid>.res.json and <rid>.con.json
+// (doc/actio_protocol.md:97, :99, :101, :103; the kinds at :443-446) must come back as their
+// kinds from KindOf and must validate, on the files a real exchange wrote — not on hand-made
+// names. The exchange is run for real: a timed-out call produces the cancellation, a confirmed
+// call the response and the confirmation.
+func TestKindOfRoundTripsTheEnvelopeNamesTheLibraryWrites(t *testing.T) {
+	root := t.TempDir()
+	peer := newTestAgent(t, root, "peer", nil)
+	emptyObject := json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)
+	if err := peer.Capability(Capability{Name: "echo", Description: "echoes", Parameters: emptyObject, Actio: CapabilityActio{Result: json.RawMessage("true")}},
+		func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
+			return map[string]any{}, nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.Capability(Capability{Name: "block", Description: "blocks until cancelled", Parameters: emptyObject, Actio: CapabilityActio{Result: json.RawMessage("true")}},
+		func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.Start(context.Background()); err != nil {
+		t.Fatalf("Start(peer): %v", err)
+	}
+	cfg := testConfig
+	cfg.Root = root
+	cfg, err := LoadConfig(cfg) // the timers and the clock
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	// The exchange archives its own files once the confirmation is seen (A4, protocol :628),
+	// and under a slow scheduler the archive can land before a read after the call. So the test
+	// takes each envelope from the exchange's A4 record: the receiver's diarium inreq event
+	// carries the envelopes as written (the archive's first step, :628), the json.RawMessage
+	// fields keep the library's own bytes, and the files are written under the names the
+	// protocol gives them (the rid of the request's header).
+	capDir := t.TempDir()
+	type inreq struct {
+		Event string `json:"event"`
+		Data  struct {
+			FinalStatus string          `json:"final_status"`
+			Req         json.RawMessage `json:"req"`
+			Can         json.RawMessage `json:"can"`
+			Res         json.RawMessage `json:"res"`
+			Con         json.RawMessage `json:"con"`
+		} `json:"event_data"`
+	}
+	var ridCancelled, ridConfirmed string
+	findEnv := func(rid, final string) map[string]json.RawMessage {
+		data, err := os.ReadFile(filepath.Join(root, "peer", "diarium.jsonl"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			var e inreq
+			if json.Unmarshal([]byte(line), &e) != nil || e.Event != "inreq" || e.Data.FinalStatus != final {
+				continue
+			}
+			var h struct {
+				RID RID `json:"rid"`
+			}
+			if json.Unmarshal(e.Data.Req, &h) != nil || string(h.RID) != rid {
+				continue
+			}
+			return map[string]json.RawMessage{"req": e.Data.Req, "can": e.Data.Can, "res": e.Data.Res, "con": e.Data.Con}
+		}
+		t.Fatalf("the diarium has no archived %s exchange with rid %s", final, rid)
+		return nil
+	}
+	writeEnv := func(rid, final, key, suffix string) string {
+		raw := findEnv(rid, final)[key]
+		if len(raw) == 0 || string(raw) == "null" {
+			t.Fatalf("the diarium's record of the %s exchange has no %s envelope", final, key)
+		}
+		p := filepath.Join(capDir, rid+suffix)
+		if err := os.WriteFile(p, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// A timed-out call: the requestor writes the request and the cancellation into the
+	// receiver's inbox and gives up; the exchange is archived as cancelled (:739).
+	if _, err := Call(context.Background(), cfg, AgentID("src"), AgentID("peer"), "block", map[string]any{}, RequestOptions{Timeout: 50 * time.Millisecond}); err != nil {
+		t.Fatalf("Call(block): %v", err)
+	}
+	// A confirmed call: the response and the confirmation join the exchange in the
+	// receiver's inbox (protocol :508); it is archived as confirmed.
+	outcome, err := Call(context.Background(), cfg, AgentID("src"), AgentID("peer"), "echo", map[string]any{}, RequestOptions{Timeout: 5 * time.Second})
+	if err != nil || outcome.Response == nil {
+		t.Fatalf("Call(echo) = (%v, %v): no confirmed response", outcome, err)
+	}
+	waitFor(t, 5*time.Second, "both exchanges to be archived in the receiver's diarium", func() bool {
+		data, err := os.ReadFile(filepath.Join(root, "peer", "diarium.jsonl"))
+		if err != nil {
+			return false
+		}
+		ridCancelled, ridConfirmed = "", ""
+		for _, line := range strings.Split(string(data), "\n") {
+			var e inreq
+			if json.Unmarshal([]byte(line), &e) != nil || e.Event != "inreq" {
+				continue
+			}
+			var h struct {
+				RID RID `json:"rid"`
+			}
+			if json.Unmarshal(e.Data.Req, &h) != nil {
+				continue
+			}
+			switch e.Data.FinalStatus {
+			case "cancelled":
+				ridCancelled = string(h.RID)
+			case "confirmed":
+				ridConfirmed = string(h.RID)
+			}
+		}
+		return ridCancelled != "" && ridConfirmed != ""
+	})
+
+	for path, want := range map[string]string{
+		writeEnv(ridCancelled, "cancelled", "req", ".json"):     KindRequest,      // <rid>.json, protocol :97
+		writeEnv(ridCancelled, "cancelled", "can", ".can.json"): KindCancellation, // <rid>.can.json, :99
+		writeEnv(ridConfirmed, "confirmed", "res", ".res.json"): KindResponse,     // <rid>.res.json, :101
+		writeEnv(ridConfirmed, "confirmed", "con", ".con.json"): KindConfirmation, // <rid>.con.json, :103
+	} {
+		if got := KindOf(path); got != want {
+			t.Errorf("KindOf(%q) = %q, want %q: a protocol envelope name (doc/actio_protocol.md:97, :99, :101, :103) no longer parses as its kind", path, got, want)
+		}
+		if err := Validate(path, ""); err != nil {
+			t.Errorf("Validate(%q, \"\") = %v: the envelope the exchange wrote does not validate under its own inference", path, err)
+		}
+	}
 }
 
 // What a rejection's reason says: it must not depend on the working directory.

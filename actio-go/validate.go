@@ -241,7 +241,7 @@ func Validate(path string, kind string) error {
 		return err
 	}
 	if kind == "" {
-		kind = kindFromName(path)
+		kind = KindOf(path)
 		if kind == "" {
 			k, ok := envelopeKind(raw)
 			if !ok {
@@ -275,13 +275,36 @@ func Validate(path string, kind string) error {
 	return err
 }
 
-// announceFileNames matches the announced file names: nuntium/<agent_id>.n.json (the agent id has
-// no dots) and the reserved nuntium/nuntium.json (*Announcement and Discovery*).
-var announceFileNames = regexp.MustCompile(`^[a-zA-Z0-9_-]+\.\d+\.json$`)
+// announceFileNames matches the protocol's announce file name: the agent id (1–32 characters of
+// [a-zA-Z0-9_-], common.schema.json $defs/agentId) followed by the literal ".n.json" —
+// doc/actio_protocol.md:83, :132, :168 and :181 name it <agent_id>.n.json, and publishAnnounce
+// writes exactly string(id)+".n.json" (status.go). The broadcast file nuntium/nuntium.json uses
+// the same format (:193) and is mapped by name in KindOf.
+var announceFileNames = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,32}\.n\.json$`)
 
-// kindFromName names the kind from a published file name, "" when the name publishes nothing.
-func kindFromName(path string) string {
-	switch filepath.Base(path) {
+// ridShape is the rid as the protocol publishes it: a ULID in canonical upper-case Crockford
+// base32 (common.schema.json $defs/rid — the same pattern the library's tests already use).
+var ridShape = regexp.MustCompile(`^[0-7][0-9A-HJKMNP-TV-Z]{25}$`)
+
+// envelopeSuffixes is the protocol's envelope-name table, longest suffix first: <rid>.json the
+// request — it carries a request or a command (request.schema.json's description, protocol
+// :36) — <rid>.can.json the cancellation, <rid>.res.json the response, <rid>.con.json the
+// confirmation (doc/actio_protocol.md:97, :99, :101, :103; the kind words at :443-446).
+var envelopeSuffixes = [][2]string{
+	{".can.json", KindCancellation},
+	{".res.json", KindResponse},
+	{".con.json", KindConfirmation},
+	{".json", KindRequest},
+}
+
+// KindOf is the protocol's name→kind table: the team files by name, the announce
+// <agent_id>.n.json and nuntium/nuntium.json, and the four envelope names <rid>.json,
+// <rid>.can.json, <rid>.res.json and <rid>.con.json (doc/actio_protocol.md:97, :99, :101,
+// :103; the kinds at :443-446) — "" when the name publishes nothing. The CLI takes its kind
+// from here: it must not carry a second copy of the rule.
+func KindOf(path string) string {
+	base := filepath.Base(path)
+	switch base {
 	case FileSpec:
 		return KindSpec
 	case FileStatus:
@@ -293,8 +316,13 @@ func kindFromName(path string) string {
 	case "nuntium.json":
 		return KindAnnounce
 	}
-	if announceFileNames.MatchString(filepath.Base(path)) {
+	if announceFileNames.MatchString(base) {
 		return KindAnnounce
+	}
+	for _, e := range envelopeSuffixes {
+		if strings.HasSuffix(base, e[0]) && ridShape.MatchString(base[:len(base)-len(e[0])]) {
+			return e[1]
+		}
 	}
 	return ""
 }
@@ -310,6 +338,30 @@ func validateDiariumFile(path string, raw []byte) error {
 		}
 	}
 	return nil
+}
+
+// resolveKind is Validate's name→bytes resolution: the published name first (KindOf), then
+// the bytes (envelopeKind). It is shared with KindOfFile, so the library's diagnosis of a
+// nameless file has one home.
+func resolveKind(path string, raw []byte) (string, error) {
+	if kind := KindOf(path); kind != "" {
+		return kind, nil
+	}
+	if k, ok := envelopeKind(raw); ok {
+		return k, nil
+	}
+	return "", fmt.Errorf("actio: cannot infer the kind of %s: not a published name and not an envelope", path)
+}
+
+// KindOfFile resolves the kind the way Validate does — the published name first, then the
+// bytes — and is the CLI's window into that resolution: the CLI prints what the library
+// settled on and never re-decides what a nameless file is.
+func KindOfFile(path string) (string, error) {
+	raw, err := readFile(path)
+	if err != nil {
+		return "", err
+	}
+	return resolveKind(path, raw)
 }
 
 // envelopeKind names the body key of an envelope file: exactly one of the four, or ok false when

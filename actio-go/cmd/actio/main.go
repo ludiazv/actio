@@ -12,7 +12,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -425,10 +424,6 @@ func broadcastCmd(cfg actio.Config, rest []string, out, errW io.Writer) int {
 // validateKinds is the reference's validator set, in its order (cli.ts VALIDATORS).
 var validateKinds = []string{"actio", "spec", "status", "announce", "request", "cancellation", "response", "confirmation", "diarium"}
 
-// announcedName is the library's announced-file name rule (validate.go): a file named
-// <agent-id>.<n>.json holds an announce.
-var announcedName = regexp.MustCompile(`^[a-zA-Z0-9_-]+\.\d+\.json$`)
-
 // validate <file> [--as kind] (cli.ts validate): OK <kind> on stdout, the reason on stderr, and
 // the exit code 1.
 func validateCmd(cfg actio.Config, rest []string, as string, out, errW io.Writer) int {
@@ -437,20 +432,21 @@ func validateCmd(cfg actio.Config, rest []string, as string, out, errW io.Writer
 		return 1
 	}
 	file := rest[0]
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		fmt.Fprintf(errW, "cannot read %q: %v\n", file, err)
+		return 1
+	}
 	kind := as
 	if kind == "" {
-		kind = kindFromName(file) // the reference: infer from the file name, or usage out
-		if kind == "" {
-			noValidator(errW, filepath.Base(file))
+		// The name publishes nothing (or nothing at all): let the library's own resolution
+		// answer — name first, then bytes — and print what it settled on.
+		if kind, err = actio.KindOfFile(file); err != nil {
+			fmt.Fprintln(errW, err)
 			return 1
 		}
 	} else if !kindIn(validateKinds, kind) {
 		noValidator(errW, kind)
-		return 1
-	}
-	raw, err := os.ReadFile(file)
-	if err != nil {
-		fmt.Fprintf(errW, "cannot read %q: %v\n", file, err)
 		return 1
 	}
 	if verr := actio.Validate(file, kind); verr != nil {
@@ -477,36 +473,6 @@ func kindIn(kinds []string, k string) bool {
 		}
 	}
 	return false
-}
-
-// kindFromName is the CLI's kind inference (cli.ts kindOf): the file name decides. Two
-// corrections on top of the reference: an announced name is the protocol's <agent-id>.<n>.json
-// (the reference's literal ".n.json" suffix is a placeholder no real file carries), and
-// nuntium.json validates as the signal kind "actio" (the reference's "announce" can never pass
-// on a signal).
-func kindFromName(path string) string {
-	base := filepath.Base(path)
-	switch {
-	case base == "spec.json":
-		return "spec"
-	case base == "status.json":
-		return "status"
-	case base == "actio.json", base == "nuntium.json":
-		return "actio"
-	case strings.HasSuffix(base, "diarium.jsonl"):
-		return "diarium"
-	case announcedName.MatchString(base):
-		return "announce"
-	case strings.HasSuffix(base, ".can.json"):
-		return "cancellation"
-	case strings.HasSuffix(base, ".res.json"):
-		return "response"
-	case strings.HasSuffix(base, ".con.json"):
-		return "confirmation"
-	case strings.HasSuffix(base, ".json"):
-		return "request"
-	}
-	return ""
 }
 
 // countNonEmpty counts the non-blank lines of a diarium, as the reference counts them.

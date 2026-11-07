@@ -4,12 +4,15 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"actio-go"
 )
 
 // newCLI points ACTIO_DIR at a fresh root and returns a runner: one call to the CLI, with the
@@ -167,40 +170,227 @@ func TestRunValidate(t *testing.T) {
 			t.Errorf("got exit %d out %q, want 0 / OK status", code, out)
 		}
 	})
-	t.Run("a response file by its name", func(t *testing.T) {
-		raw, err := os.ReadFile("../../testdata/vectors/response/valid/01-a1-normal.json")
+	// The four envelope files a real exchange wrote (doc/actio_protocol.md:97, :99, :101, :103):
+	// each validates by its name alone — no --as — and the response also by --as, so both routes
+	// are pinned. The names come from an exchange the library ran, not from hand-made files.
+	t.Run("the envelopes an exchange wrote", func(t *testing.T) {
+		cfg, err := actio.LoadConfig(actio.Config{
+			HeartbeatInterval: 50 * time.Millisecond,
+			AnnounceDelay:     5 * time.Millisecond,
+			NuntiumDebounce:   10 * time.Millisecond,
+			StopGrace:         2 * time.Second,
+			CancelWaitTimeout: 300 * time.Millisecond,
+			ConfirmTimeout:    5 * time.Second,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		f := filepath.Join(root, "some.res.json")
-		writeFile(t, f, string(raw))
-		code, out, _ := cli("validate", f)
+		emptyObject := `{"type":"object","properties":{},"additionalProperties":false}`
+		peer, err := actio.New(actio.Options{ID: "peer", AcceptsCommandsFrom: []string{}, Config: cfg})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := peer.Capability(actio.Capability{Name: "echo", Description: "echoes", Parameters: json.RawMessage(emptyObject), Actio: actio.CapabilityActio{Result: json.RawMessage("true")}},
+			func(ctx context.Context, params json.RawMessage, call *actio.CallContext) (any, error) {
+				return map[string]any{}, nil
+			}); err != nil {
+			t.Fatal(err)
+		}
+		if err := peer.Capability(actio.Capability{Name: "block", Description: "blocks until cancelled", Parameters: json.RawMessage(emptyObject), Actio: actio.CapabilityActio{Result: json.RawMessage("true")}},
+			func(ctx context.Context, params json.RawMessage, call *actio.CallContext) (any, error) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}); err != nil {
+			t.Fatal(err)
+		}
+		if err := peer.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := peer.Stop(stopCtx, actio.StopOptions{Force: true}); err != nil {
+				t.Errorf("cleanup Stop(peer): %v", err)
+			}
+		})
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(filepath.Join(root, "peer", "status.json")); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the peer agent did not start")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// The exchange archives its own files once the confirmation is seen (A4, protocol :628),
+		// and under a slow scheduler the archive can land before a read after the call. So the
+		// envelopes are taken from the exchange's A4 record: the receiver's diarium inreq event
+		// carries the envelopes as written (the archive's first step, :628), and the files are
+		// written under the names the protocol gives them (the rid of the request's header).
+		capDir := t.TempDir()
+		type inreq struct {
+			Event string `json:"event"`
+			Data  struct {
+				FinalStatus string          `json:"final_status"`
+				Req         json.RawMessage `json:"req"`
+				Can         json.RawMessage `json:"can"`
+				Res         json.RawMessage `json:"res"`
+				Con         json.RawMessage `json:"con"`
+			} `json:"event_data"`
+		}
+		var ridCancelled, ridConfirmed string
+		findEnv := func(rid, final string) map[string]json.RawMessage {
+			data, err := os.ReadFile(filepath.Join(root, "peer", "diarium.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, line := range strings.Split(string(data), "\n") {
+				var e inreq
+				if json.Unmarshal([]byte(line), &e) != nil || e.Event != "inreq" || e.Data.FinalStatus != final {
+					continue
+				}
+				var h struct {
+					RID string `json:"rid"`
+				}
+				if json.Unmarshal(e.Data.Req, &h) != nil || h.RID != rid {
+					continue
+				}
+				return map[string]json.RawMessage{"req": e.Data.Req, "can": e.Data.Can, "res": e.Data.Res, "con": e.Data.Con}
+			}
+			t.Fatalf("the diarium has no archived %s exchange with rid %s", final, rid)
+			return nil
+		}
+		writeEnv := func(rid, final, key, suffix string) string {
+			raw := findEnv(rid, final)[key]
+			if len(raw) == 0 || string(raw) == "null" {
+				t.Fatalf("the diarium's record of the %s exchange has no %s envelope", final, key)
+			}
+			p := filepath.Join(capDir, rid+suffix)
+			if err := os.WriteFile(p, raw, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}
+
+		// A timed-out call leaves the request and the cancellation in the receiver's inbox;
+		// the exchange is archived as cancelled (:739).
+		if _, err := actio.Call(context.Background(), cfg, "src", "peer", "block", map[string]any{}, actio.RequestOptions{Timeout: 50 * time.Millisecond}); err != nil {
+			t.Fatalf("Call(block): %v", err)
+		}
+		// A confirmed call: the response and the confirmation join the exchange in the
+		// receiver's inbox (protocol :508); it is archived as confirmed.
+		outcome, err := actio.Call(context.Background(), cfg, "src", "peer", "echo", map[string]any{}, actio.RequestOptions{Timeout: 5 * time.Second})
+		if err != nil || outcome.Response == nil {
+			t.Fatalf("Call(echo) = (%v, %v): no confirmed response", outcome, err)
+		}
+		deadline = time.Now().Add(5 * time.Second)
+		for {
+			data, err := os.ReadFile(filepath.Join(root, "peer", "diarium.jsonl"))
+			ridCancelled, ridConfirmed = "", ""
+			if err == nil {
+				for _, line := range strings.Split(string(data), "\n") {
+					var e inreq
+					if json.Unmarshal([]byte(line), &e) != nil || e.Event != "inreq" {
+						continue
+					}
+					var h struct {
+						RID string `json:"rid"`
+					}
+					if json.Unmarshal(e.Data.Req, &h) != nil {
+						continue
+					}
+					switch e.Data.FinalStatus {
+					case "cancelled":
+						ridCancelled = h.RID
+					case "confirmed":
+						ridConfirmed = h.RID
+					}
+				}
+			}
+			if ridCancelled != "" && ridConfirmed != "" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("both exchanges were not archived in the receiver's diarium")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		for _, row := range [][2]string{
+			{writeEnv(ridCancelled, "cancelled", "req", ".json"), "OK request"},          // <rid>.json, protocol :97
+			{writeEnv(ridCancelled, "cancelled", "can", ".can.json"), "OK cancellation"}, // <rid>.can.json, :99
+			{writeEnv(ridConfirmed, "confirmed", "res", ".res.json"), "OK response"},     // <rid>.res.json, :101
+			{writeEnv(ridConfirmed, "confirmed", "con", ".con.json"), "OK confirmation"}, // <rid>.con.json, :103
+		} {
+			code, out, errOut := cli("validate", row[0]) // no --as: the name alone must decide
+			if code != 0 || strings.TrimSpace(out) != row[1] {
+				t.Errorf("validate %s: got exit %d out %q err %q, want 0 / %s (the envelope's own name, no --as)", filepath.Base(row[0]), code, out, errOut, row[1])
+			}
+		}
+		// the response also by --as: both routes pinned
+		resCopy := filepath.Join(capDir, ridConfirmed+".res.json")
+		code, out, _ := cli("validate", resCopy, "--as", "response")
 		if code != 0 || strings.TrimSpace(out) != "OK response" {
-			t.Errorf("got exit %d out %q, want 0 / OK response", code, out)
+			t.Errorf("got exit %d out %q, want 0 / OK response by --as", code, out)
 		}
 	})
-	t.Run("an announced file by its name", func(t *testing.T) {
-		raw, err := os.ReadFile("../../testdata/vectors/announce/valid/01-active.json")
+	// The announce file the agent's own test run wrote: a name something real produced, not one
+	// invented by hand (protocol: <agent_id>.n.json).
+	t.Run("the announce an agent run wrote", func(t *testing.T) {
+		cfg, err := actio.LoadConfig(actio.Config{
+			HeartbeatInterval: 50 * time.Millisecond,
+			AnnounceDelay:     5 * time.Millisecond,
+			NuntiumDebounce:   10 * time.Millisecond,
+			StopGrace:         2 * time.Second,
+			CancelWaitTimeout: 2 * time.Second,
+			ConfirmTimeout:    5 * time.Second,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		f := filepath.Join(root, "alpha.1.json")
-		writeFile(t, f, string(raw))
-		code, out, _ := cli("validate", f)
+		agent, err := actio.New(actio.Options{ID: "announcer", AcceptsCommandsFrom: []string{}, Config: cfg})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := agent.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := agent.Stop(stopCtx, actio.StopOptions{Force: true}); err != nil {
+				t.Errorf("cleanup Stop(announcer): %v", err)
+			}
+		})
+		announcePath := filepath.Join(root, "nuntium", "announcer.n.json")
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(announcePath); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the agent did not write its announce file %s", announcePath)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		code, out, _ := cli("validate", announcePath)
 		if code != 0 || strings.TrimSpace(out) != "OK announce" {
 			t.Errorf("got exit %d out %q, want 0 / OK announce", code, out)
 		}
 	})
-	t.Run("the signal file infers the signal kind", func(t *testing.T) {
-		raw, err := os.ReadFile("../../testdata/vectors/actio/valid/01-minimal.json")
-		if err != nil {
-			t.Fatal(err)
+	// nuntium/nuntium.json, written by the broadcast case: the same format as the announce files
+	// (protocol :193), so it validates as an announce.
+	t.Run("the broadcast file is an announce", func(t *testing.T) {
+		code, _, errOut := cli("broadcast", "fix16: the broadcast file is an announce")
+		if code != 0 {
+			t.Fatalf("broadcast: %s", errOut)
 		}
-		f := filepath.Join(root, "nuntium.json")
-		writeFile(t, f, string(raw))
+		f := filepath.Join(root, "nuntium", "nuntium.json")
 		code, out, _ := cli("validate", f)
-		if code != 0 || strings.TrimSpace(out) != "OK actio" {
-			t.Errorf("got exit %d out %q, want 0 / OK actio (the reference maps nuntium.json to announce, which can never pass)", code, out)
+		if code != 0 || strings.TrimSpace(out) != "OK announce" {
+			t.Errorf("got exit %d out %q, want 0 / OK announce", code, out)
 		}
 	})
 	t.Run("an invalid status", func(t *testing.T) {
@@ -243,20 +433,35 @@ func TestRunValidate(t *testing.T) {
 			t.Errorf("got exit %d err %q, want 1 / a schema reason", code, errOut)
 		}
 	})
-	t.Run("not valid JSON under a bare .json name", func(t *testing.T) {
+	// The name publishes nothing: the library's own fallback decides (name, then bytes) and the
+	// CLI prints what it settled on. A real envelope body under a non-rid stem is a request —
+	// the same file the TS CLI calls `OK request` on.
+	t.Run("a nameless file with a real envelope body validates by its bytes", func(t *testing.T) {
+		body, err := os.ReadFile("../../testdata/vectors/request/valid/01-a1-request.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := filepath.Join(root, "copy.json")
+		writeFile(t, f, string(body))
+		code, out, errOut := cli("validate", f)
+		if code != 0 || strings.TrimSpace(out) != "OK request" {
+			t.Errorf("got exit %d out %q err %q, want 0 / OK request (the library's bytewise fallback, not a CLI rule)", code, out, errOut)
+		}
+	})
+	t.Run("a nameless file with garbage gets the library's diagnosis", func(t *testing.T) {
 		bad := filepath.Join(root, "junk.json")
 		writeFile(t, bad, "not json at all")
 		code, _, errOut := cli("validate", bad)
-		if code != 1 || !strings.Contains(errOut, "request.schema.json") {
-			t.Errorf("got exit %d err %q, want 1 / a request schema reason (any .json infers request, as in the reference)", code, errOut)
+		if code != 1 || !strings.Contains(errOut, "not a published name and not an envelope") {
+			t.Errorf("got exit %d err %q, want 1 / the library's diagnosis (the CLI does not decide \"no validator\" itself)", code, errOut)
 		}
 	})
-	t.Run("no validator for the name", func(t *testing.T) {
+	t.Run("a nameless file that is valid JSON but no envelope", func(t *testing.T) {
 		f := filepath.Join(root, "notes.txt")
 		writeFile(t, f, "hello")
 		code, _, errOut := cli("validate", f)
-		if code != 1 || !strings.Contains(errOut, `no validator for "notes.txt"`) {
-			t.Errorf("got exit %d err %q, want 1 / no validator", code, errOut)
+		if code != 1 || !strings.Contains(errOut, "not a published name and not an envelope") {
+			t.Errorf("got exit %d err %q, want 1 / the library's diagnosis", code, errOut)
 		}
 	})
 	t.Run("an unknown --as kind", func(t *testing.T) {
