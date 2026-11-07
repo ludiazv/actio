@@ -383,6 +383,14 @@ func (a *Agent) stopInternal(ctx context.Context, opts StopOptions, closeDone bo
 		return ctx.Err()
 	}
 	st.req.stop()
+	// D-9 (v1.11): the outbound abandons, then C1. The stop waits, within its ctx, for the exchanges
+	// it abandoned so their outreq lines land before the inactive, as in TS. This is a guarantee, not
+	// a race we usually win: each exchange writes its outreq line before its deferred inflight.Done(),
+	// so the wait is a happens-before edge over the line. D-9's other half: a blocked exchange costs a
+	// goroutine and Stop returns ctx.Err().
+	if err := waitBounded(ctx, &st.req.inflight); err != nil {
+		return err
+	}
 	if st.discClosed.CompareAndSwap(false, true) {
 		close(st.discStop) // the discovery loop: no more scans, the pending debounce is dropped
 	}

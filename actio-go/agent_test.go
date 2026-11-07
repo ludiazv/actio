@@ -1412,11 +1412,12 @@ func TestAgentStartFailsAtFirstPublishReturns(t *testing.T) {
 }
 
 // TestAgentSecondStartBadConfigReturns: a Start that fails at the configuration returns its error.
-// A weak pin: the config failure precedes the half-started state the run-per-Start restructure
-// addresses, so it does not distinguish the restructure from the pre-fix code — the strong pins
-// are TestAgentStartFailsAtFirstPublishReturns (the running rollback) and
-// TestAgentStopDuringStartNoCrash. New arms no run, so a second Start has no dead heartbeat
-// behind it to hang on.
+// In the current lifecycle, one run is one agentState, published once through one atomic.Pointer, and
+// the lifecycle gate serializes Start against the stops. A config failure happens before the new run is
+// published, so a second Start leaves no half-started run: the previous run is already stopped and the
+// gate is released when Start returns. A weak pin for the lifecycle (the strong pins are the
+// running-rollback and the stop-during-start tests); it guards that a failed Start returns its error
+// and does not hang.
 func TestAgentSecondStartBadConfigReturns(t *testing.T) {
 	root := t.TempDir()
 	a := newTestAgent(t, root, "alpha", nil)
@@ -1434,6 +1435,85 @@ func TestAgentSecondStartBadConfigReturns(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("the second Start succeeded with a bad configuration")
+	}
+}
+
+// TestAgentStopWritesAbandonLinesBeforeInactive: D-9 (v1.11) — the stop waits, within its ctx, for the
+// outbound exchanges it abandoned, so their outreq lines come before the inactive, as in TS. Over the
+// probe's 20 stops × 3 in-flight requests, zero abandoned lines may come after the inactive: each
+// exchange writes its outreq line before its deferred inflight.Done(), so the stop's wait is a
+// happens-before edge over the line, not a race we usually win. A stop that cannot finish returns
+// through its ctx (D-9's other half), so the test is bounded.
+func TestAgentStopWritesAbandonLinesBeforeInactive(t *testing.T) {
+	const (
+		stopIterations = 20
+		inFlightReqs   = 3
+		settleSleep    = 50 * time.Millisecond
+		startTimeout   = 5 * time.Second
+		stopTimeout    = 10 * time.Second
+		requestTimeout = 60 * time.Second
+		busyBound      = 5 * time.Second
+	)
+	after, total := 0, 0
+	for i := 0; i < stopIterations; i++ {
+		root := t.TempDir()
+		a := newTestAgent(t, root, "alpha", nil)
+		b := newTestAgent(t, root, "beta", nil)
+		release := make(chan struct{})
+		if err := b.Capability(echoCap(), func(ctx context.Context, p json.RawMessage, c *CallContext) (any, error) {
+			<-release
+			return map[string]any{"out": "x"}, nil
+		}); err != nil {
+			t.Fatalf("Capability: %v", err)
+		}
+		if err := a.Start(startCtx(t)); err != nil {
+			t.Fatalf("Start(alpha): %v", err)
+		}
+		if err := b.Start(startCtx(t)); err != nil {
+			t.Fatalf("Start(beta): %v", err)
+		}
+		back := make(chan struct{}, inFlightReqs)
+		for j := 0; j < inFlightReqs; j++ {
+			go func() {
+				a.Request(context.Background(), "beta", "echo", map[string]any{"in": "x"}, RequestOptions{Timeout: requestTimeout})
+				back <- struct{}{}
+			}()
+		}
+		waitFor(t, busyBound, "beta to turn busy", func() bool { return statusState(t, root, "beta") == "busy" })
+		time.Sleep(settleSleep)
+		var stopErr error
+		if !within(stopTimeout, func() { stopErr = a.Stop(ctxN(stopTimeout), StopOptions{}) }) {
+			t.Fatalf("stop %d did not return within its ctx", i)
+		}
+		if stopErr != nil {
+			t.Fatalf("stop %d: %v", i, stopErr)
+		}
+		for j := 0; j < inFlightReqs; j++ {
+			<-back
+		}
+		read, err := ReadDiarium(filepath.Join(root, "alpha"))
+		if err != nil {
+			t.Fatalf("diarium: %v", err)
+		}
+		seen := false
+		for _, line := range read.Lines {
+			if line.Event == "status" && string(line.EventData) == `"inactive"` {
+				seen = true
+			}
+			if line.Event == "outreq" && strings.Contains(string(line.EventData), `"final_status":"abandoned"`) {
+				total++
+				if seen {
+					after++
+				}
+			}
+		}
+		close(release)
+		if err := b.Stop(ctxN(stopTimeout), StopOptions{Force: true}); err != nil {
+			t.Fatalf("Stop(beta) %d: %v", i, err)
+		}
+	}
+	if after != 0 {
+		t.Fatalf("%d of %d abandoned lines came after inactive (want 0)", after, total)
 	}
 }
 

@@ -25,8 +25,9 @@ import (
 
 // requestor is the lane-B machinery of one agent (or of one CLI call).
 type requestor struct {
-	st     *agentState
-	stopCh chan struct{}
+	inflight sync.WaitGroup // the exchanges in B1–B5: the stop waits for their abandon before C1 (D-9)
+	st       *agentState
+	stopCh   chan struct{}
 
 	// The mutex of the outbound-exchange count (D-8): the third of the four the concurrency
 	// contract allows. It also guards the two dedup sets and the stopped flag; nothing else in
@@ -94,11 +95,18 @@ func (r *requestor) request(ctx context.Context, dst AgentID, name string, param
 	// The outbound count (for busy, D-8) is kept under its own mutex, the third of the four.
 	r.mu.Lock()
 	r.out++
+	tracked := !r.stopped // after stop, nobody waits: the exchange abandons at its first select
+	if tracked {
+		r.inflight.Add(1)
+	}
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
 		r.out--
 		r.mu.Unlock()
+		if tracked {
+			r.inflight.Done()
+		}
 	}()
 
 	// D-6: the timeout timer; a zero timeout waits until ctx is done.
