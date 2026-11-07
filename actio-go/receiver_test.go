@@ -257,19 +257,6 @@ func (tt *recvTest) errorResult(t *testing.T, b ResponseBody) ErrorResult {
 	return er
 }
 
-func (tt *recvTest) waitForInboxEmpty(t *testing.T, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		entries, _ := os.ReadDir(tt.st.folders.inbox)
-		if len(entries) == 0 {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("the inbox is not empty after the timeout")
-}
-
 func (tt *recvTest) waitForBusy(t *testing.T, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -295,6 +282,22 @@ func (tt *recvTest) inreqLines(t *testing.T) []DiariumLine {
 		}
 	}
 	return out
+}
+
+// waitForInreqLines blocks until the diarium holds at least n inreq lines, or the timeout: the
+// archive has landed. It observes the condition the test asserts (the line), not an earlier side
+// effect (the inbox becoming empty). archive removes the inbox files before it writes the line, so
+// waiting on the empty inbox can read the diarium in the gap and see 0 lines under load.
+func (tt *recvTest) waitForInreqLines(t *testing.T, n int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(tt.inreqLines(t)) >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("the diarium has %d inreq lines, want at least %d, after %v", len(tt.inreqLines(t)), n, timeout)
 }
 
 // logLines is the diarium's log lines (the `log` event), in order.
@@ -545,7 +548,7 @@ func TestRecvNormalExchangeConfirmed(t *testing.T) {
 		t.Fatalf("the result is not the echoed parameters: %v", b.Result)
 	}
 	tt.writeConfirmation(t, rid)
-	tt.waitForInboxEmpty(t, 3*time.Second)
+	tt.waitForInreqLines(t, 1, 3*time.Second)
 	lines := tt.inreqLines(t)
 	if len(lines) != 1 {
 		t.Fatalf("want one inreq line, got %d", len(lines))
@@ -584,7 +587,7 @@ func TestRecvNoDoubleAnswerHeaderMismatch(t *testing.T) {
 	// The intruder is ignored (D-11); the exchange archives on the confirmation with its OWN
 	// response (the first one), not the intruder's.
 	tt.writeConfirmation(t, rid)
-	tt.waitForInboxEmpty(t, 3*time.Second)
+	tt.waitForInreqLines(t, 1, 3*time.Second)
 	lines := tt.inreqLines(t)
 	if len(lines) != 1 {
 		t.Fatalf("want one inreq line, got %d", len(lines))
@@ -635,7 +638,7 @@ func TestRecvConfirmationTimeoutCompletes(t *testing.T) {
 	tt.writeRequest(t, rid, "echo", json.RawMessage(`{}`), 0)
 	tt.readResponse(t, rid)
 	// No confirmation: the archive happens on the timeout, as completed.
-	tt.waitForInboxEmpty(t, 3*time.Second)
+	tt.waitForInreqLines(t, 1, 3*time.Second)
 	lines := tt.inreqLines(t)
 	if len(lines) != 1 {
 		t.Fatalf("want one inreq line, got %d", len(lines))
@@ -684,7 +687,7 @@ func TestRecvCancellationDuringWork(t *testing.T) {
 		t.Fatalf("want a cancellation response, got %+v", b)
 	}
 	tt.writeConfirmation(t, rid)
-	tt.waitForInboxEmpty(t, 3*time.Second)
+	tt.waitForInreqLines(t, 1, 3*time.Second)
 	var env ExchangeEnvelopes
 	if err := json.Unmarshal(tt.inreqLines(t)[0].EventData, &env); err != nil {
 		t.Fatal(err)
@@ -787,7 +790,7 @@ func TestRecvStopForceAnswers300(t *testing.T) {
 	if err := tt.r.stop(true, 0); err != nil {
 		t.Fatal(err)
 	}
-	tt.waitForInboxEmpty(t, 3*time.Second) // the stop archives the exchange
+	tt.waitForInreqLines(t, 1, 3*time.Second) // the stop archives the exchange
 	lines := tt.inreqLines(t)
 	if len(lines) != 1 {
 		t.Fatalf("want one inreq line, got %d", len(lines))
@@ -1030,7 +1033,7 @@ func TestRecvDroppedCommandArchivesDropped(t *testing.T) {
 	// An unknown command from the listed source: dropped at D4.
 	tt.writeCommand(t, rid, "nosuchcmd", json.RawMessage(`{}`))
 	// The command is archived: its file is deleted and the diarium holds an inreq line.
-	tt.waitForInboxEmpty(t, 3*time.Second)
+	tt.waitForInreqLines(t, 1, 3*time.Second)
 	ins := tt.inreqLines(t)
 	if len(ins) != 1 {
 		t.Fatalf("the inreq diarium has %d lines, want 1 (the dropped command)", len(ins))
@@ -1114,7 +1117,7 @@ func TestRecvDiariumEnvelopesAsExchanged(t *testing.T) {
 	resRaw := tt.waitForFile(t, tt.resPath(rid), 3*time.Second) // the receiver's own response, as written
 	conRaw := craftedCon(rid, tt.now())
 	tt.writeRawEnvelope(t, string(rid)+".con.json", conRaw)
-	tt.waitForInboxEmpty(t, 3*time.Second)
+	tt.waitForInreqLines(t, 1, 3*time.Second)
 	lines := tt.inreqLines(t)
 	if len(lines) != 1 {
 		t.Fatalf("want one inreq line, got %d", len(lines))
@@ -1149,7 +1152,7 @@ func TestRecvRetrackKeepsEnvelopes(t *testing.T) {
 	tt.writeRawEnvelope(t, string(rid)+".res.json", resRaw)
 	tt.writeRawEnvelope(t, string(rid)+".can.json", canRaw)
 	tt.start()
-	tt.waitForInboxEmpty(t, 3*time.Second)
+	tt.waitForInreqLines(t, 1, 3*time.Second)
 	lines := tt.inreqLines(t)
 	if len(lines) != 1 {
 		t.Fatalf("want one inreq line, got %d", len(lines))
@@ -1188,7 +1191,7 @@ func TestRecvStaleResponseAtStartDoesNotRunWork(t *testing.T) {
 	tt.writeRawEnvelope(t, string(rid)+".res.json", resRaw)   // the previous run's answer
 	tt.writeRequest(t, rid, "echo", json.RawMessage(`{}`), 0) // and its request
 	tt.start()
-	tt.waitForInboxEmpty(t, 3*time.Second)
+	tt.waitForInreqLines(t, 1, 3*time.Second)
 	if tt.calls() != 0 {
 		t.Fatalf("the handler ran %d times, want 0: the exchange was already answered", tt.calls())
 	}
