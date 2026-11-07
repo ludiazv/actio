@@ -229,7 +229,7 @@ func TestE2UnknownCapability(t *testing.T) {
 		t.Fatalf("the error result: %v", err)
 	}
 	if er.Code == nil || *er.Code != 101 {
-		t.Errorf("the code: %v (want 101), msg %q", er.Code, er.Msg)
+		t.Errorf("the code: %v (want 101), msg %q", *er.Code, er.Msg)
 	}
 }
 
@@ -389,7 +389,7 @@ func e2eExpectCode(t *testing.T, root, src, dst, name string, params any, want i
 		t.Fatalf("the error result: %v", err)
 	}
 	if er.Code == nil || *er.Code != want {
-		t.Errorf("the code: %v (want %d), msg %q", er.Code, want, er.Msg)
+		t.Errorf("the code: %v (want %d), msg %q", *er.Code, want, er.Msg)
 	}
 }
 
@@ -426,7 +426,7 @@ func e2eExpectInreqCode(t *testing.T, root, id string, wantCode int) {
 			t.Fatalf("the error result: %v", err)
 		}
 		if er.Code == nil || *er.Code != wantCode {
-			t.Errorf("the code: %v (want %d), msg %q", er.Code, wantCode, er.Msg)
+			t.Errorf("the code: %v (want %d), msg %q", *er.Code, wantCode, er.Msg)
 		}
 		return
 	}
