@@ -90,7 +90,10 @@ func newRecvTest(t *testing.T, confirmTimeout time.Duration) *recvTest {
 		watch:   watch,
 		now:     tt.now,
 		emit:    emit,
-		logf:    func(format string, args ...any) { emit(LogEvent{Message: fmt.Sprintf(format, args...)}) },
+		// logf writes a diarium log line, as the agent's logf does (no stream event).
+		logf: func(format string, args ...any) {
+			_ = tt.st.diaria.append(logEvent(tt.st.id, tt.st.now(), fmt.Sprintf(format, args...)))
+		},
 		// The harness's failWatch mirrors the stream half of the agent's D-22 hook: the LogEvent.
 		// The diarium line and the Fail are agent-level and tested there.
 		failWatch: func(path string, err error) { emit(LogEvent{Message: "watch lost " + path + ": " + err.Error()}) },
@@ -292,6 +295,34 @@ func (tt *recvTest) inreqLines(t *testing.T) []DiariumLine {
 		}
 	}
 	return out
+}
+
+// logLines is the diarium's log lines (the `log` event), in order.
+func (tt *recvTest) logLines(t *testing.T) []DiariumLine {
+	t.Helper()
+	read, err := ReadDiarium(tt.st.folders.agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []DiariumLine
+	for _, l := range read.Lines {
+		if l.Event == EventLog {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// countLogLinesNaming counts the diarium log lines whose message names the rid.
+func countLogLinesNaming(t *testing.T, tt *recvTest, rid RID) int {
+	t.Helper()
+	n := 0
+	for _, l := range tt.logLines(t) {
+		if strings.Contains(string(l.EventData), string(rid)) {
+			n++
+		}
+	}
+	return n
 }
 
 func (tt *recvTest) hasEvent(t *testing.T, timeout time.Duration, check func(Event) bool) Event {
@@ -893,9 +924,9 @@ func TestRecvInboxRemovedWithFilesNoCrash(t *testing.T) {
 }
 
 // After a loss, a Stop(Force) cancels the running handler and settles the exchange: the work is
-// cancelled, and the archive (inreq) lands as dropped (the 300 answer cannot be written to a lost
-// inbox). The probe this adopts is the oracle's TestR2InboxLostHandlerNotCancelled, with the
-// settle assertion added.
+// cancelled, and the exchange is left unsettled (the 300 answer cannot be written to a lost inbox,
+// and the protocol has no `dropped` for a request). The probe this adopts is the oracle's
+// TestR2InboxLostHandlerNotCancelled, with the settle assertion added.
 func TestRecvInboxLostStopForceSettles(t *testing.T) {
 	tt := newRecvTest(t, 5*time.Second)
 	tt.registerCap(echoCap(), func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
@@ -921,21 +952,29 @@ func TestRecvInboxLostStopForceSettles(t *testing.T) {
 	// The loop is observably settled (a bounded wait, not an unbounded signal): performStop ran and
 	// the loop ended. If it never ran, this fails fast with a named message, not a hang.
 	tt.waitForSettled(t, 5*time.Second)
-	// The exchange was settled: the work was cancelled and the archive landed as dropped (the 300
-	// answer could not be written to a lost inbox).
+	// Unsettled must not mean leaked: the exchange left the working set (it is no longer tracked),
+	// and no goroutine keeps waiting on it (the loop ended, so the cancelled handler has returned).
+	if len(tt.r.exchanges) != 0 {
+		t.Fatalf("the unsettled exchange is still in the working set: %d tracked", len(tt.r.exchanges))
+	}
+	// The exchange is left unsettled: the protocol has no `dropped` for a request, so the diarium
+	// holds no final_status line for the rid, and no inreq event carries `dropped`.
 	ins := tt.inreqLines(t)
-	if len(ins) != 1 {
-		t.Fatalf("the inreq diarium has %d lines, want 1: the exchange was not settled", len(ins))
+	if len(ins) != 0 {
+		t.Fatalf("the inreq diarium has %d lines, want 0: a request whose answer was not written stays out of the archive", len(ins))
 	}
-	var env ExchangeEnvelopes
-	if err := json.Unmarshal(ins[0].EventData, &env); err != nil {
-		t.Fatalf("unmarshal the inreq event_data: %v", err)
+	for _, l := range ins {
+		var env ExchangeEnvelopes
+		if err := json.Unmarshal(l.EventData, &env); err != nil {
+			t.Fatalf("unmarshal the inreq event_data: %v", err)
+		}
+		if env.FinalStatus == FinalDropped {
+			t.Fatalf("an inreq event carries final_status %q: a request is never dropped", env.FinalStatus)
+		}
 	}
-	if env.FinalStatus != FinalDropped {
-		t.Fatalf("the settled exchange has final_status %q, want %q", env.FinalStatus, FinalDropped)
-	}
-	if !isJSONNull(env.Res) {
-		t.Fatalf("the diarium res is not null, want null (the answer was not written): %s", env.Res)
+	// Exactly one log line, naming the rid and why it has no answer.
+	if n := countLogLinesNaming(t, tt, rid); n != 1 {
+		t.Fatalf("the diarium has %d log lines naming the rid %s, want exactly 1", n, rid)
 	}
 }
 
@@ -971,17 +1010,37 @@ func TestRecvStopAfterLossSettlesOnce(t *testing.T) {
 		}
 	}
 	tt.waitForSettled(t, 5*time.Second)
-	// Settled exactly once: one inreq line, dropped (the answer was not written to the lost inbox).
+	// Settled exactly once: no inreq line (a request is never dropped), and exactly one log line
+	// naming the rid (the D-5 guard writes it once, not per stop).
+	ins := tt.inreqLines(t)
+	if len(ins) != 0 {
+		t.Fatalf("the inreq diarium has %d lines, want 0: a request whose answer was not written stays out of the archive", len(ins))
+	}
+	if n := countLogLinesNaming(t, tt, rid); n != 1 {
+		t.Fatalf("the diarium has %d log lines naming the rid %s, want exactly 1 (settled once)", n, rid)
+	}
+}
+
+// A command that is not accepted (D4) is archived as `dropped`: that is the one legal use of the
+// status. A request is never dropped (it stays unsettled), but a command is.
+func TestRecvDroppedCommandArchivesDropped(t *testing.T) {
+	tt := newRecvTest(t, 5*time.Second)
+	tt.start()
+	rid := tt.newRID()
+	// An unknown command from the listed source: dropped at D4.
+	tt.writeCommand(t, rid, "nosuchcmd", json.RawMessage(`{}`))
+	// The command is archived: its file is deleted and the diarium holds an inreq line.
+	tt.waitForInboxEmpty(t, 3*time.Second)
 	ins := tt.inreqLines(t)
 	if len(ins) != 1 {
-		t.Fatalf("the inreq diarium has %d lines, want 1: the exchange was settled %d times", len(ins), len(ins))
+		t.Fatalf("the inreq diarium has %d lines, want 1 (the dropped command)", len(ins))
 	}
 	var env ExchangeEnvelopes
 	if err := json.Unmarshal(ins[0].EventData, &env); err != nil {
 		t.Fatalf("unmarshal the inreq event_data: %v", err)
 	}
 	if env.FinalStatus != FinalDropped {
-		t.Fatalf("the settled exchange has final_status %q, want %q", env.FinalStatus, FinalDropped)
+		t.Fatalf("the dropped command has final_status %q, want %q", env.FinalStatus, FinalDropped)
 	}
 }
 

@@ -348,7 +348,7 @@ func (r *receiver) performStop(force bool, grace time.Duration) {
 		}
 	}
 	for _, ex := range r.exchanges {
-		r.archive(ex) // settled by the stop: answered, or dropped when the answer could not be written
+		r.archive(ex) // settled by the stop: answered, or left unsettled when the answer could not be written
 	}
 }
 
@@ -956,16 +956,8 @@ func (r *receiver) archive(ex *exchange) {
 	if ex.timer != nil {
 		ex.timer.Stop()
 	}
-	finalStatus := FinalCompleted
-	if ex.res == nil {
-		finalStatus = FinalDropped // the answer was not written (e.g. the inbox was lost)
-	} else if ex.canSeen {
-		finalStatus = FinalCancelled
-	} else if ex.con != nil {
-		finalStatus = FinalConfirmed
-	}
-	env := ExchangeEnvelopes{FinalStatus: finalStatus, Req: ex.reqRaw, Can: ex.canRaw, Res: ex.resRaw, Con: ex.conRaw}
-	_ = r.st.diaria.append(inreqEvent(r.st.id, r.st.now(), finalStatus, env))
+	// The files are cleaned and the exchange leaves the working set whether or not it is archived:
+	// an unsettled exchange must not be leaked.
 	for _, suffix := range []string{".json", ".can.json", ".res.json", ".con.json"} {
 		_ = r.st.files.removePath(filepath.Join(r.st.folders.inbox, string(ex.rid)+suffix))
 	}
@@ -973,6 +965,21 @@ func (r *receiver) archive(ex *exchange) {
 		_ = r.st.files.removePath(filepath.Join(r.st.folders.forum, name))
 	}
 	delete(r.exchanges, ex.rid)
+	// A request whose answer was not written (the inbox was lost) is never given a final status: the
+	// protocol has no `dropped` for a request. It stays out of the archive, unsettled, with one log
+	// line naming the rid and why it has no answer.
+	if ex.res == nil {
+		r.st.logf("the answer for %s was not written (the inbox was lost); the exchange is left unsettled", ex.rid)
+		return
+	}
+	finalStatus := FinalCompleted
+	if ex.canSeen {
+		finalStatus = FinalCancelled
+	} else if ex.con != nil {
+		finalStatus = FinalConfirmed
+	}
+	env := ExchangeEnvelopes{FinalStatus: finalStatus, Req: ex.reqRaw, Can: ex.canRaw, Res: ex.resRaw, Con: ex.conRaw}
+	_ = r.st.diaria.append(inreqEvent(r.st.id, r.st.now(), finalStatus, env))
 	r.st.emit(InreqEvent{RID: ex.rid, FinalStatus: finalStatus})
 }
 
