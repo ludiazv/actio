@@ -1129,6 +1129,31 @@ func TestAgentRestartHonoursDelay(t *testing.T) {
 	}
 }
 
+// TestAgentRestartFractionalDelayIsHonoured: a schema-valid fractional delay (the schema's
+// duration is a number, not an integer) really delays the restart — the agent is still down at a
+// bound inside the delay, and up again at a bound after it. A fraction dropped to 0 would restart
+// immediately, which is what the int parse did: the delay is parsed as a number and the fraction is
+// honoured.
+func TestAgentRestartFractionalDelayIsHonoured(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) { o.AcceptsCommandsFrom = []string{"beta"} })
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	b := newTestAgent(t, root, "beta", nil)
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	if _, err := b.Command(startCtx(t), "alpha", "restart", map[string]any{"delay": 1.5}); err != nil {
+		t.Fatalf("Command(restart): %v", err)
+	}
+	time.Sleep(750 * time.Millisecond) // a bound inside the 1.5s delay, not through the clamp
+	if a.cur().running.Load() {
+		t.Fatal("a fractional delay of 1.5s restarted immediately: the fraction was dropped to 0")
+	}
+	waitFor(t, 15*time.Second, "alpha to come back after the fractional delay", func() bool { return a.cur().running.Load() })
+}
+
 // TestAgentClampedRestartDelay: the restart delay policy, unit-tested at the helper: a huge delay
 // clamps to the bound, a delay at the bound passes through, a delay under the bound passes
 // through, and zero or negative delays arm no wait. The constant's value is what its comment
@@ -1146,6 +1171,7 @@ func TestAgentClampedRestartDelay(t *testing.T) {
 		{"just above the bound clamps", maxRestartDelay + time.Second, maxRestartDelay},
 		{"at the bound passes through", maxRestartDelay, maxRestartDelay},
 		{"under the bound passes through", 1 * time.Second, 1 * time.Second},
+		{"a fractional delay passes through", 1500 * time.Millisecond, 1500 * time.Millisecond},
 		{"zero arms no wait", 0, 0},
 		{"a negative delay arms no wait", -5 * time.Second, 0},
 	}
@@ -1385,8 +1411,12 @@ func TestAgentStartFailsAtFirstPublishReturns(t *testing.T) {
 	}
 }
 
-// TestAgentSecondStartBadConfigReturns: a second Start that fails at the configuration returns its
-// error — the old run's dead heartbeat is not behind it.
+// TestAgentSecondStartBadConfigReturns: a Start that fails at the configuration returns its error.
+// A weak pin: the config failure precedes the half-started state the run-per-Start restructure
+// addresses, so it does not distinguish the restructure from the pre-fix code — the strong pins
+// are TestAgentStartFailsAtFirstPublishReturns (the running rollback) and
+// TestAgentStopDuringStartNoCrash. New arms no run, so a second Start has no dead heartbeat
+// behind it to hang on.
 func TestAgentSecondStartBadConfigReturns(t *testing.T) {
 	root := t.TempDir()
 	a := newTestAgent(t, root, "alpha", nil)
@@ -1993,6 +2023,79 @@ func TestAgentStopBoundedWithStuckTick(t *testing.T) {
 	}
 	if got := statusState(t, root, "alpha"); got != "inactive" {
 		t.Fatalf("status %q, want inactive", got)
+	}
+}
+
+// TestAgentAbortStartBoundedByCtx: the start-failure cleanup is bounded by its context — a run
+// whose heartbeat never ends and whose discovery goroutine never returns is dropped within the
+// bound, and the lifecycle gate is released afterwards: a subsequent Stop returns instead of
+// blocking in acquire. An unbounded wait here would hold the gate forever and brick the agent.
+func TestAgentAbortStartBoundedByCtx(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", nil)
+
+	// A run whose heartbeat never ends (hbDone never closes) and whose discovery goroutine never
+	// returns: the two waits the cleanup must bound.
+	st := &agentState{agentShared: a.shared, id: "alpha", current: StatusInactive}
+	st.view.Store(&peerSet{views: map[AgentID]AgentView{}, specs: map[AgentID]*Spec{}})
+	st.hb = newHeartbeat(time.Second, func() error { return nil })
+	st.hbDone = make(chan struct{}) // never closed: the heartbeat's goroutine never ends
+	st.discArmed = true
+	st.discStop = make(chan struct{})
+	never := make(chan struct{})
+	st.wg.Go(func() { <-never }) // the discovery goroutine never returns
+
+	// Start holds the lifecycle gate while it cleans up a failed run; model that.
+	if err := a.acquire(startCtx(t)); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	expired, cancel := context.WithCancel(context.Background())
+	cancel() // an already-expired context: the cleanup's bounds run out at once
+	aborted := false
+	ok := within(5*time.Second, func() { a.abortStart(expired, st); aborted = true })
+	a.release() // Start's deferred release, now that the cleanup has returned
+	if !ok || !aborted {
+		t.Fatal("the start-failure cleanup did not return within 5s: its waits are not bounded by ctx")
+	}
+
+	// The gate is released: a subsequent Stop returns instead of blocking in acquire.
+	var stopErr error
+	if !within(5*time.Second, func() { stopErr = a.Stop(ctxN(2*time.Second), StopOptions{}) }) {
+		t.Fatal("Stop blocked in acquire: the lifecycle gate was not released")
+	}
+	if stopErr != nil {
+		t.Fatalf("Stop after the bounded cleanup: %v", stopErr)
+	}
+}
+
+// TestAgentStopDiscoveryWaitBoundedByCtx: the stop's wait for the discovery goroutine is bounded
+// by the caller's context — a discovery that never returns (stuck in a blocking listener on a lost
+// nuntium) does not hold the stop: Stop returns its ctx's deadline.
+func TestAgentStopDiscoveryWaitBoundedByCtx(t *testing.T) {
+	root := t.TempDir()
+	block := make(chan struct{})
+	defer close(block) // release the blocking listener so the discovery goroutine can end
+	var stuck atomic.Bool
+	a := newTestAgent(t, root, "alpha", nil)
+	a.OnEvent(func(e Event) {
+		if lg, ok := e.(LogEvent); ok && strings.Contains(lg.Message, "watch lost") {
+			stuck.Store(true)
+			<-block // block on the loss event: the discovery goroutine never returns
+		}
+	})
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Lose the own nuntium: the discovery goroutine emits the loss and blocks in the listener.
+	os.RemoveAll(a.cur().folders.nuntium)
+	waitFor(t, 10*time.Second, "the discovery goroutine to block on the loss", stuck.Load)
+	var err error
+	ok := within(5*time.Second, func() { err = a.Stop(ctxN(300*time.Millisecond), StopOptions{}) })
+	if !ok {
+		t.Fatal("Stop did not return within 5s: the discovery wait is not bounded by ctx")
+	}
+	if err != context.DeadlineExceeded {
+		t.Fatalf("Stop err = %v, want DeadlineExceeded", err)
 	}
 }
 

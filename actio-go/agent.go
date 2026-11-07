@@ -169,7 +169,7 @@ func (a *Agent) startLocked(ctx context.Context) error {
 	st := &agentState{agentShared: sh, id: sh.opts.ID, current: StatusInactive}
 	st.view.Store(&peerSet{views: map[AgentID]AgentView{}, specs: map[AgentID]*Spec{}})
 	if err := a.startUp(ctx, st); err != nil {
-		a.abortStart(st)
+		a.abortStart(ctx, st)
 		return err
 	}
 	return nil
@@ -292,13 +292,18 @@ func (a *Agent) wireStandardCommands(recv *receiver) {
 // abortStart drops what a failed Start armed, and re-arms none: the discovery loop, the receiver,
 // the heartbeat, the watcher and the provider all end, and the agent is not running (D-9). It
 // runs once, on the run that failed, and it publishes inactive if that run had published idle: a
-// published idle must not outlive the run.
-func (a *Agent) abortStart(st *agentState) {
+// published idle must not outlive the run. The two waits are bounded by ctx — what is stuck costs
+// its own goroutine until it returns, and the caller is told through ctx — so a failed Start can
+// never hold the lifecycle gate forever (D-9).
+func (a *Agent) abortStart(ctx context.Context, st *agentState) {
 	if st.hb != nil {
 		st.hb.stop()
 	}
 	if st.hbDone != nil {
-		<-st.hbDone
+		select {
+		case <-st.hbDone:
+		case <-ctx.Done():
+		}
 	}
 	if st.current != StatusInactive { // a published idle must not outlive the run
 		_ = a.setState(StatusInactive)
@@ -311,7 +316,7 @@ func (a *Agent) abortStart(st *agentState) {
 	}
 	if st.discArmed {
 		close(st.discStop)
-		st.wg.Wait()
+		_ = waitBounded(ctx, &st.wg)
 	}
 	if st.watch != nil {
 		st.watch.close()
@@ -801,8 +806,8 @@ func (a *Agent) cmdEnable(ctx context.Context, params json.RawMessage, cmd *Comm
 // reason.
 func (a *Agent) cmdRestart(ctx context.Context, params json.RawMessage, cmd *CommandContext) error {
 	var p struct {
-		Force *bool `json:"force"`
-		Delay *int  `json:"delay"`
+		Force *bool    `json:"force"`
+		Delay *float64 `json:"delay"` // the schema's duration is a number: a fraction is honoured
 	}
 	_ = json.Unmarshal(params, &p)
 	force := p.Force != nil && *p.Force
@@ -817,7 +822,7 @@ func (a *Agent) cmdRestart(ctx context.Context, params json.RawMessage, cmd *Com
 	// clamped to the bound: the peer asked for a restart, and it gets one.
 	delay := time.Duration(0)
 	if p.Delay != nil {
-		delay = clampedRestartDelay(time.Duration(*p.Delay) * time.Second)
+		delay = clampedRestartDelay(time.Duration(*p.Delay * float64(time.Second)))
 	}
 	if err := a.acquire(context.Background()); err != nil {
 		return err
