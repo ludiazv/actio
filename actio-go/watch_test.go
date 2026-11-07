@@ -377,12 +377,16 @@ func TestWatchRealOverflowWakesEverySubscriber(t *testing.T) {
 	}
 
 	// Every subscriber is woken: the other folder has no event of its own, so only the overflow's
-	// wake of everyone can reach it.
+	// wake of everyone can reach it. The overflow event sits at the tail of the kernel's queue, so
+	// this leg waits out the hand-off of every event queued before it (~16 000 of them, no file I/O).
+	// Measured: 1.7 s of its own solo, and 1.8 s with eight whole-suite -race runs at GOMAXPROCS=1
+	// going at the same time; one instance was seen past the old 10 s bound on a machine that was also
+	// running black-box agents and builds, so the bound carries the machine's load, not one run's.
 	select {
 	case <-s2.changed():
 	case <-s2.lost():
 		t.Fatal("an overflow was reported as a loss, for the other folder")
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Error("the overflow did not reach every subscriber")
 	}
 
