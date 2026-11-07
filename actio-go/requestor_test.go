@@ -619,6 +619,7 @@ func TestRequestTwoHundredConcurrentHalfCancel(t *testing.T) {
 	events := make(chan Event, 1024)
 	base := inotifyCount(t)
 	x := newReqTest(t, "me", "peer", events)
+	x.r.st.config.CancelWaitTimeout = 60 * time.Second // the protocol's: this test's answers come after all the cancellations
 	before := runtime.NumGoroutine()
 
 	ctxs := make([]context.CancelFunc, n)

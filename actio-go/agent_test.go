@@ -9,9 +9,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -155,11 +159,11 @@ func TestAgentNewRejectsBadOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(alpha): %v", err)
 	}
-	if good == nil || good.st == nil {
+	if good == nil || good.shared == nil {
 		t.Fatalf("New(alpha) returned no agent")
 	}
 	// New arms nothing: no folders on disk, no watcher, no goroutine.
-	entries, err := os.ReadDir(good.st.opts.Config.Root)
+	entries, err := os.ReadDir(good.shared.opts.Config.Root)
 	if err != nil {
 		t.Fatalf("list the root New was given: %v", err)
 	}
@@ -374,7 +378,7 @@ func TestAgentStartFailureArmsNothing(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "alpha")); !os.IsNotExist(err) {
 		t.Errorf("a failed Start left the agent folder behind")
 	}
-	a.st.config.Sync = "" // the next Start reloads the configuration from the (valid) default
+	a.cur().config.Sync = "" // the next Start reloads the configuration from the (valid) default
 	a2, err := New(Options{ID: "alpha", AcceptsCommandsFrom: []string{}, Config: testConfigWithRoot(root)})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1034,17 +1038,18 @@ func TestAgentTwoStopCommands(t *testing.T) {
 	waitFor(t, 10*time.Second, "the stop command's handler to stop the heartbeat",
 		func() bool { return heartbeatStopped(a) })
 	// The handler's stop is in flight, in the grace drain: the second entry, from the program
-	// itself, must resolve, not run a second D-9 sequence.
+	// itself, must wait for it at the gate, not resolve early: it returns only once the first stop
+	// has finished, so inactive is on disk the moment it returns.
 	if err := a.Stop(startCtx(t), StopOptions{}); err != nil {
 		t.Fatalf("the concurrent Stop: %v", err)
+	}
+	if got := statusState(t, root, "alpha"); got != "inactive" {
+		t.Errorf("the Stop returned before inactive was on disk: status %q", got)
 	}
 	select {
 	case <-a.Done():
 	case <-time.After(20 * time.Second):
 		t.Fatal("Done did not close after the two stops")
-	}
-	if got := statusState(t, root, "alpha"); got != "inactive" {
-		t.Errorf("status after the two stops: %q, want inactive", got)
 	}
 	inactive := 0
 	for _, s := range diariumStates(t, root, "alpha") {
@@ -1060,7 +1065,7 @@ func TestAgentTwoStopCommands(t *testing.T) {
 // heartbeatStopped reads the heartbeat's stopped flag under its own lock: true means a stop has
 // entered the D-9 sequence (the heartbeat is the first step), and the read is race-free.
 func heartbeatStopped(a *Agent) bool {
-	hb := a.st.hb
+	hb := a.cur().hb
 	hb.mu.Lock()
 	defer hb.mu.Unlock()
 	return hb.stopped
@@ -1082,7 +1087,7 @@ func TestAgentStopRetryAfterFailedC1(t *testing.T) {
 	if err := a.Stop(fastCtx, StopOptions{Force: true}); err == nil {
 		t.Fatal("the first Stop succeeded; the test needs a failed C1")
 	}
-	if !a.st.running.Load() {
+	if !a.cur().running.Load() {
 		t.Fatal("a failed C1 ended the agent; it must stay running for the retry")
 	}
 	// The retry: no panic, the agent ends stopped.
@@ -1117,8 +1122,8 @@ func TestAgentRestartHonoursDelay(t *testing.T) {
 	if _, err := b.Command(startCtx(t), "alpha", "restart", map[string]any{"delay": 1}); err != nil {
 		t.Fatalf("Command(restart): %v", err)
 	}
-	waitFor(t, 10*time.Second, "alpha to stop for the restart", func() bool { return !a.st.running.Load() })
-	waitFor(t, 15*time.Second, "alpha to come back after the delay", func() bool { return a.st.running.Load() })
+	waitFor(t, 10*time.Second, "alpha to stop for the restart", func() bool { return !a.cur().running.Load() })
+	waitFor(t, 15*time.Second, "alpha to come back after the delay", func() bool { return a.cur().running.Load() })
 	if elapsed := time.Since(start); elapsed < 950*time.Millisecond {
 		t.Errorf("restart with delay 1 came back after %s; the delay must be honoured (>= ~1s)", elapsed)
 	}
@@ -1191,8 +1196,8 @@ func TestAgentRescanWithoutSpec(t *testing.T) {
 		}
 	}
 	a := newTestAgent(t, root, "alpha", nil)
-	a.st.folders.root = root // a valid tree: the scan succeeds and would pair the nil spec
-	a.rescan()               // the guard must return before the callability rules touch the nil self
+	a.cur().folders.root = root // a valid tree: the scan succeeds and would pair the nil spec
+	a.rescan()                  // the guard must return before the callability rules touch the nil self
 }
 
 // TestAgentFailPublishesError: Fail publishes the error state and announces it; the agent keeps
@@ -1217,7 +1222,7 @@ func TestAgentFailPublishesError(t *testing.T) {
 		t.Fatalf("a second Fail: %v", err)
 	}
 	// The agent is still running: a Stop is needed to end it.
-	if !a.st.running.Load() {
+	if !a.cur().running.Load() {
 		t.Error("Fail stopped the agent; it must stay in the error state")
 	}
 }
@@ -1320,4 +1325,727 @@ func testConfigWithRoot(root string) Config {
 	cfg := testConfig
 	cfg.Root = root
 	return cfg
+}
+
+// --- the R2 round: one run is one object, and the lifecycle has a gate ------------------------
+
+// doneOf reports whether Done has closed, without blocking.
+func doneOf(a *Agent) bool {
+	select {
+	case <-a.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// within runs f on a goroutine and reports whether it returned within the bound.
+func within(bound time.Duration, f func()) bool {
+	done := make(chan struct{})
+	go func() { f(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(bound):
+		return false
+	}
+}
+
+// ctxN is a detached context that expires after d: for calls that outlive the test's setup. The
+// cancel is deliberately not called: the expiry is the point, and the context is short-lived.
+func ctxN(d time.Duration) context.Context {
+	c, cancel := context.WithTimeout(context.Background(), d)
+	_ = cancel
+	return c
+}
+
+// echoOK answers an echo request with its own marker.
+func echoOK(ctx context.Context, p json.RawMessage, c *CallContext) (any, error) {
+	return map[string]any{"out": "x"}, nil
+}
+
+// TestAgentStartFailsAtFirstPublishReturns: a Start whose first publication fails returns its
+// error — it does not hang on a dead run's heartbeat, and it leaves nothing armed.
+func TestAgentStartFailsAtFirstPublishReturns(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "alpha", "inbox"), 0o755)
+	os.Chmod(filepath.Join(root, "alpha"), 0o500)
+	t.Cleanup(func() { os.Chmod(filepath.Join(root, "alpha"), 0o755) })
+	a := newTestAgent(t, root, "alpha", nil)
+	var err error
+	ok := within(5*time.Second, func() { err = a.Start(ctxN(2 * time.Second)) })
+	if !ok {
+		t.Fatal("Start hung on its first publication failure")
+	}
+	if err == nil {
+		t.Fatal("Start succeeded though its first publication failed")
+	}
+	if a.cur().running.Load() {
+		t.Error("a failed Start left the agent running")
+	}
+}
+
+// TestAgentSecondStartBadConfigReturns: a second Start that fails at the configuration returns its
+// error — the old run's dead heartbeat is not behind it.
+func TestAgentSecondStartBadConfigReturns(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := a.Stop(startCtx(t), StopOptions{}); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	a.shared.opts.Config.Sync = "bogus"
+	var err error
+	ok := within(5*time.Second, func() { err = a.Start(ctxN(2 * time.Second)) })
+	if !ok {
+		t.Fatal("the second Start hung on a bad configuration")
+	}
+	if err == nil {
+		t.Fatal("the second Start succeeded with a bad configuration")
+	}
+}
+
+// TestAgentSecondStartRootGoneReturns: a second Start whose root is gone returns its error.
+func TestAgentSecondStartRootGoneReturns(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "tree")
+	a := newTestAgent(t, sub, "alpha", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := a.Stop(startCtx(t), StopOptions{}); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	os.RemoveAll(sub)
+	os.WriteFile(sub, []byte("x"), 0o644) // the root is now a file
+	var err error
+	ok := within(5*time.Second, func() { err = a.Start(ctxN(2 * time.Second)) })
+	if !ok {
+		t.Fatal("the second Start hung with a missing root")
+	}
+	if err == nil {
+		t.Fatal("the second Start succeeded with a missing root")
+	}
+}
+
+// TestAgentRestartFailsAtStartClosesDone: a restart whose Start fails closes Done — nobody is left
+// to bring the agent back, so a program selecting on Done must not wait forever.
+func TestAgentRestartFailsAtStartClosesDone(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) { o.AcceptsCommandsFrom = []string{"beta"} })
+	b := newTestAgent(t, root, "beta", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	if _, err := b.Command(ctxN(5*time.Second), "alpha", "restart", map[string]any{"delay": 1}); err != nil {
+		t.Fatalf("Command(restart): %v", err)
+	}
+	waitFor(t, 10*time.Second, "alpha to stop for the restart", func() bool { return !a.cur().running.Load() })
+	folder := filepath.Join(root, "alpha")
+	os.Chmod(folder, 0o500) // the restart's first publication now fails
+	t.Cleanup(func() { os.Chmod(folder, 0o755) })
+	waitFor(t, 10*time.Second, "Done to close after the failed restart", func() bool { return doneOf(a) })
+	if a.cur().running.Load() {
+		t.Error("the agent is running after a failed restart")
+	}
+	if got := statusState(t, root, "alpha"); got != "inactive" {
+		t.Errorf("status after a failed restart: %q, want inactive", got)
+	}
+}
+
+// TestAgentStartCancelledDuringAnnounceLeavesInactive: a Start cancelled during its announce delay
+// leaves the agent inactive, not idle: a published idle must not outlive the run.
+func TestAgentStartCancelledDuringAnnounceLeavesInactive(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) { o.Config.AnnounceDelay = time.Second })
+	err := a.Start(ctxN(100 * time.Millisecond))
+	if err == nil {
+		t.Fatal("Start succeeded though its ctx expired in the announce delay")
+	}
+	if a.cur().running.Load() {
+		t.Error("a cancelled Start left the agent running")
+	}
+	if got := statusState(t, root, "alpha"); got != "inactive" {
+		t.Errorf("status after a cancelled Start: %q, want inactive (a published idle must not outlive the run)", got)
+	}
+}
+
+// TestAgentStopDuringStartNoCrash: a Stop that races a Start, from any side, leaves nothing armed
+// and crashes nothing.
+func TestAgentStopDuringStartNoCrash(t *testing.T) {
+	const runs = 100
+	for i := 0; i < runs; i++ {
+		root := t.TempDir()
+		a := newTestAgent(t, root, "alpha", nil)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = a.Start(ctxN(5 * time.Second)) }()
+		time.Sleep(time.Duration(rand.Intn(300)) * time.Microsecond)
+		if err := a.Stop(ctxN(5*time.Second), StopOptions{Force: true}); err != nil {
+			t.Fatalf("run %d: the Stop during Start: %v", i, err)
+		}
+		wg.Wait()
+		if err := a.Stop(ctxN(5*time.Second), StopOptions{Force: true}); err != nil {
+			t.Fatalf("run %d: the second Stop: %v", i, err)
+		}
+	}
+}
+
+// TestAgentRequestRacesStopRaceFree: the public API racing a stop is race-free and every call
+// ends. The race detector is the verdict; this asserts the calls all return.
+func TestAgentRequestRacesStopRaceFree(t *testing.T) {
+	root := t.TempDir()
+	b := newTestAgent(t, root, "beta", nil)
+	if err := b.Capability(echoCap(), echoOK); err != nil {
+		t.Fatalf("Capability: %v", err)
+	}
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	a := newTestAgent(t, root, "alpha", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	const workers, perWorker = 8, 400
+	var wg sync.WaitGroup
+	var n atomic.Int64
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				a.Request(ctxN(3*time.Second), "beta", "echo", map[string]any{"in": "x"}, RequestOptions{Timeout: time.Second})
+				n.Add(1)
+			}
+		}()
+	}
+	time.Sleep(60 * time.Millisecond)
+	if err := a.Stop(ctxN(10*time.Second), StopOptions{}); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	wg.Wait()
+	if n.Load() != workers*perWorker {
+		t.Errorf("calls completed: %d, want %d", n.Load(), workers*perWorker)
+	}
+}
+
+// TestAgentAPIDuringRestartRaceFree: the public API racing a peer-triggered restart is race-free:
+// a program has no way to synchronise with a restart, and none of its calls may hang.
+func TestAgentAPIDuringRestartRaceFree(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) { o.AcceptsCommandsFrom = []string{"beta"} })
+	b := newTestAgent(t, root, "beta", nil)
+	if err := b.Capability(echoCap(), echoOK); err != nil {
+		t.Fatalf("Capability: %v", err)
+	}
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	calls := []func(){
+		func() {
+			a.Request(ctxN(2*time.Second), "beta", "echo", map[string]any{"in": "x"}, RequestOptions{Timeout: time.Second})
+		},
+		func() { a.Command(ctxN(2*time.Second), "beta", "nosuch", nil) },
+		func() { a.Log("x") },
+		func() { a.Diarium() },
+		func() { a.Refresh(ctxN(2 * time.Second)) },
+		func() { a.Agmen() },
+	}
+	for _, f := range calls {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					f()
+				}
+			}
+		}()
+	}
+	const restarts = 4
+	for i := 0; i < restarts; i++ {
+		var err error
+		for attempt := 0; attempt < 100; attempt++ { // a restart's down window refuses calls: retry until one lands
+			_, err = b.Command(ctxN(5*time.Second), "alpha", "restart", map[string]any{})
+			if err == nil || !strings.Contains(err.Error(), "not callable") {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if err != nil {
+			t.Fatalf("Command(restart %d): %v", i, err)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
+	if err := a.Stop(ctxN(5*time.Second), StopOptions{Force: true}); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestAgentPingDuringRestartRaceFree: the protocol commands, fired at a restarting agent, are
+// race-free and end the agent cleanly.
+func TestAgentPingDuringRestartRaceFree(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) { o.AcceptsCommandsFrom = []string{"beta"} })
+	b := newTestAgent(t, root, "beta", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	const rounds = 6
+	for i := 0; i < rounds; i++ {
+		for _, c := range []string{"ping", "enable", "restart", "ping"} {
+			var p any
+			switch c {
+			case "enable":
+				p = map[string]any{"enabled": true}
+			case "restart":
+				p = map[string]any{}
+			} // ping takes null
+			// A ping that lands in the restart's down window is refused by the callability rules —
+			// that is the protocol working, not a defect; any other error is one.
+			if _, err := b.Command(ctxN(5*time.Second), "alpha", c, p); err != nil && !strings.Contains(err.Error(), "not callable") {
+				t.Fatalf("Command(%s, round %d): %v", c, i, err)
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err := a.Stop(ctxN(5*time.Second), StopOptions{Force: true}); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+// TestAgentStopDuringRestartDelayLeavesDown: a stop during a restart's delay cancels the restart
+// and closes Done — the agent stays down.
+func TestAgentStopDuringRestartDelayLeavesDown(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) { o.AcceptsCommandsFrom = []string{"beta"} })
+	b := newTestAgent(t, root, "beta", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	if _, err := b.Command(ctxN(5*time.Second), "alpha", "restart", map[string]any{"delay": 2}); err != nil {
+		t.Fatalf("Command(restart): %v", err)
+	}
+	waitFor(t, 10*time.Second, "alpha to stop for the restart", func() bool { return !a.cur().running.Load() })
+	if err := a.Stop(startCtx(t), StopOptions{}); err != nil {
+		t.Fatalf("the Stop during the delay: %v", err)
+	}
+	if !doneOf(a) {
+		t.Fatal("Done did not close: a stop during a restart's delay closes it")
+	}
+	if got := statusState(t, root, "alpha"); got != "inactive" {
+		t.Errorf("status after the stop: %q, want inactive", got)
+	}
+	time.Sleep(2500 * time.Millisecond) // past the delay the restart was in
+	if a.cur().running.Load() {
+		t.Error("the agent came back on its own: the stop must cancel the pending restart")
+	}
+}
+
+// TestAgentStopWaitsForStopCommand: a Stop that finds a stop command in flight waits for it at the
+// gate: it returns only once the command's stop has finished, so inactive is on disk the moment it
+// returns, and it took the time the first stop needed.
+func TestAgentStopWaitsForStopCommand(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) { o.AcceptsCommandsFrom = []string{"beta"} })
+	if err := a.Capability(echoCap(), func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}); err != nil {
+		t.Fatalf("Capability: %v", err)
+	}
+	b := newTestAgent(t, root, "beta", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	go func() {
+		_, _ = b.Request(context.Background(), "alpha", "echo", map[string]any{"in": "x"}, RequestOptions{Timeout: 30 * time.Second})
+	}()
+	waitFor(t, 10*time.Second, "alpha to be busy with the in-flight request", func() bool {
+		return statusState(t, root, "alpha") == "busy"
+	})
+	if _, err := b.Command(ctxN(5*time.Second), "alpha", "stop", map[string]any{"force": false}); err != nil {
+		t.Fatalf("Command(stop): %v", err)
+	}
+	waitFor(t, 10*time.Second, "the stop command's handler to stop the heartbeat",
+		func() bool { return heartbeatStopped(a) })
+	t0 := time.Now()
+	if err := a.Stop(ctxN(10*time.Second), StopOptions{}); err != nil {
+		t.Fatalf("the concurrent Stop: %v", err)
+	}
+	if got := statusState(t, root, "alpha"); got != "inactive" {
+		t.Errorf("the Stop returned before inactive was on disk: status %q", got)
+	}
+	if elapsed := time.Since(t0); elapsed < time.Second {
+		t.Errorf("the Stop returned in %s: it must wait for the stop command's drain", elapsed)
+	}
+	if !doneOf(a) {
+		t.Fatal("Done did not close")
+	}
+}
+
+// TestAgentStopAndRestartCommandsSettled: stop and restart commands, in either order, settle the
+// agent: stop-then-restart ends running, restart-then-stop ends down with Done closed — never
+// half-stopped, never a panic.
+func TestAgentStopAndRestartCommandsSettled(t *testing.T) {
+	orders := [][2]string{{"stop", "restart"}, {"restart", "stop"}}
+	for _, order := range orders {
+		for i := 0; i < 2; i++ {
+			root := t.TempDir()
+			a := newTestAgent(t, root, "alpha", func(o *Options) { o.AcceptsCommandsFrom = []string{"beta"} })
+			b := newTestAgent(t, root, "beta", nil)
+			if err := a.Start(startCtx(t)); err != nil {
+				t.Fatalf("Start(alpha): %v", err)
+			}
+			if err := b.Start(startCtx(t)); err != nil {
+				t.Fatalf("Start(beta): %v", err)
+			}
+			for _, c := range order {
+				p := map[string]any{}
+				if c == "restart" {
+					p["delay"] = 1
+				}
+				var err error
+				for attempt := 0; attempt < 100; attempt++ { // the down window between a stop and a start refuses calls
+					_, err = b.Command(ctxN(5*time.Second), "alpha", c, p)
+					if err == nil || !strings.Contains(err.Error(), "not callable") {
+						break
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+				if err != nil {
+					t.Fatalf("Command(%s): %v", c, err)
+				}
+			}
+			if order[1] == "restart" {
+				waitFor(t, 10*time.Second, "the agent to come back after the restart",
+					func() bool { return a.cur().running.Load() })
+			} else {
+				waitFor(t, 10*time.Second, "Done to close after the final stop", func() bool { return doneOf(a) })
+			}
+		}
+	}
+}
+
+// TestAgentRetryAfterStatusWriteFailed: a stop whose C1 status write fails is retried, and the
+// retry lands: status.json is inactive, the diarium has the event, and the announce went out —
+// not the old mix of a stale status, an announce, and no event.
+func TestAgentRetryAfterStatusWriteFailed(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	folder := filepath.Join(root, "alpha")
+	os.Chmod(folder, 0o500)
+	t.Cleanup(func() { os.Chmod(folder, 0o755) })
+	if err := a.Stop(ctxN(3*time.Second), StopOptions{}); err == nil {
+		t.Fatal("the first Stop succeeded; the test needs a failed C1")
+	}
+	if !a.cur().running.Load() {
+		t.Fatal("a failed C1 ended the agent; it must stay running for the retry")
+	}
+	os.Chmod(folder, 0o755)
+	if err := a.Stop(ctxN(3*time.Second), StopOptions{}); err != nil {
+		t.Fatalf("the retry: %v", err)
+	}
+	if got := statusState(t, root, "alpha"); got != "inactive" {
+		t.Errorf("status after the retry: %q, want inactive", got)
+	}
+	states := diariumStates(t, root, "alpha")
+	last := ""
+	for _, s := range states {
+		last = s
+	}
+	if last != "inactive" {
+		t.Errorf("the last status event in the diarium: %q, want inactive", last)
+	}
+	ann, err := os.ReadFile(filepath.Join(root, "nuntium", "alpha.n.json"))
+	if err != nil {
+		t.Fatalf("the announce after the retry: %v", err)
+	}
+	if !strings.Contains(string(ann), "inactive") {
+		t.Errorf("the announce: %q, want the inactive text", ann)
+	}
+}
+
+// TestAgentRetryWhileFirstDrains: a Stop whose ctx expires in the grace drain returns its ctx
+// error and keeps draining in the background; a Stop after the drain has settled takes the gate
+// and finishes the job. (The interleaving where the second Stop's receiver stop reads the inbox
+// while the first performStop is still writing it is a receiver race this round does not own: the
+// flag the receiver's author introduces removes the read.)
+func TestAgentRetryWhileFirstDrains(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", nil)
+	cancelled := make(chan struct{})
+	if err := a.Capability(echoCap(), func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
+		<-ctx.Done()
+		close(cancelled)
+		return nil, ctx.Err()
+	}); err != nil {
+		t.Fatalf("Capability: %v", err)
+	}
+	b := newTestAgent(t, root, "beta", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	go func() {
+		_, _ = b.Request(context.Background(), "alpha", "echo", map[string]any{"in": "x"}, RequestOptions{Timeout: 30 * time.Second})
+	}()
+	waitFor(t, 10*time.Second, "alpha to be busy with the in-flight request", func() bool {
+		return statusState(t, root, "alpha") == "busy"
+	})
+	if err := a.Stop(ctxN(100*time.Millisecond), StopOptions{}); err == nil {
+		t.Fatal("the first Stop succeeded; the test needs a ctx that expires in the drain")
+	}
+	waitFor(t, 10*time.Second, "the drain to cancel the in-flight handler", func() bool {
+		select {
+		case <-cancelled:
+			return true
+		default:
+			return false
+		}
+	})
+	if err := a.Stop(ctxN(10*time.Second), StopOptions{}); err != nil {
+		t.Fatalf("the second Stop: %v", err)
+	}
+	if a.cur().running.Load() {
+		t.Error("the agent is running after the second Stop")
+	}
+	if got := statusState(t, root, "alpha"); got != "inactive" {
+		t.Errorf("status after the second Stop: %q, want inactive", got)
+	}
+	if !doneOf(a) {
+		t.Fatal("Done did not close")
+	}
+}
+
+// TestAgentCallbackReentryMatrix: any API may be called from a callback, and none deadlocks: the
+// dispatch runs no callback under a mutex, so a re-entrant event joins the queue instead.
+func TestAgentCallbackReentryMatrix(t *testing.T) {
+	cases := []struct {
+		name string
+		call func(a *Agent, root string)
+	}{
+		{"Log", func(a *Agent, root string) { a.Log("x") }},
+		{"Agmen", func(a *Agent, root string) { a.Agmen() }},
+		{"Diarium", func(a *Agent, root string) { a.Diarium() }},
+		{"Refresh", func(a *Agent, root string) { a.Refresh(ctxN(2 * time.Second)) }},
+		{"Request", func(a *Agent, root string) {
+			a.Request(ctxN(2*time.Second), "beta", "echo", map[string]any{"in": "x"}, RequestOptions{Timeout: time.Second})
+		}},
+		{"Command", func(a *Agent, root string) { a.Command(ctxN(2*time.Second), "beta", "ping", nil) }},
+		{"Fail", func(a *Agent, root string) { a.Fail("x") }},
+		{"Stop", func(a *Agent, root string) { a.Stop(ctxN(time.Second), StopOptions{}) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			b := newTestAgent(t, root, "beta", nil)
+			if err := b.Capability(echoCap(), echoOK); err != nil {
+				t.Fatalf("Capability: %v", err)
+			}
+			if err := b.Start(startCtx(t)); err != nil {
+				t.Fatalf("Start(beta): %v", err)
+			}
+			a := newTestAgent(t, root, "alpha", nil)
+			ran := make(chan struct{})
+			var once sync.Once
+			a.OnEvent(func(e Event) {
+				if _, ok := e.(AnnounceEvent); ok {
+					once.Do(func() {
+						tc.call(a, root)
+						close(ran) // only once the call returned
+					})
+				}
+			})
+			go a.Start(startCtx(t))
+			select {
+			case <-ran:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("the callback calling %s never returned: it deadlocked", tc.name)
+			}
+		})
+	}
+}
+
+// TestAgentCyclesLeakNothing: Start/Stop cycles leave nothing behind: the goroutine and file
+// descriptor counts are flat, and the agent ends inactive.
+func TestAgentCyclesLeakNothing(t *testing.T) {
+	fds := func() int { e, _ := os.ReadDir("/proc/self/fd"); return len(e) }
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := a.Stop(startCtx(t), StopOptions{}); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	g0, f0 := runtime.NumGoroutine(), fds()
+	const cycles = 40
+	for i := 0; i < cycles; i++ {
+		if err := a.Start(startCtx(t)); err != nil {
+			t.Fatalf("cycle %d Start: %v", i, err)
+		}
+		if err := a.Stop(startCtx(t), StopOptions{}); err != nil {
+			t.Fatalf("cycle %d Stop: %v", i, err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	if g := runtime.NumGoroutine(); g > g0+2 {
+		t.Errorf("goroutines %d→%d: a cycle leaked", g0, g)
+	}
+	if f := fds(); f > f0+2 {
+		t.Errorf("file descriptors %d→%d: a cycle leaked", f0, f)
+	}
+	if got := statusState(t, root, "alpha"); got != "inactive" {
+		t.Errorf("status after the cycles: %q, want inactive", got)
+	}
+}
+
+// TestAgentTickAfterStopLeavesFileAlone: a tick after Stop writes nothing — the status file's
+// bytes and mtime come back as they were.
+func TestAgentTickAfterStopLeavesFileAlone(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := a.Stop(startCtx(t), StopOptions{}); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	f := filepath.Join(root, "alpha", "status.json")
+	s0, err := os.Stat(f)
+	if err != nil {
+		t.Fatalf("stat status.json: %v", err)
+	}
+	r0, err := os.ReadFile(f)
+	if err != nil {
+		t.Fatalf("read status.json: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond) // the mtime must differ if a tick writes
+	if err := a.tick(); err != nil {
+		t.Fatalf("tick after Stop: %v", err)
+	}
+	s1, err := os.Stat(f)
+	if err != nil {
+		t.Fatalf("stat status.json after the tick: %v", err)
+	}
+	r1, err := os.ReadFile(f)
+	if err != nil {
+		t.Fatalf("read status.json after the tick: %v", err)
+	}
+	if s0.ModTime() != s1.ModTime() || !bytes.Equal(r0, r1) {
+		t.Errorf("a tick wrote after inactive: %s", r1)
+	}
+}
+
+// TestAgentStopBoundedWithStuckTick: with a tick stuck on the publication mutex, Stop returns its
+// ctx error — the heartbeat is stopped and waited for before C1, and that wait is bounded by the
+// ctx.
+func TestAgentStopBoundedWithStuckTick(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) { o.Config.HeartbeatInterval = 10 * time.Millisecond })
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	a.cur().pubMu.Lock()               // a stuck publication: the next tick blocks on it, inside the heartbeat
+	time.Sleep(100 * time.Millisecond) // let a tick reach the mutex
+	var err error
+	ok := within(2*time.Second, func() { err = a.Stop(ctxN(200*time.Millisecond), StopOptions{}) })
+	a.cur().pubMu.Unlock()
+	if !ok {
+		t.Fatal("Stop ignored its ctx with a tick stuck on the publication mutex")
+	}
+	if err != context.DeadlineExceeded {
+		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	}
+	if err := a.Stop(startCtx(t), StopOptions{}); err != nil {
+		t.Fatalf("the second Stop: %v", err)
+	}
+	if got := statusState(t, root, "alpha"); got != "inactive" {
+		t.Fatalf("status %q, want inactive", got)
+	}
+}
+
+// TestAgentCommandStopBound: a stop command's bound is the protocol's grace plus the stop's own
+// 30 s — and a huge grace clamps nothing.
+func TestAgentCommandStopBound(t *testing.T) {
+	if commandStopBound != 30*time.Second {
+		t.Errorf("commandStopBound = %s, want 30s", commandStopBound)
+	}
+	if got := commandStopBoundFor(30 * time.Second); got != 60*time.Second {
+		t.Errorf("commandStopBoundFor(30s) = %s, want 60s", got)
+	}
+	if got := commandStopBoundFor(0); got != 30*time.Second {
+		t.Errorf("commandStopBoundFor(0) = %s, want 30s", got)
+	}
+	if got := commandStopBoundFor(time.Hour); got != time.Hour+30*time.Second {
+		t.Errorf("commandStopBoundFor(1h) = %s, want 1h30m: a huge grace clamps nothing", got)
+	}
+}
+
+// TestAgentStopCommandShrunkGrace: a stop command, with a shrunk grace and work that outlives it,
+// completes and leaves the agent inactive with Done closed: the command's bound covers the
+// drain, and nothing is left half-stopped.
+func TestAgentStopCommandShrunkGrace(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) {
+		o.AcceptsCommandsFrom = []string{"beta"}
+		o.Config.StopGrace = 300 * time.Millisecond
+	})
+	if err := a.Capability(echoCap(), func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}); err != nil {
+		t.Fatalf("Capability: %v", err)
+	}
+	b := newTestAgent(t, root, "beta", nil)
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	go func() {
+		_, _ = b.Request(context.Background(), "alpha", "echo", map[string]any{"in": "x"}, RequestOptions{Timeout: 30 * time.Second})
+	}()
+	waitFor(t, 10*time.Second, "alpha to be busy with the in-flight request", func() bool {
+		return statusState(t, root, "alpha") == "busy"
+	})
+	if _, err := b.Command(ctxN(5*time.Second), "alpha", "stop", map[string]any{"force": false}); err != nil {
+		t.Fatalf("Command(stop): %v", err)
+	}
+	waitFor(t, 15*time.Second, "Done to close", func() bool { return doneOf(a) })
+	if got := statusState(t, root, "alpha"); got != "inactive" {
+		t.Errorf("status after the stop command: %q, want inactive", got)
+	}
 }

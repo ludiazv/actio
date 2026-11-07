@@ -6,6 +6,13 @@
 // the same agent object: the registrations survive, a disabled flag set by the enable command does
 // not, and Done stays the same channel (D-10).
 //
+// One run is one agentState: fully built, published through one atomic pointer, and never
+// rewritten, so a goroutine that outlives its run reads a stale run, not a live one changed under
+// it — that is what makes a peer-triggered restart safe against Request, Command, Log and rescan.
+// What outlives a run lives in the shared part, embedded in every run. The lifecycle has one gate,
+// a channel of capacity 1, that Start and every stop take, so a wait for it can be bounded by a
+// ctx, a second stop waits for the first, and a stop during Start waits for Start (D-9).
+//
 // Lane C is the four protocol commands — stop, enable, restart, ping — plus whatever the program
 // registers with OnCommand. A command is never answered: the sender is not told whether it worked.
 package actio
@@ -22,8 +29,13 @@ import (
 
 // Agent is one running agent. Create it with New; one object per agent id in one actio root.
 type Agent struct {
-	st *agentState
+	shared *agentShared
+	run    atomic.Pointer[agentState]
 }
+
+// cur is the current run: its fields are never rewritten, so a stale goroutine reads a stale run,
+// which is harmless.
+func (a *Agent) cur() *agentState { return a.run.Load() }
 
 // New checks the options: the id's shape, and a namespace list the protocol can write. It reads no
 // configuration and arms nothing: a bad ACTIO_* value surfaces at Start, as in the reference,
@@ -41,16 +53,20 @@ func New(opts Options) (*Agent, error) {
 			return nil, fmt.Errorf("actio: a namespace name may not be empty")
 		}
 	}
-	empty := &peerSet{views: map[AgentID]AgentView{}, specs: map[AgentID]*Spec{}}
-	st := &agentState{
-		id: opts.ID, opts: opts, now: time.Now,
-		emit: func(Event) {}, logf: func(string, ...any) {},
-		spec: func() *Spec { return nil }, state: func() StatusState { return StatusInactive },
-		doneCh: make(chan struct{}), current: StatusInactive,
+	sh := &agentShared{
+		opts: opts, doneCh: make(chan struct{}), life: make(chan struct{}, 1),
 		caps: map[string]Capability{}, handlers: map[string]CapabilityHandler{}, cmds: map[string]CommandHandler{},
 	}
-	st.view.Store(empty)
-	return &Agent{st: st}, nil
+	st := &agentState{
+		agentShared: sh, id: opts.ID, now: time.Now,
+		emit: func(Event) {}, logf: func(string, ...any) {},
+		spec: func() *Spec { return nil }, state: func() StatusState { return StatusInactive },
+		current: StatusInactive,
+	}
+	st.view.Store(&peerSet{views: map[AgentID]AgentView{}, specs: map[AgentID]*Spec{}})
+	a := &Agent{shared: sh}
+	a.run.Store(st)
+	return a, nil
 }
 
 // isAgentID is the id's shape (common.schema.json, agentId): 1-32 characters of [a-zA-Z0-9_-].
@@ -70,7 +86,7 @@ func isAgentID(id string) bool {
 // and the handler. Register before Start. A duplicate name, or a schema that does not compile or
 // uses a keyword this validator does not know, is an error (D-19).
 func (a *Agent) Capability(cap Capability, handler CapabilityHandler) error {
-	st := a.st
+	st := a.cur()
 	if st.running.Load() {
 		return fmt.Errorf("actio: the capabilities of %s are fixed once it has started", st.id)
 	}
@@ -90,7 +106,7 @@ func (a *Agent) Capability(cap Capability, handler CapabilityHandler) error {
 // built-in commands, or a name already registered, is an error: the built-in's behavior is not
 // replaceable, as in the reference.
 func (a *Agent) OnCommand(name string, handler CommandHandler) error {
-	st := a.st
+	st := a.cur()
 	if st.running.Load() {
 		return fmt.Errorf("actio: the commands of %s are fixed once it has started", st.id)
 	}
@@ -104,25 +120,56 @@ func (a *Agent) OnCommand(name string, handler CommandHandler) error {
 	return nil
 }
 
-// OnEvent adds an observability callback. Callbacks run synchronously on the protocol goroutine
-// that produced the event, one at a time: return quickly and never call Stop from one.
+// OnEvent adds an observability callback. Callbacks run synchronously on the goroutine that
+// produced the event, in order, one at a time, and none runs under a mutex: any API may be called
+// from a callback. A callback must return: the one limit this does not remove is that a callback
+// that never returns cannot be bounded when it runs on Stop's own goroutine.
 func (a *Agent) OnEvent(fn func(Event)) {
-	a.st.dispatchMu.Lock()
-	a.st.listeners = append(a.st.listeners, fn)
-	a.st.dispatchMu.Unlock()
+	a.shared.dispatchMu.Lock()
+	a.shared.listeners = append(a.shared.listeners, fn)
+	a.shared.dispatchMu.Unlock()
 }
 
 // Start publishes the agent and arms its watchers, its heartbeat and its receiver. ctx bounds the
-// startup only: cancelling it later does not stop the agent. A stop during Start leaves nothing
-// armed (D-9).
+// startup only: cancelling it later does not stop the agent. A stop during Start waits for it at
+// the gate, and a failed Start aborts once, leaving nothing armed (D-9).
 func (a *Agent) Start(ctx context.Context) error {
-	st := a.st
-	if !st.running.CompareAndSwap(false, true) {
-		return fmt.Errorf("actio: the agent %s is already started", st.id)
+	if err := a.acquire(ctx); err != nil {
+		return err
 	}
-	st.stopping.Store(false)
-	if err := a.startUp(ctx); err != nil {
-		a.abortStart()
+	defer a.release()
+	return a.startLocked(ctx)
+}
+
+// acquire takes the lifecycle gate, bounded by ctx: Start and every stop run one at a time, so a
+// wait for the gate can be told to give up.
+func (a *Agent) acquire(ctx context.Context) error {
+	select {
+	case a.shared.life <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// release gives back the lifecycle gate.
+func (a *Agent) release() { <-a.shared.life }
+
+// startLocked starts one run. The caller holds the gate. A start cancels a restart still in its
+// delay: the agent is being started, so the pending restart is superseded (D-10).
+func (a *Agent) startLocked(ctx context.Context) error {
+	sh := a.shared
+	if !sh.running.CompareAndSwap(false, true) {
+		return fmt.Errorf("actio: the agent %s is already started", sh.opts.ID)
+	}
+	if sh.restartAbort != nil {
+		close(sh.restartAbort)
+		sh.restartAbort = nil
+	}
+	st := &agentState{agentShared: sh, id: sh.opts.ID, current: StatusInactive}
+	st.view.Store(&peerSet{views: map[AgentID]AgentView{}, specs: map[AgentID]*Spec{}})
+	if err := a.startUp(ctx, st); err != nil {
+		a.abortStart(st)
 		return err
 	}
 	return nil
@@ -130,8 +177,9 @@ func (a *Agent) Start(ctx context.Context) error {
 
 // startUp is the lifecycle order: config, folders, the one watcher, the subscriptions, the
 // receiver, the heartbeat, and the first publication. A failure at any step leaves nothing armed.
-func (a *Agent) startUp(ctx context.Context) error {
-	st := a.st
+// The run is published through a.run only once everything in it is built: from then on, everyone
+// sees this run, and nothing in it is rewritten.
+func (a *Agent) startUp(ctx context.Context, st *agentState) error {
 	cfg, err := LoadConfig(st.opts.Config)
 	if err != nil {
 		return err // a bad ACTIO_* value surfaces here, not in New
@@ -152,18 +200,14 @@ func (a *Agent) startUp(ctx context.Context) error {
 		defer st.pubMu.Unlock()
 		return a.publishedStateLocked()
 	}
-	st.haltCh, st.discStop, st.hbDone = make(chan struct{}), make(chan struct{}), make(chan struct{})
-	st.discClosed.Store(false) // a fresh run, a fresh discovery stop
-	st.enabled = nil           // D-10: a `disabled` set by `enable` does not survive a restart
-	st.current = StatusInactive
-
+	st.haltCh, st.discStop = make(chan struct{}), make(chan struct{})
 	for _, dir := range []string{cfg.Root, st.folders.nuntium, st.folders.forum, st.folders.agent, st.folders.inbox} {
 		if err := st.files.makeDir(dir); err != nil {
 			return err // abortStart closes the provider
 		}
 	}
 	// A bad registration fails here, before anything lands in the tree.
-	spec, err := a.rebuildSpec()
+	spec, err := a.rebuildSpec(st)
 	if err != nil {
 		return err
 	}
@@ -176,8 +220,6 @@ func (a *Agent) startUp(ctx context.Context) error {
 	if err != nil {
 		return err // abortStart closes the watcher
 	}
-	st.wg.Go(func() { a.discoveryLoop(nuntium) })
-
 	recv := newReceiver(st)
 	for _, name := range st.capOrder {
 		if err := recv.register(st.caps[name], st.handlers[name]); err != nil {
@@ -199,11 +241,16 @@ func (a *Agent) startUp(ctx context.Context) error {
 	// costs at most one transient accept/reject, and the protocol re-evaluates per exchange.
 	recv.setPeerSpec(func(id AgentID) *Spec { return st.view.Load().specs[id] }) // code 106 sees the discovered spec
 	st.recv = recv
+	st.req = newRequestor(st)
+	st.hb = newHeartbeat(cfg.HeartbeatInterval, a.tick)
+	// Everything is built: from here on, everyone sees this run, and nothing in it is rewritten.
+	a.run.Store(st)
+	st.discArmed = true
+	st.wg.Go(func() { a.discoveryLoop(nuntium) })
 	if err := recv.start(&st.wg, st.haltCh); err != nil {
 		return err
 	}
-	st.req = newRequestor(st)
-	st.hb = newHeartbeat(cfg.HeartbeatInterval, a.tick)
+	st.hbDone = make(chan struct{})
 	st.hb.start(&st.hbWg, st.haltCh)
 	st.wg.Go(func() {
 		st.hbWg.Wait()
@@ -216,11 +263,9 @@ func (a *Agent) startUp(ctx context.Context) error {
 	err = publishSpec(st.files, st.folders.agent, spec)
 	st.pubMu.Unlock()
 	if err != nil {
-		a.abortStart()
 		return err
 	}
 	if err := a.setState(StatusIdle); err != nil {
-		a.abortStart()
 		return err
 	}
 	a.rescan() // the first discovery: now that the spec and the status are in the tree
@@ -237,41 +282,45 @@ func (a *Agent) wireStandardCommands(recv *receiver) {
 	recv.view.Store(&capView{caps: old.caps, cmds: cmds})
 }
 
-// resetArmed drops the armed handles; the caller has already ended the loops behind them.
-func (a *Agent) resetArmed() {
-	a.st.haltCh, a.st.discStop, a.st.hbDone, a.st.recv, a.st.req, a.st.watch, a.st.sync = nil, nil, nil, nil, nil, nil, nil
-}
-
 // abortStart drops what a failed Start armed, and re-arms none: the discovery loop, the receiver,
-// the heartbeat, the watcher and the provider all end, and the agent is not running (D-9).
-func (a *Agent) abortStart() {
-	st := a.st
+// the heartbeat, the watcher and the provider all end, and the agent is not running (D-9). It
+// runs once, on the run that failed, and it publishes inactive if that run had published idle: a
+// published idle must not outlive the run.
+func (a *Agent) abortStart(st *agentState) {
 	if st.hb != nil {
 		st.hb.stop()
+	}
+	if st.hbDone != nil {
 		<-st.hbDone
+	}
+	if st.current != StatusInactive { // a published idle must not outlive the run
+		_ = a.setState(StatusInactive)
 	}
 	if st.recv != nil {
 		_ = st.recv.stop(true, 0)
 	}
-	a.stopDiscovery()
+	if st.req != nil {
+		st.req.stop()
+	}
+	if st.discArmed {
+		close(st.discStop)
+		st.wg.Wait()
+	}
 	if st.watch != nil {
 		st.watch.close()
 	}
 	if st.sync != nil {
 		st.sync.Close()
 	}
-	a.resetArmed()
-	st.files, st.diaria = nil, nil
-	st.running.Store(false)
+	a.shared.running.Store(false)
 }
 
 // Stop ends the agent: it answers or cancels the work in progress, publishes inactive, announces,
 // releases its watchers and timers, and waits for every goroutine to end. ctx bounds the wait, not
-// the protocol's grace period: opts.Force cancels the work instead of waiting for it.
+// the protocol's grace period: opts.Force cancels the work instead of waiting for it. A stop that
+// finds one in flight waits for it at the gate and then returns: it returns only once the other
+// stop has finished, so the caller can rely on inactive being on disk (D-9).
 func (a *Agent) Stop(ctx context.Context, opts StopOptions) error {
-	if !a.st.running.Load() {
-		return nil
-	}
 	return a.stopInternal(ctx, opts, true)
 }
 
@@ -281,18 +330,27 @@ func (a *Agent) Stop(ctx context.Context, opts StopOptions) error {
 // returns); the receiver; the outbound side; C1, the status first and the delayed announce after;
 // C2, nothing armed. All the waits are bounded by ctx.
 //
-// It is safe to enter twice, from any entry (a second stop command, a retry after a failed C1):
-// the stopping CAS lets one D-9 sequence run at a time, and a stop after a completed one sees the
-// agent not running and does nothing.
+// It takes the lifecycle gate, so one D-9 sequence runs at a time, from any entry: a second stop —
+// a second stop command, a retry after a failed C1 — waits for the first at the gate, within its
+// ctx, and a stop after a completed one sees the agent not running and does nothing.
 func (a *Agent) stopInternal(ctx context.Context, opts StopOptions, closeDone bool) error {
-	st := a.st
-	if !st.stopping.CompareAndSwap(false, true) {
-		return nil // a stop is already in flight: the second entry resolves, the sequence runs once
+	if err := a.acquire(ctx); err != nil {
+		return err // a stop or a start is in flight and ctx ran out: the caller is told
 	}
-	defer st.stopping.Store(false)
-	if !st.running.Load() {
-		return nil // already stopped: nothing to stop, from any entry
+	defer a.release()
+	sh := a.shared
+	if closeDone && sh.restartAbort != nil { // a stop wins over a restart still in its delay
+		close(sh.restartAbort)
+		sh.restartAbort = nil
+		if !sh.running.Load() {
+			a.closeDoneLocked()
+			return nil
+		}
 	}
+	if !sh.running.Load() {
+		return nil
+	}
+	st := a.cur()
 	st.hb.stop()
 	select {
 	case <-st.hbDone:
@@ -313,9 +371,14 @@ func (a *Agent) stopInternal(ctx context.Context, opts StopOptions, closeDone bo
 		return ctx.Err()
 	}
 	st.req.stop()
-	a.stopDiscovery() // the discovery loop: no more scans, the pending debounce is dropped
+	if st.discClosed.CompareAndSwap(false, true) {
+		close(st.discStop) // the discovery loop: no more scans, the pending debounce is dropped
+	}
+	if err := waitBounded(ctx, &st.wg); err != nil {
+		return err
+	}
 	// C1: the status first, then the delayed announce, then the sync flush. A failed publish is
-	// logged, as in the reference: the state stays as chosen.
+	// logged, as in the reference: the state stays as chosen, and the next setState republishes it.
 	a.setState(StatusInactive)
 	if err := a.announceAfterDelay(ctx, fmt.Sprintf("agent %s is inactive", st.id)); err != nil {
 		return err
@@ -323,54 +386,68 @@ func (a *Agent) stopInternal(ctx context.Context, opts StopOptions, closeDone bo
 	if err := st.sync.Flush(ctx); err != nil {
 		return err
 	}
-	// C2: deinit. The watchers are gone, the in-memory view is dropped, nothing is armed. Done
-	// closes once per agent's life — a restart's stop must not close it again.
+	// C2: deinit. The watchers are gone, the provider is closed, the in-memory view is dropped,
+	// nothing is armed. Done closes once per agent's life — a restart's stop must not close it.
 	st.watch.close()
+	st.sync.Close()
 	st.view.Store(&peerSet{views: map[AgentID]AgentView{}, specs: map[AgentID]*Spec{}})
-	a.resetArmed()
-	st.running.Store(false)
-	if closeDone && !st.doneClosed {
-		close(st.doneCh)
-		st.doneClosed = true
+	sh.running.Store(false)
+	if closeDone {
+		a.closeDoneLocked()
+	} else {
+		sh.restartAbort = make(chan struct{}) // the restart is pending in its delay; a stop closes it
 	}
 	return nil
 }
 
-// stopDiscovery ends the discovery loop once per run: the close happens a single time, so a stop
-// entered twice (a second stop command, a retry after a failed C1, an abort racing a stop) cannot
-// close the channel twice. The wait covers the loop and every other tracked goroutine of the run.
-func (a *Agent) stopDiscovery() {
-	st := a.st
-	if st.discStop != nil && st.discClosed.CompareAndSwap(false, true) {
-		close(st.discStop)
-		st.wg.Wait()
+// closeDoneLocked closes Done once per agent's life. The caller holds the lifecycle gate.
+func (a *Agent) closeDoneLocked() {
+	if !a.shared.doneClosed {
+		close(a.shared.doneCh)
+		a.shared.doneClosed = true
+	}
+}
+
+// waitBounded waits for wg within ctx: what is stuck costs its goroutines until it returns, and
+// the caller is told.
+func waitBounded(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
 // Done closes when the agent stops. A restart does not close it. It is what lets a program select
 // on the agent's life instead of polling.
-func (a *Agent) Done() <-chan struct{} { return a.st.doneCh }
+func (a *Agent) Done() <-chan struct{} { return a.shared.doneCh }
 
 // Agmen is the snapshot of the peers we can talk to, keyed by id (the callability rules applied).
 // Treat the maps as read-only: the next scan replaces them.
-func (a *Agent) Agmen() map[AgentID]AgentView { return a.st.view.Load().views }
+func (a *Agent) Agmen() map[AgentID]AgentView { return a.cur().view.Load().views }
 
 // Refresh rescans now and returns the same view, so a program that just started a peer can see it
 // without waiting for the debounced scan. Before Start there is nothing to scan, and it says so,
 // as Request and Command do for the same situation.
 func (a *Agent) Refresh(ctx context.Context) (map[AgentID]AgentView, error) {
-	if !a.st.running.Load() {
-		return nil, fmt.Errorf("actio: the agent %s has not started", a.st.id)
+	if !a.cur().running.Load() {
+		return nil, fmt.Errorf("actio: the agent %s has not started", a.cur().id)
 	}
 	a.rescan()
-	return a.st.view.Load().views, nil
+	return a.cur().view.Load().views, nil
 }
 
 // Request is lane B from a started agent. Cancellation of ctx does not return at once: it writes the
 // cancellation and keeps waiting for the response as the protocol requires, then returns with
 // FinalStatus cancelled or abandoned and a nil error.
 func (a *Agent) Request(ctx context.Context, dst AgentID, name string, params any, opts RequestOptions) (Outcome, error) {
-	req := a.st.req
+	req := a.cur().req
 	if req == nil {
 		return Outcome{}, &CallError{Dst: dst, Name: name, Reason: "the agent is not started"}
 	}
@@ -380,7 +457,7 @@ func (a *Agent) Request(ctx context.Context, dst AgentID, name string, params an
 // Command delivers a command to dst and returns its rid. Whether the peer accepts it is the peer's
 // decision, and a command is never answered.
 func (a *Agent) Command(ctx context.Context, dst AgentID, name string, params any) (RID, error) {
-	req := a.st.req
+	req := a.cur().req
 	if req == nil {
 		return "", &CallError{Dst: dst, Name: name, Reason: "the agent is not started"}
 	}
@@ -392,7 +469,7 @@ func (a *Agent) Command(ctx context.Context, dst AgentID, name string, params an
 // it is stopped (D-22), so a peer can see why. A second call while already failed does nothing: no
 // second announce, no recovery.
 func (a *Agent) Fail(message string) error {
-	st := a.st
+	st := a.cur()
 	if st.files == nil {
 		return fmt.Errorf("actio: the agent %s has never started", st.id)
 	}
@@ -410,39 +487,54 @@ func (a *Agent) Fail(message string) error {
 
 // Diarium reads this agent's own log.
 func (a *Agent) Diarium() (DiariumRead, error) {
-	if a.st.folders.agent == "" {
-		return DiariumRead{}, fmt.Errorf("actio: the agent %s has never started", a.st.id)
+	if a.cur().folders.agent == "" {
+		return DiariumRead{}, fmt.Errorf("actio: the agent %s has never started", a.cur().id)
 	}
-	return ReadDiarium(a.st.folders.agent)
+	return ReadDiarium(a.cur().folders.agent)
 }
 
 // Log appends a log event to our diarium. It emits no ActioEvent: an event callback is not a log
 // consumer, as in the reference.
 func (a *Agent) Log(message string) error {
-	st := a.st
+	st := a.cur()
 	if st.diaria == nil {
 		return fmt.Errorf("actio: the agent %s has never started", st.id)
 	}
 	return st.diaria.append(logEvent(st.id, st.now(), message))
 }
 
-// onEvent is the agent's dispatch of one observability event: the user's callbacks, one at a time
-// under the dispatch mutex (the second of the four), then the agent's own observation, outside the
-// mutex so the observation's publication cannot invert the lock order.
+// onEvent is the agent's dispatch of observability events. The dispatch mutex guards the queue
+// only (the second of the four): an event that arrives while a delivery is in progress joins the
+// queue, and whoever is delivering delivers the rest, in order, one at a time. No callback runs
+// under a mutex, so any API may be called from a callback.
 func (a *Agent) onEvent(e Event) {
-	a.st.dispatchMu.Lock()
-	for _, fn := range a.st.listeners {
-		fn(e)
+	sh := a.shared
+	sh.dispatchMu.Lock()
+	sh.queue = append(sh.queue, e)
+	if sh.dispatching { // someone is delivering, maybe us from a callback: they deliver this one too
+		sh.dispatchMu.Unlock()
+		return
 	}
-	a.st.dispatchMu.Unlock()
-	a.observe(e)
+	sh.dispatching = true
+	for len(sh.queue) > 0 {
+		next, listeners := sh.queue[0], sh.listeners
+		sh.queue = sh.queue[1:]
+		sh.dispatchMu.Unlock()
+		for _, fn := range listeners {
+			fn(next)
+		}
+		a.observe(next)
+		sh.dispatchMu.Lock()
+	}
+	sh.dispatching = false
+	sh.dispatchMu.Unlock()
 }
 
 // observe is the agent's own reading of the events: a lost own inbox or nuntium is D-22 — the log
 // event came with it, and the agent fails itself from it.
 func (a *Agent) observe(e Event) {
 	ig, ok := e.(IgnoredEvent)
-	if !ok || (ig.Path != a.st.folders.inbox && ig.Path != a.st.folders.nuntium) {
+	if !ok || (ig.Path != a.cur().folders.inbox && ig.Path != a.cur().folders.nuntium) {
 		return
 	}
 	a.Fail("watch lost " + ig.Path)
@@ -451,21 +543,21 @@ func (a *Agent) observe(e Event) {
 // logf is the agent's log shortcut: a diarium log line, no event. A failed append is dropped: the
 // log is the report of the state, not the state itself.
 func (a *Agent) logf(format string, args ...any) {
-	if a.st.diaria == nil {
+	if a.cur().diaria == nil {
 		return
 	}
-	_ = a.st.diaria.append(logEvent(a.st.id, a.st.now(), fmt.Sprintf(format, args...)))
+	_ = a.cur().diaria.append(logEvent(a.cur().id, a.cur().now(), fmt.Sprintf(format, args...)))
 }
 
-// tick is the heartbeat's tick (D-9 v1.8): it publishes under the publication mutex, and it writes
+// tick is the heartbeat's tick (D-9): it publishes under the publication mutex, and it writes
 // nothing once the state is inactive, so it can never overwrite C1. The guard is belt-and-braces:
-// every stop waits for the heartbeat before C1, so only a tick in the start window, before the first
-// idle, can see inactive. It is a refresh: the status file with a fresh datetime, no diarium event,
-// no announce.
+// every stop waits for the heartbeat before C1, so only a tick in the start window, before the
+// first idle, can see inactive. It is a refresh: the status file with a fresh datetime, no diarium
+// event, no announce.
 func (a *Agent) tick() error {
-	a.st.pubMu.Lock()
-	defer a.st.pubMu.Unlock()
-	if a.st.current == StatusInactive {
+	a.cur().pubMu.Lock()
+	defer a.cur().pubMu.Unlock()
+	if a.cur().current == StatusInactive {
 		return nil
 	}
 	return a.publishStatusFileLocked()
@@ -473,11 +565,12 @@ func (a *Agent) tick() error {
 
 // setState changes the lifecycle state: the state first, then the status file, then the diarium
 // event, and then the StatusEvent, outside the publication mutex, as every event is. A failed
-// publish keeps the state as chosen, logs it, and reports the error.
+// publish keeps the state as chosen, logs it, and reports the error — and it is published again by
+// the next setState: a stop that fails C1 is retried, and the retry must land.
 func (a *Agent) setState(s StatusState) error {
-	st := a.st
+	st := a.cur()
 	st.pubMu.Lock()
-	changed := st.current != s
+	changed := st.current != s || st.pubFailed // a retry publishes what the last try failed to
 	st.current = s
 	var err error
 	if changed {
@@ -486,6 +579,7 @@ func (a *Agent) setState(s StatusState) error {
 			err = st.diaria.append(statusEvent(st.id, st.now(), s))
 		}
 	}
+	st.pubFailed = err != nil
 	st.pubMu.Unlock()
 	if err != nil {
 		st.logf("status %q: %v", s, err)
@@ -502,35 +596,34 @@ func (a *Agent) setState(s StatusState) error {
 // caller holds the publication mutex.
 func (a *Agent) publishStatusFileLocked() error {
 	var caps []CapabilityStatus
-	if a.st.recv != nil {
-		caps = a.st.recv.capabilityStatus()
+	if a.cur().recv != nil {
+		caps = a.cur().recv.capabilityStatus()
 	}
-	status := buildStatus(a.st.id, a.publishedStateLocked(), a.st.now(), caps)
-	return publishStatus(a.st.files, a.st.folders.agent, &status)
+	status := buildStatus(a.cur().id, a.publishedStateLocked(), a.cur().now(), caps)
+	return publishStatus(a.cur().files, a.cur().folders.agent, &status)
 }
 
 // publishedStateLocked is the state as the peers will see it: busy when the lifecycle state is
 // idle and work is in flight, an inbound exchange (the receiver's counters) or an outbound one (B2)
 // (D-8). The caller holds the publication mutex.
 func (a *Agent) publishedStateLocked() StatusState {
-	if a.st.current == StatusIdle && a.busy() {
+	if a.cur().current == StatusIdle && a.busy() {
 		return StatusBusy
 	}
-	return a.st.current
+	return a.cur().current
 }
 
 // busy is D-8: busy iff an inbound exchange is running or an outbound one (B2) is in flight.
 func (a *Agent) busy() bool {
-	if a.st.recv != nil && a.st.recv.busy() {
+	if a.cur().recv != nil && a.cur().recv.busy() {
 		return true
 	}
-	return a.st.req != nil && a.st.req.outboundCount() > 0
+	return a.cur().req != nil && a.cur().req.outboundCount() > 0
 }
 
 // rebuildSpec builds the spec from the options and the registrations, re-applies the run's enabled
 // state (D-10), and stores it. It is called with nothing held: the store is atomic.
-func (a *Agent) rebuildSpec() (*Spec, error) {
-	st := a.st
+func (a *Agent) rebuildSpec(st *agentState) (*Spec, error) {
 	caps := make([]Capability, 0, len(st.capOrder))
 	for _, name := range st.capOrder {
 		caps = append(caps, st.caps[name])
@@ -550,7 +643,7 @@ func (a *Agent) rebuildSpec() (*Spec, error) {
 // under the publication mutex, as every publication is. The delay is bounded by ctx, as every wait
 // of the lifecycle is.
 func (a *Agent) announceAfterDelay(ctx context.Context, text string) error {
-	st := a.st
+	st := a.cur()
 	select {
 	case <-time.After(st.config.AnnounceDelay):
 	case <-ctx.Done():
@@ -572,7 +665,7 @@ func (a *Agent) announceAfterDelay(ctx context.Context, text string) error {
 // and its fired channel belong to this goroutine alone; the timer callback only sends, as §5.4
 // orders.
 func (a *Agent) discoveryLoop(nuntium *folderWatch) {
-	st := a.st
+	st := a.cur()
 	var timer *time.Timer
 	fired := make(chan struct{}, 1)
 	for {
@@ -601,7 +694,7 @@ func (a *Agent) discoveryLoop(nuntium *folderWatch) {
 // the atomic swap of the view (the discovery's publish, no mutex: one pointer). What reaches
 // IgnoredEvent is exactly what Scan reports — no dedup, no reason of our own.
 func (a *Agent) rescan() {
-	st := a.st
+	st := a.cur()
 	seen, err := Scan(st.folders.root)
 	if err != nil {
 		st.logf("discovery scan failed: %v", err)
@@ -642,6 +735,10 @@ type peerSet struct {
 // able to keep the agent down for an arbitrary time, so a delay above the bound is clamped to it.
 const maxRestartDelay = 60 * time.Second
 
+// commandStopBound is what a stop command gets beyond the protocol's grace: the grace is the
+// work's, this is the stop's own.
+const commandStopBound = 30 * time.Second
+
 // clampedRestartDelay is the restart command's delay policy: a positive delay is honoured up to
 // the bound, anything above it clamps to the bound, and a non-positive delay arms no wait.
 func clampedRestartDelay(d time.Duration) time.Duration {
@@ -654,15 +751,21 @@ func clampedRestartDelay(d time.Duration) time.Duration {
 	return d
 }
 
+// commandStopBoundFor is a stop command's bound: the protocol's grace plus what the stop itself
+// needs beyond it. A huge grace clamps nothing: the bound grows with the grace.
+func commandStopBoundFor(grace time.Duration) time.Duration { return grace + commandStopBound }
+
 // cmdStop is the `stop` command: the agent stops itself, with the force the sender gave. The
 // handler's own context is the receiver's and dies with the stop, so the stop runs on its own bound
-// context: the command is never answered, and the stop must be able to finish.
+// context: the command is never answered, and the stop must be able to finish. The bound is the
+// protocol's grace plus the stop's own: with work that outlives the grace, a bare grace-length
+// bound would expire first and leave the agent half-stopped.
 func (a *Agent) cmdStop(ctx context.Context, params json.RawMessage, cmd *CommandContext) error {
 	var p struct {
 		Force bool `json:"force"`
 	}
 	_ = json.Unmarshal(params, &p)
-	bound, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	bound, cancel := context.WithTimeout(context.Background(), commandStopBoundFor(a.cur().config.StopGrace))
 	defer cancel()
 	return a.stopInternal(bound, StopOptions{Force: p.Force}, true)
 }
@@ -675,10 +778,10 @@ func (a *Agent) cmdEnable(ctx context.Context, params json.RawMessage, cmd *Comm
 	}
 	_ = json.Unmarshal(params, &p)
 	disabled := !p.Enabled
-	st := a.st
+	st := a.cur()
 	st.pubMu.Lock()
 	st.enabled = &disabled
-	spec, err := a.rebuildSpec()
+	spec, err := a.rebuildSpec(st)
 	if err == nil {
 		err = publishSpec(st.files, st.folders.agent, spec)
 	}
@@ -696,7 +799,10 @@ func (a *Agent) cmdEnable(ctx context.Context, params json.RawMessage, cmd *Comm
 // cmdRestart is the `restart` command (D-10): stop, wait the delay, start fresh in the same
 // object. The registrations survive; the disabled flag set by enable does not. It runs on the
 // receiver's command goroutine, which outlives the stop: the stop cancels the receiver's context,
-// not the goroutine, and the new state is armed before the handler returns.
+// not the goroutine, and the new state is armed before the handler returns. A stop or a start
+// during the delay cancels the restart: a stop then closes Done, since the agent is down and
+// nobody is left to bring it back, and a restart whose Start fails closes Done for the same
+// reason.
 func (a *Agent) cmdRestart(ctx context.Context, params json.RawMessage, cmd *CommandContext) error {
 	var p struct {
 		Force *bool `json:"force"`
@@ -704,7 +810,7 @@ func (a *Agent) cmdRestart(ctx context.Context, params json.RawMessage, cmd *Com
 	}
 	_ = json.Unmarshal(params, &p)
 	force := p.Force != nil && *p.Force
-	bound, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	bound, cancel := context.WithTimeout(context.Background(), commandStopBoundFor(a.cur().config.StopGrace))
 	err := a.stopInternal(bound, StopOptions{Force: force}, false)
 	cancel()
 	if err != nil {
@@ -717,31 +823,53 @@ func (a *Agent) cmdRestart(ctx context.Context, params json.RawMessage, cmd *Com
 	if p.Delay != nil {
 		delay = clampedRestartDelay(time.Duration(*p.Delay) * time.Second)
 	}
-	if delay > 0 {
-		<-time.After(delay)
+	if err := a.acquire(context.Background()); err != nil {
+		return err
 	}
-	return a.Start(context.Background())
+	abort := a.shared.restartAbort
+	a.release()
+	if abort == nil {
+		return nil // a stop or a start got there first
+	}
+	select {
+	case <-time.After(delay):
+	case <-abort:
+		return nil // a stop won the delay: it closed Done
+	}
+	if err := a.acquire(context.Background()); err != nil {
+		return err
+	}
+	defer a.release()
+	if a.shared.restartAbort != abort {
+		return nil // a stop or a start superseded this restart
+	}
+	if err := a.startLocked(context.Background()); err != nil {
+		a.closeDoneLocked() // the restart failed: nobody will restart it, so the agent has stopped
+		return err
+	}
+	return nil
 }
 
 // cmdPing is the `ping` command: a fresh datetime in the spec and the status, then the re-announce.
 func (a *Agent) cmdPing(ctx context.Context, params json.RawMessage, cmd *CommandContext) error {
-	a.st.pubMu.Lock()
-	spec, err := a.rebuildSpec()
+	a.cur().pubMu.Lock()
+	spec, err := a.rebuildSpec(a.cur())
 	if err == nil {
-		err = publishSpec(a.st.files, a.st.folders.agent, spec)
+		err = publishSpec(a.cur().files, a.cur().folders.agent, spec)
 	}
 	if err == nil {
 		err = a.publishStatusFileLocked()
 	}
-	a.st.pubMu.Unlock()
+	a.cur().pubMu.Unlock()
 	if err != nil {
 		return err
 	}
-	return a.announceAfterDelay(ctx, fmt.Sprintf("agent %s is alive", a.st.id))
+	return a.announceAfterDelay(ctx, fmt.Sprintf("agent %s is alive", a.cur().id))
 }
 
-// agentState is the wiring the protocol files share, created by New and by the CLI's Call. Every
-// piece of it belongs to one agent: there is no process-wide state in this package.
+// agentState is one run of one agent: the wiring the protocol files share for this run, created
+// by startLocked and published whole. Its fields are never rewritten; a restart builds a fresh
+// one. What outlives a run is the embedded shared part.
 type agentState struct {
 	id      AgentID
 	config  Config
@@ -758,17 +886,8 @@ type agentState struct {
 	spec  func() *Spec
 	state func() StatusState
 
-	// The lifecycle wiring (frozen-interfaces §3, the one allowed change to agentState): the
-	// registrations, the two agent-owned mutexes (publication and the OnEvent dispatch), the
-	// loops, and the lifecycle state.
-	opts       Options
-	caps       map[string]Capability
-	capOrder   []string
-	handlers   map[string]CapabilityHandler
-	cmds       map[string]CommandHandler
-	pubMu      sync.Mutex // 1: the publication of status, spec, the announce and the state's diarium
-	dispatchMu sync.Mutex // 2: the OnEvent dispatch
-	listeners  []func(Event)
+	// The run's own wiring: the loops and their stops. The receiver and the requestor keep this
+	// run: a goroutine that outlives it reads a stale run, which is harmless.
 	recv       *receiver
 	req        *requestor
 	hb         *heartbeat
@@ -778,14 +897,37 @@ type agentState struct {
 	haltCh     chan struct{}  // the hard abort of a failed Start: the receiver's force path
 	discStop   chan struct{}
 	discClosed atomic.Bool // the discovery stop's close has run for this run: stopInternal is re-entrant
-	running    atomic.Bool
-	stopping   atomic.Bool
-	doneCh     chan struct{}
-	doneClosed bool        // Done closes once per life: a restart's stop must not close it again
+	discArmed  bool        // the discovery loop is running: abortStart's close and wait apply
 	enabled    *bool       // D-10: the enable command's disabled state for this run
 	current    StatusState // the lifecycle state; busy is derived, under pubMu
+	pubFailed  bool        // the last status publish failed: the next setState republishes
 	specNow    atomic.Pointer[Spec]
 	view       atomic.Pointer[peerSet]
+
+	*agentShared
+}
+
+// agentShared is what outlives a run: the registrations, the two agent-owned mutexes (publication
+// and the OnEvent dispatch), the lifecycle gate, and Done. Embedded by pointer in every run, so
+// st.caps and the rest read the same way.
+type agentShared struct {
+	opts     Options
+	caps     map[string]Capability
+	capOrder []string
+	handlers map[string]CapabilityHandler
+	cmds     map[string]CommandHandler
+
+	pubMu       sync.Mutex // 1: the publication of status, spec, the announce and the state's diarium
+	dispatchMu  sync.Mutex // 2: the OnEvent queue, never a callback
+	listeners   []func(Event)
+	queue       []Event
+	dispatching bool
+
+	running      atomic.Bool
+	life         chan struct{} // the lifecycle gate: capacity 1, so a wait for it can be bounded
+	restartAbort chan struct{} // set while a restart is in its delay; a stop or a start closes it
+	doneCh       chan struct{}
+	doneClosed   bool // Done closes once per life: a restart's stop must not close it again
 }
 
 // agentFolders are the folders of one agent inside the actio root, all absolute: the shared root,
