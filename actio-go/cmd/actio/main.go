@@ -439,10 +439,15 @@ func validateCmd(cfg actio.Config, rest []string, as string, out, errW io.Writer
 	}
 	kind := as
 	if kind == "" {
-		// The name publishes nothing (or nothing at all): let the library's own resolution
-		// answer — name first, then bytes — and print what it settled on.
-		if kind, err = actio.KindOfFile(file); err != nil {
-			fmt.Fprintln(errW, err)
+		// The name decides, the reference's rule (cli.ts kindOf): the published names first, and a
+		// bare <stem>.json is a request — the reference's own last line (cli.ts:312), the CLI's own
+		// UX rule, not a second protocol table. It must not grow any other rule.
+		kind = actio.KindOf(file)
+		if kind == "" && strings.HasSuffix(filepath.Base(file), ".json") {
+			kind = "request"
+		}
+		if kind == "" {
+			noValidator(errW, filepath.Base(file))
 			return 1
 		}
 	} else if !kindIn(validateKinds, kind) {

@@ -433,35 +433,50 @@ func TestRunValidate(t *testing.T) {
 			t.Errorf("got exit %d err %q, want 1 / a schema reason", code, errOut)
 		}
 	})
-	// The name publishes nothing: the library's own fallback decides (name, then bytes) and the
-	// CLI prints what it settled on. A real envelope body under a non-rid stem is a request —
-	// the same file the TS CLI calls `OK request` on.
-	t.Run("a nameless file with a real envelope body validates by its bytes", func(t *testing.T) {
-		body, err := os.ReadFile("../../testdata/vectors/request/valid/01-a1-request.json")
+	// The seven rows of the reference transcript (orchestra/tasks/FIX19-A-6.brief.md): the name
+	// decides, the reference's rule (cli.ts kindOf). A bare <stem>.json is a request (cli.ts:312,
+	// the CLI's own UX rule, not a second protocol table); a non-.json name gets the reference's
+	// "no validator". Each row asserts the exit code AND the word the CLI prints, so a rename of
+	// the .json → request fallback cannot hide behind an exit code.
+	t.Run("the seven reference rows", func(t *testing.T) {
+		requestBody, err := os.ReadFile("../../testdata/vectors/request/valid/01-a1-request.json")
 		if err != nil {
 			t.Fatal(err)
 		}
-		f := filepath.Join(root, "copy.json")
-		writeFile(t, f, string(body))
-		code, out, errOut := cli("validate", f)
-		if code != 0 || strings.TrimSpace(out) != "OK request" {
-			t.Errorf("got exit %d out %q err %q, want 0 / OK request (the library's bytewise fallback, not a CLI rule)", code, out, errOut)
+		rows := []struct {
+			name     string // the file name
+			body     string // the content
+			wantExit int
+			wantOut  string // for exit 0: the stdout word
+			wantErr  string // for exit 1: a substring of the stderr
+		}{
+			{"nuntium/nuntium.json", `{"id":"broadcast","datetime":"` + datetime + `","ts":1792836000,"nuntium":"hello"}`, 0, "OK announce", ""},
+			{"spec.json", specBody, 0, "OK spec", ""},
+			{"status.json", statusBody, 0, "OK status", ""},
+			{"copy.json", string(requestBody), 0, "OK request", ""},
+			{"mis.json", `{"rid":"01JB7Q3W8K2M4N6P8R0S2T4V6X","src":"s","dst":"d","datetime":"` + datetime + `","type":"res","actio_version":"0.1","response":{"ok":true}}`, 1, "", "request.schema.json"},
+			{"diaryx.json", diariumLine, 1, "", "request.schema.json"},
+			{"junk.json", "not json at all", 1, "", "request.schema.json"},
+			{"notes.txt", "hello", 1, "", `no validator for "notes.txt"`},
 		}
-	})
-	t.Run("a nameless file with garbage gets the library's diagnosis", func(t *testing.T) {
-		bad := filepath.Join(root, "junk.json")
-		writeFile(t, bad, "not json at all")
-		code, _, errOut := cli("validate", bad)
-		if code != 1 || !strings.Contains(errOut, "not a published name and not an envelope") {
-			t.Errorf("got exit %d err %q, want 1 / the library's diagnosis (the CLI does not decide \"no validator\" itself)", code, errOut)
-		}
-	})
-	t.Run("a nameless file that is valid JSON but no envelope", func(t *testing.T) {
-		f := filepath.Join(root, "notes.txt")
-		writeFile(t, f, "hello")
-		code, _, errOut := cli("validate", f)
-		if code != 1 || !strings.Contains(errOut, "not a published name and not an envelope") {
-			t.Errorf("got exit %d err %q, want 1 / the library's diagnosis", code, errOut)
+		for _, row := range rows {
+			t.Run(row.name, func(t *testing.T) {
+				f := filepath.Join(root, row.name)
+				if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				writeFile(t, f, row.body)
+				code, out, errOut := cli("validate", f)
+				if code != row.wantExit {
+					t.Errorf("validate %s: got exit %d out %q err %q, want exit %d", row.name, code, out, errOut, row.wantExit)
+				}
+				if row.wantOut != "" && strings.TrimSpace(out) != row.wantOut {
+					t.Errorf("validate %s: got out %q, want %q (the word, not just the exit code)", row.name, out, row.wantOut)
+				}
+				if row.wantErr != "" && !strings.Contains(errOut, row.wantErr) {
+					t.Errorf("validate %s: got err %q, want it to contain %q", row.name, errOut, row.wantErr)
+				}
+			})
 		}
 	})
 	t.Run("an unknown --as kind", func(t *testing.T) {

@@ -241,13 +241,9 @@ func Validate(path string, kind string) error {
 		return err
 	}
 	if kind == "" {
-		kind = KindOf(path)
-		if kind == "" {
-			k, ok := envelopeKind(raw)
-			if !ok {
-				return fmt.Errorf("actio: cannot infer the kind of %s: not a published name and not an envelope", path)
-			}
-			kind = k
+		kind, err = resolveKind(path, raw)
+		if err != nil {
+			return err
 		}
 	}
 	switch kind {
@@ -341,8 +337,8 @@ func validateDiariumFile(path string, raw []byte) error {
 }
 
 // resolveKind is Validate's name→bytes resolution: the published name first (KindOf), then
-// the bytes (envelopeKind). It is shared with KindOfFile, so the library's diagnosis of a
-// nameless file has one home.
+// the bytes (envelopeKind). It is the library's diagnosis of a nameless file; the CLI has its
+// own name rule and does not use it.
 func resolveKind(path string, raw []byte) (string, error) {
 	if kind := KindOf(path); kind != "" {
 		return kind, nil
@@ -351,17 +347,6 @@ func resolveKind(path string, raw []byte) (string, error) {
 		return k, nil
 	}
 	return "", fmt.Errorf("actio: cannot infer the kind of %s: not a published name and not an envelope", path)
-}
-
-// KindOfFile resolves the kind the way Validate does — the published name first, then the
-// bytes — and is the CLI's window into that resolution: the CLI prints what the library
-// settled on and never re-decides what a nameless file is.
-func KindOfFile(path string) (string, error) {
-	raw, err := readFile(path)
-	if err != nil {
-		return "", err
-	}
-	return resolveKind(path, raw)
 }
 
 // envelopeKind names the body key of an envelope file: exactly one of the four, or ok false when

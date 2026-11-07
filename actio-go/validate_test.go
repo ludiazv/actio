@@ -481,10 +481,11 @@ func TestValidatePath(t *testing.T) {
 // and nuntium.json (Broadcast) — must come back as "announce" from the library's own kind
 // inference and must validate under it. If a future change to announceFileNames or KindOf breaks
 // this, the message says exactly which name stopped round-tripping.
-// TestKindOfFileFallsBackToTheBytes pins the library's own resolution: the published name
-// wins, and a name that publishes nothing is settled by the bytes — the window the CLI uses,
-// so the CLI never carries a second rule of its own.
-func TestKindOfFileFallsBackToTheBytes(t *testing.T) {
+// TestValidateResolvesNameThenBytes pins the library's own resolution through Validate: the
+// published name wins, a name that publishes nothing is settled by the bytes (envelopeKind), and
+// when neither resolves the diagnosis names the file. This is the library's export; the CLI has
+// its own name rule and does not use it.
+func TestValidateResolvesNameThenBytes(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, content string) string {
 		t.Helper()
@@ -494,30 +495,35 @@ func TestKindOfFileFallsBackToTheBytes(t *testing.T) {
 		}
 		return p
 	}
+	// A valid request envelope (wrapped) body, from the library's own test vectors.
 	requestBody, err := os.ReadFile(filepath.Join("testdata", "vectors", "request", "valid", "01-a1-request.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// A real envelope body under a non-rid stem: the bytes settle it as a request.
-	kind, err := KindOfFile(write("copy.json", string(requestBody)))
-	if err != nil || kind != KindRequest {
-		t.Errorf("KindOfFile(copy.json) = (%q, %v), want (%q, nil): the bytewise fallback is the library's", kind, err, KindRequest)
+	// The published name wins over the bytes: a wrapped request body in spec.json is settled as a
+	// spec (the name), so the failure is a spec schema reason, not a request one.
+	err = Validate(write("spec.json", string(requestBody)), "")
+	if err == nil {
+		t.Fatal("Validate(spec.json with a request body, \"\") = nil, want a spec schema failure")
+	}
+	if !strings.Contains(err.Error(), "spec.schema.json") {
+		t.Errorf("the name did not decide first: the failure %q is not a spec schema reason", err)
 	}
 
-	// Garbage under a nameless file: the library's diagnosis, naming the file.
-	kind, err = KindOfFile(write("junk.json", "not json at all"))
-	if err == nil || kind != "" {
-		t.Fatalf("KindOfFile(junk.json) = (%q, %v), want (\"\", an error)", kind, err)
+	// A name that publishes nothing is settled by the bytes: a wrapped request body in copy.json
+	// is a request (the envelopeKind fallback, the library's own rule).
+	if err = Validate(write("copy.json", string(requestBody)), ""); err != nil {
+		t.Errorf("Validate(copy.json with a wrapped request body, \"\") = %v, want nil: the bytewise fallback is the library's", err)
+	}
+
+	// Neither the name nor the bytes resolve: the library's diagnosis, naming the file.
+	err = Validate(write("junk.json", "not json at all"), "")
+	if err == nil {
+		t.Fatal("Validate(junk.json, \"\") = nil, want an error")
 	}
 	if !strings.Contains(err.Error(), "not a published name and not an envelope") {
 		t.Errorf("the diagnosis %q does not say what it is: not a published name and not an envelope", err)
-	}
-
-	// A published name wins over the bytes: a request body in spec.json is a spec.
-	kind, err = KindOfFile(write("spec.json", string(requestBody)))
-	if err != nil || kind != KindSpec {
-		t.Errorf("KindOfFile(spec.json with a request body) = (%q, %v), want (%q, nil): the name decides first", kind, err, KindSpec)
 	}
 }
 
