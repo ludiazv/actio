@@ -298,6 +298,30 @@ func TestScanReservedAndHiddenExcluded(t *testing.T) {
 	}
 }
 
+// Row 1.8: a regular *file* named actio.json at the root is not an agent folder. Scan skips
+// non-directory entries silently (the !info.IsDir() continue) — no agent, no error out of Scan,
+// no ignored entry. A file is not a folder, and the scan does not report it as one.
+func TestScanFileNamedActioJsonIsNotAnAgent(t *testing.T) {
+	root := t.TempDir()
+	// A regular file named actio.json at the root (not a directory).
+	if err := os.WriteFile(filepath.Join(root, "actio.json"), []byte(`{"id":"actio"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Scan(root)
+	if err != nil {
+		t.Fatalf("Scan returned an error for a non-directory entry: %v", err)
+	}
+	if len(result.Agents) != 0 {
+		t.Errorf("Scan reported %d agents for a non-directory entry, want 0: %+v", len(result.Agents), result.Agents)
+	}
+	if len(result.Ignored) != 0 {
+		t.Errorf("Scan reported the non-directory entry as ignored, want silence: %+v", result.Ignored)
+	}
+	if len(result.Duplicates) != 0 {
+		t.Errorf("Scan reported the non-directory entry as a duplicate, want silence: %+v", result.Duplicates)
+	}
+}
+
 // Ported from ../actio-ts/test/unit/discovery.test.ts:299, "scan ignores silently a folder
 // missing spec.json or status.json (rule 2)": an empty folder, a folder with only spec.json and a
 // folder with only status.json are all silent — the result is empty in all three fields, as the

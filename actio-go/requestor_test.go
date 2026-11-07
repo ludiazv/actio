@@ -546,6 +546,74 @@ func TestRequestCallabilityRefusals(t *testing.T) {
 	}
 }
 
+// Row 6.4: the requestor validates its own file before it writes it (G-5). An outbound request
+// whose built file would not conform to request.schema.json is refused — the error is ours, and
+// nothing is written: no <rid>.json in the destination inbox, no outreq diarium line. The
+// injection point is from the public surface: a capability name with a space, which the schema's
+// capabilityName pattern forbids and which the builder does not reject earlier (the capability
+// registration validates the schemas, not the name).
+func TestRequestSelfValidationRefusesNonconformingFile(t *testing.T) {
+	events := make(chan Event, 64)
+	x := newReqTest(t, "me", "peer", events)
+	// The destination peer has a capability with an invalid name (a space): the schema's
+	// capabilityName pattern forbids it, and the builder does not reject it earlier.
+	badName := "my capability"
+	peer := Spec{
+		ID:                  x.dst,
+		ActioVersion:        ProtocolVersion,
+		Datetime:            formatISO(time.Now()),
+		Description:         "test peer",
+		AcceptsCommandsFrom: []string{"*"},
+		Capabilities:        []Capability{{Name: badName, Description: "bad", Parameters: json.RawMessage(`{}`), Actio: CapabilityActio{Result: json.RawMessage(`{"type":"object"}`)}}},
+		SecurityPosture:     "trusted",
+	}
+	x.r.scanFn = func(root string) (ScanResult, error) {
+		return ScanResult{Agents: []DiscoveredAgent{{
+			Folder: filepath.Join(root, string(x.dst)),
+			Spec:   peer,
+			Status: Status{ID: x.dst, Status: StatusIdle, Datetime: formatISO(time.Now()), CapabilityStatus: []CapabilityStatus{}},
+		}}}, nil
+	}
+	x.r.callableFn = func(self *Spec, p DiscoveredAgent, now time.Time) *AgentView {
+		caps := make(map[string]Capability, len(p.Spec.Capabilities))
+		for _, c := range p.Spec.Capabilities {
+			caps[c.Name] = c
+		}
+		return &AgentView{
+			ID: p.Spec.ID, Folder: p.Folder, Spec: p.Spec, Status: p.Status,
+			Health: HealthHealthy, Commands: true, Capabilities: caps,
+		}
+	}
+	// Make the request with the invalid name. The self-validation refuses it before the write.
+	// A bounded context: if the self-validation is skipped (the control's mutation), the request
+	// would proceed to the B2 loop and wait for a response that never comes; the timeout ends it.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := x.r.request(ctx, x.dst, badName, nil, RequestOptions{})
+	if err == nil {
+		t.Fatal("the nonconforming request was not refused")
+	}
+	// The error is ours (the schema's words), not a callability refusal.
+	var ce *CallError
+	if errors.As(err, &ce) {
+		t.Errorf("the refusal is a *CallError, want the schema's words: %v", err)
+	}
+	if !strings.Contains(err.Error(), "name") && !strings.Contains(err.Error(), "capability") && !strings.Contains(err.Error(), "pattern") {
+		t.Errorf("the error does not name the reason: %v", err)
+	}
+	// Nothing is written: no <rid>.json in the destination inbox.
+	entries, _ := os.ReadDir(x.inbox)
+	if len(entries) != 0 {
+		t.Fatalf("the refused request left files in the inbox: %v", entries)
+	}
+	// No outreq diarium line: the write (and its diarium line) never happened. The plan's order
+	// puts the self-validation before the write, so a refusal leaves no diarium trace.
+	di, err2 := os.ReadFile(filepath.Join(x.agentDir, "diarium.jsonl"))
+	if err2 == nil && strings.Contains(string(di), "outreq") {
+		t.Errorf("the refused request wrote an outreq diarium line: %s", di)
+	}
+}
+
 // Call refuses a timeout of zero or less, and builds nothing.
 func TestCallRefusesZeroTimeout(t *testing.T) {
 	root := t.TempDir()

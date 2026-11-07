@@ -1247,3 +1247,79 @@ func TestRecvDeferredEnvelopeKeepsRaw(t *testing.T) {
 		t.Fatalf("the deferred res is not the file's bytes as exchanged:\n file: %s\n exchange: %s", resRaw, ex.resRaw)
 	}
 }
+
+// Row 15.4: a request file that is ignored (it fails the schema) drops the envelopes deferred
+// for its rid (D-15). A deferred .can is parked before the malformed .json arrives; when the
+// .json is ignored, the deferred envelope is dropped — no working set, no answer written, a
+// diarium line naming the drop — and a later file for the same rid starts fresh (it does not
+// resurrect the dropped envelope). The neighbour TestRecvDeferredEnvelopeKeepsRaw pins the keep
+// half (a tracked request drains its deferred envelopes); this pins the drop half.
+func TestRecvIgnoredRequestDropsDeferred(t *testing.T) {
+	tt := newRecvTest(t, 5*time.Second)
+	tt.registerEcho()
+	tt.start()
+	rid := tt.newRID()
+	// Park a deferred cancellation for the rid (it arrived before the request, lexical order).
+	canRaw := craftedCan(rid, tt.now())
+	can, err := validateCancellationFile(canRaw)
+	if err != nil {
+		t.Fatalf("the crafted cancellation is not valid: %v", err)
+	}
+	tt.r.parkDeferred(rid, deferredEnv{kind: BodyCancellation, can: can, raw: canRaw})
+	if len(tt.r.deferred[rid]) != 1 {
+		t.Fatalf("the deferred envelope was not parked: %d", len(tt.r.deferred[rid]))
+	}
+	// The malformed request file: a "request" body key, but the body's name fails the schema
+	// (a space is not in the capabilityName pattern).
+	bad := `{"request":{"ts":1,"nonce":"` + newNonce() + `","signature":null,"name":"my capability","parameters":null,"timeout":0,"attachments":[]},"rid":"` + string(rid) + `","src":"peer","dst":"agent","datetime":"` + formatISO(tt.now()) + `","type":"req","actio_version":"1.0"}`
+	tt.writeRawEnvelope(t, string(rid)+".json", []byte(bad))
+	// The ignore of the request file is the observable effect: wait for it with a named bound.
+	tt.hasEvent(t, 5*time.Second, func(e Event) bool {
+		ig, ok := e.(IgnoredEvent)
+		return ok && strings.HasSuffix(ig.Path, string(rid)+".json") && ig.Reason != ""
+	})
+	// The deferred envelope is dropped: no longer in the deferred table.
+	if got := len(tt.r.deferred[rid]); got != 0 {
+		t.Errorf("the deferred envelope survived the ignore, want it dropped: %d left", got)
+	}
+	// No working set: the rid is not tracked as an exchange.
+	if _, tracked := tt.r.exchanges[rid]; tracked {
+		t.Errorf("the ignored request was tracked as an exchange, want no working set")
+	}
+	// No answer written: no .res.json in the inbox.
+	if tt.st.files.exists(tt.resPath(rid)) {
+		t.Errorf("an answer was written for an ignored request: %s", tt.resPath(rid))
+	}
+	// The diarium names the drop: an "ignored" line for the request file and a "deferred" line
+	// for the dropped envelope, both naming the rid.
+	lines := tt.logLines(t)
+	var ignoredReq, deferredDrop bool
+	for _, l := range lines {
+		msg := string(l.EventData)
+		if strings.Contains(msg, string(rid)+".json") && strings.Contains(msg, "ignored") {
+			ignoredReq = true
+		}
+		if strings.Contains(msg, string(rid)) && strings.Contains(msg, "deferred") && strings.Contains(msg, "D-15") {
+			deferredDrop = true
+		}
+	}
+	if !ignoredReq {
+		t.Errorf("the diarium has no \"ignored\" line naming the request file: %v", lines)
+	}
+	if !deferredDrop {
+		t.Errorf("the diarium has no \"deferred\" drop line naming the rid: %v", lines)
+	}
+	// A later file for the same rid starts fresh: a valid request is tracked and answered without
+	// the dropped .can (it is not resurrected).
+	tt.writeRequest(t, rid, "echo", json.RawMessage(`{}`), 0)
+	if b := tt.readResponse(t, rid); b.Error {
+		t.Fatalf("the later request for the same rid was not served: %+v", b)
+	}
+	ex, ok := tt.r.exchanges[rid]
+	if !ok {
+		t.Fatalf("the later request was not tracked")
+	}
+	if ex.can != nil {
+		t.Errorf("the dropped deferred .can was resurrected onto the later exchange")
+	}
+}
