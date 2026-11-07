@@ -153,7 +153,8 @@ func (a *Agent) startUp(ctx context.Context) error {
 		return a.publishedStateLocked()
 	}
 	st.haltCh, st.discStop, st.hbDone = make(chan struct{}), make(chan struct{}), make(chan struct{})
-	st.enabled = nil // D-10: a `disabled` set by `enable` does not survive a restart
+	st.discClosed.Store(false) // a fresh run, a fresh discovery stop
+	st.enabled = nil           // D-10: a `disabled` set by `enable` does not survive a restart
 	st.current = StatusInactive
 
 	for _, dir := range []string{cfg.Root, st.folders.nuntium, st.folders.forum, st.folders.agent, st.folders.inbox} {
@@ -191,6 +192,11 @@ func (a *Agent) startUp(ctx context.Context) error {
 			return err
 		}
 	}
+	// The receiver's code 106 pairs the self spec (one atomic) with a peer spec (another): the pair
+	// can be one scan apart, and a namespace decision made on a stale self spec self-corrects on the
+	// next scan — the specs change only on a start, an enable, or a peer's publication, each of
+	// which re-scans. Kept on purpose: a shared snapshot would add a publication for a window that
+	// costs at most one transient accept/reject, and the protocol re-evaluates per exchange.
 	recv.setPeerSpec(func(id AgentID) *Spec { return st.view.Load().specs[id] }) // code 106 sees the discovered spec
 	st.recv = recv
 	if err := recv.start(&st.wg, st.haltCh); err != nil {
@@ -247,10 +253,7 @@ func (a *Agent) abortStart() {
 	if st.recv != nil {
 		_ = st.recv.stop(true, 0)
 	}
-	if st.discStop != nil {
-		close(st.discStop)
-		st.wg.Wait()
-	}
+	a.stopDiscovery()
 	if st.watch != nil {
 		st.watch.close()
 	}
@@ -266,12 +269,7 @@ func (a *Agent) abortStart() {
 // releases its watchers and timers, and waits for every goroutine to end. ctx bounds the wait, not
 // the protocol's grace period: opts.Force cancels the work instead of waiting for it.
 func (a *Agent) Stop(ctx context.Context, opts StopOptions) error {
-	st := a.st
-	if !st.stopping.CompareAndSwap(false, true) {
-		return nil // idempotent: a second stop resolves
-	}
-	defer st.stopping.Store(false)
-	if !st.running.Load() {
+	if !a.st.running.Load() {
 		return nil
 	}
 	return a.stopInternal(ctx, opts, true)
@@ -282,8 +280,19 @@ func (a *Agent) Stop(ctx context.Context, opts StopOptions) error {
 // never overwrite C1; the bound is this ctx, and a stuck tick costs one goroutine until its write
 // returns); the receiver; the outbound side; C1, the status first and the delayed announce after;
 // C2, nothing armed. All the waits are bounded by ctx.
+//
+// It is safe to enter twice, from any entry (a second stop command, a retry after a failed C1):
+// the stopping CAS lets one D-9 sequence run at a time, and a stop after a completed one sees the
+// agent not running and does nothing.
 func (a *Agent) stopInternal(ctx context.Context, opts StopOptions, closeDone bool) error {
 	st := a.st
+	if !st.stopping.CompareAndSwap(false, true) {
+		return nil // a stop is already in flight: the second entry resolves, the sequence runs once
+	}
+	defer st.stopping.Store(false)
+	if !st.running.Load() {
+		return nil // already stopped: nothing to stop, from any entry
+	}
 	st.hb.stop()
 	select {
 	case <-st.hbDone:
@@ -303,9 +312,8 @@ func (a *Agent) stopInternal(ctx context.Context, opts StopOptions, closeDone bo
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	st.req.stop()      // the outbound side: what is still in B2 is abandoned (D-9)
-	close(st.discStop) // the discovery loop: no more scans, the pending debounce is dropped
-	st.wg.Wait()
+	st.req.stop()
+	a.stopDiscovery() // the discovery loop: no more scans, the pending debounce is dropped
 	// C1: the status first, then the delayed announce, then the sync flush. A failed publish is
 	// logged, as in the reference: the state stays as chosen.
 	a.setState(StatusInactive)
@@ -315,7 +323,8 @@ func (a *Agent) stopInternal(ctx context.Context, opts StopOptions, closeDone bo
 	if err := st.sync.Flush(ctx); err != nil {
 		return err
 	}
-	// C2: deinit. The watchers are gone, the in-memory view is dropped, nothing is armed.
+	// C2: deinit. The watchers are gone, the in-memory view is dropped, nothing is armed. Done
+	// closes once per agent's life — a restart's stop must not close it again.
 	st.watch.close()
 	st.view.Store(&peerSet{views: map[AgentID]AgentView{}, specs: map[AgentID]*Spec{}})
 	a.resetArmed()
@@ -327,6 +336,17 @@ func (a *Agent) stopInternal(ctx context.Context, opts StopOptions, closeDone bo
 	return nil
 }
 
+// stopDiscovery ends the discovery loop once per run: the close happens a single time, so a stop
+// entered twice (a second stop command, a retry after a failed C1, an abort racing a stop) cannot
+// close the channel twice. The wait covers the loop and every other tracked goroutine of the run.
+func (a *Agent) stopDiscovery() {
+	st := a.st
+	if st.discStop != nil && st.discClosed.CompareAndSwap(false, true) {
+		close(st.discStop)
+		st.wg.Wait()
+	}
+}
+
 // Done closes when the agent stops. A restart does not close it. It is what lets a program select
 // on the agent's life instead of polling.
 func (a *Agent) Done() <-chan struct{} { return a.st.doneCh }
@@ -336,8 +356,12 @@ func (a *Agent) Done() <-chan struct{} { return a.st.doneCh }
 func (a *Agent) Agmen() map[AgentID]AgentView { return a.st.view.Load().views }
 
 // Refresh rescans now and returns the same view, so a program that just started a peer can see it
-// without waiting for the debounced scan.
+// without waiting for the debounced scan. Before Start there is nothing to scan, and it says so,
+// as Request and Command do for the same situation.
 func (a *Agent) Refresh(ctx context.Context) (map[AgentID]AgentView, error) {
+	if !a.st.running.Load() {
+		return nil, fmt.Errorf("actio: the agent %s has not started", a.st.id)
+	}
 	a.rescan()
 	return a.st.view.Load().views, nil
 }
@@ -585,6 +609,10 @@ func (a *Agent) rescan() {
 	}
 	views, specs := make(map[AgentID]AgentView, len(seen.Agents)), make(map[AgentID]*Spec, len(seen.Agents))
 	self, now := st.specNow.Load(), st.now()
+	if self == nil {
+		st.logf("discovery scan skipped: the spec is not built yet")
+		return
+	}
 	for _, peer := range seen.Agents {
 		spec := peer.Spec
 		specs[spec.ID] = &spec // unfiltered: code 106 sees what the scan found
@@ -609,6 +637,22 @@ type peerSet struct {
 }
 
 // --- lane C: the four protocol commands ---------------------------------------------------------
+
+// maxRestartDelay bounds the restart command's delay: a peer in accepts_commands_from must not be
+// able to keep the agent down for an arbitrary time, so a delay above the bound is clamped to it.
+const maxRestartDelay = 60 * time.Second
+
+// clampedRestartDelay is the restart command's delay policy: a positive delay is honoured up to
+// the bound, anything above it clamps to the bound, and a non-positive delay arms no wait.
+func clampedRestartDelay(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	if d > maxRestartDelay {
+		return maxRestartDelay
+	}
+	return d
+}
 
 // cmdStop is the `stop` command: the agent stops itself, with the force the sender gave. The
 // handler's own context is the receiver's and dies with the stop, so the stop runs on its own bound
@@ -666,11 +710,15 @@ func (a *Agent) cmdRestart(ctx context.Context, params json.RawMessage, cmd *Com
 	if err != nil {
 		return err
 	}
-	if p.Delay != nil && *p.Delay > 0 {
-		select {
-		case <-time.After(time.Duration(*p.Delay) * time.Second):
-		case <-ctx.Done(): // the receiver's stop cancelled this context: start without the delay
-		}
+	// The delay is honoured on a fresh timer: the handler's context is the receiver's, and the stop
+	// above already cancelled it, so it is dead and cannot carry the wait. Above the bound, it is
+	// clamped to the bound: the peer asked for a restart, and it gets one.
+	delay := time.Duration(0)
+	if p.Delay != nil {
+		delay = clampedRestartDelay(time.Duration(*p.Delay) * time.Second)
+	}
+	if delay > 0 {
+		<-time.After(delay)
 	}
 	return a.Start(context.Background())
 }
@@ -729,10 +777,11 @@ type agentState struct {
 	wg         sync.WaitGroup // the agent's own tracked goroutines: discovery, the hb join, the stop runner
 	haltCh     chan struct{}  // the hard abort of a failed Start: the receiver's force path
 	discStop   chan struct{}
+	discClosed atomic.Bool // the discovery stop's close has run for this run: stopInternal is re-entrant
 	running    atomic.Bool
 	stopping   atomic.Bool
 	doneCh     chan struct{}
-	doneClosed bool
+	doneClosed bool        // Done closes once per life: a restart's stop must not close it again
 	enabled    *bool       // D-10: the enable command's disabled state for this run
 	current    StatusState // the lifecycle state; busy is derived, under pubMu
 	specNow    atomic.Pointer[Spec]

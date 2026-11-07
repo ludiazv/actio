@@ -151,16 +151,20 @@ func TestAgentNewRejectsBadOptions(t *testing.T) {
 			t.Errorf("%s: New accepted it, want an error", tc.name)
 		}
 	}
-	good, err := New(Options{ID: "alpha", Namespaces: []*string{nil, ptrString("*")}})
+	good, err := New(Options{ID: "alpha", Namespaces: []*string{nil, ptrString("*")}, Config: Config{Root: t.TempDir()}})
 	if err != nil {
 		t.Fatalf("New(alpha): %v", err)
 	}
 	if good == nil || good.st == nil {
 		t.Fatalf("New(alpha) returned no agent")
 	}
-	// New arms nothing: no folders, no watcher, no goroutine.
-	if _, err := os.Stat(filepath.Join(good.st.folders.root, "alpha")); good.st.folders.root != "" && !os.IsNotExist(err) {
-		t.Errorf("New created folders, it must not")
+	// New arms nothing: no folders on disk, no watcher, no goroutine.
+	entries, err := os.ReadDir(good.st.opts.Config.Root)
+	if err != nil {
+		t.Fatalf("list the root New was given: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("New created folders on disk: %d entries in the root", len(entries))
 	}
 }
 
@@ -990,6 +994,205 @@ func TestAgentStopWithSlowTick(t *testing.T) {
 	if got := statusState(t, root, "alpha"); got != "inactive" {
 		t.Errorf("status after a Stop that raced a slow tick: %q, want inactive", got)
 	}
+}
+
+// TestAgentTwoStopCommands: stopInternal is entered twice — once by a peer's stop command, once by
+// the program's own Stop — and the second entry must not run a second D-9 sequence. The
+// construction is synchronized, not a timing bet: a request sits in flight, so the command's stop
+// spends the whole grace drain waiting for it; the test waits (on the heartbeat's own lock) until
+// the handler has stopped the heartbeat — it is inside stopInternal, in the drain — and only then
+// enters the second stop, well inside the drain's window. (A second command file would not do:
+// the receiver unsubscribes its inbox at the start of the stop, so a late file is never
+// dispatched.) No panic, the agent ends stopped, Done closes, and the inactive publication happens
+// once: the second entry sees the stop in flight and resolves, so the status file and its diarium
+// event are written a single time.
+func TestAgentTwoStopCommands(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) { o.AcceptsCommandsFrom = []string{"beta"} })
+	if err := a.Capability(echoCap(), func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
+		<-ctx.Done() // in flight until the stop's grace expires and the exchange is cancelled
+		return nil, ctx.Err()
+	}); err != nil {
+		t.Fatalf("Capability: %v", err)
+	}
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	b := newTestAgent(t, root, "beta", nil)
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	go func() {
+		_, _ = b.Request(context.Background(), "alpha", "echo", map[string]any{"in": "x"}, RequestOptions{Timeout: 30 * time.Second})
+	}()
+	waitFor(t, 10*time.Second, "alpha to be busy with the in-flight request", func() bool {
+		return statusState(t, root, "alpha") == "busy"
+	})
+	if _, err := b.Command(startCtx(t), "alpha", "stop", map[string]any{"force": false}); err != nil {
+		t.Fatalf("Command(stop): %v", err)
+	}
+	waitFor(t, 10*time.Second, "the stop command's handler to stop the heartbeat",
+		func() bool { return heartbeatStopped(a) })
+	// The handler's stop is in flight, in the grace drain: the second entry, from the program
+	// itself, must resolve, not run a second D-9 sequence.
+	if err := a.Stop(startCtx(t), StopOptions{}); err != nil {
+		t.Fatalf("the concurrent Stop: %v", err)
+	}
+	select {
+	case <-a.Done():
+	case <-time.After(20 * time.Second):
+		t.Fatal("Done did not close after the two stops")
+	}
+	if got := statusState(t, root, "alpha"); got != "inactive" {
+		t.Errorf("status after the two stops: %q, want inactive", got)
+	}
+	inactive := 0
+	for _, s := range diariumStates(t, root, "alpha") {
+		if s == "inactive" {
+			inactive++
+		}
+	}
+	if inactive != 1 {
+		t.Errorf("inactive status events in the diarium: %d, want exactly one", inactive)
+	}
+}
+
+// heartbeatStopped reads the heartbeat's stopped flag under its own lock: true means a stop has
+// entered the D-9 sequence (the heartbeat is the first step), and the read is race-free.
+func heartbeatStopped(a *Agent) bool {
+	hb := a.st.hb
+	hb.mu.Lock()
+	defer hb.mu.Unlock()
+	return hb.stopped
+}
+
+// TestAgentStopRetryAfterFailedC1: a Stop whose context expires in C1's announce delay leaves the
+// agent half-stopped — the loops are dead, the watcher is open, the agent is still running — and
+// the natural retry must finish the stop without panicking on the already-closed discovery stop.
+func TestAgentStopRetryAfterFailedC1(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) { o.Config.AnnounceDelay = 200 * time.Millisecond })
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// The first Stop: a context that expires inside the announce delay, so C1 fails and C2 is
+	// skipped. Force keeps everything before C1 under the deadline.
+	fastCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := a.Stop(fastCtx, StopOptions{Force: true}); err == nil {
+		t.Fatal("the first Stop succeeded; the test needs a failed C1")
+	}
+	if !a.st.running.Load() {
+		t.Fatal("a failed C1 ended the agent; it must stay running for the retry")
+	}
+	// The retry: no panic, the agent ends stopped.
+	retryCtx, cancelRetry := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelRetry()
+	if err := a.Stop(retryCtx, StopOptions{}); err != nil {
+		t.Fatalf("the Stop retry: %v", err)
+	}
+	if got := statusState(t, root, "alpha"); got != "inactive" {
+		t.Errorf("status after the retry: %q, want inactive", got)
+	}
+	select {
+	case <-a.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done did not close after the retry")
+	}
+}
+
+// TestAgentRestartHonoursDelay: restart {delay: 1} brings the agent back no earlier than about a
+// second: the delay is honoured on a live timer, not swallowed by the receiver's dead context.
+func TestAgentRestartHonoursDelay(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) { o.AcceptsCommandsFrom = []string{"beta"} })
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	b := newTestAgent(t, root, "beta", nil)
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	start := time.Now()
+	if _, err := b.Command(startCtx(t), "alpha", "restart", map[string]any{"delay": 1}); err != nil {
+		t.Fatalf("Command(restart): %v", err)
+	}
+	waitFor(t, 10*time.Second, "alpha to stop for the restart", func() bool { return !a.st.running.Load() })
+	waitFor(t, 15*time.Second, "alpha to come back after the delay", func() bool { return a.st.running.Load() })
+	if elapsed := time.Since(start); elapsed < 950*time.Millisecond {
+		t.Errorf("restart with delay 1 came back after %s; the delay must be honoured (>= ~1s)", elapsed)
+	}
+}
+
+// TestAgentClampedRestartDelay: the restart delay policy, unit-tested at the helper: a huge delay
+// clamps to the bound, a delay at the bound passes through, a delay under the bound passes
+// through, and zero or negative delays arm no wait. The constant's value is what its comment
+// claims — if the oracle moves the bound at R2, one line of this table moves with it.
+func TestAgentClampedRestartDelay(t *testing.T) {
+	if maxRestartDelay != 60*time.Second {
+		t.Errorf("maxRestartDelay = %s; the comment claims 60s", maxRestartDelay)
+	}
+	cases := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{"a huge delay clamps to the bound", 3600 * time.Second, maxRestartDelay},
+		{"just above the bound clamps", maxRestartDelay + time.Second, maxRestartDelay},
+		{"at the bound passes through", maxRestartDelay, maxRestartDelay},
+		{"under the bound passes through", 1 * time.Second, 1 * time.Second},
+		{"zero arms no wait", 0, 0},
+		{"a negative delay arms no wait", -5 * time.Second, 0},
+	}
+	for _, tc := range cases {
+		if got := clampedRestartDelay(tc.in); got != tc.want {
+			t.Errorf("%s: clampedRestartDelay(%s) = %s, want %s", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestAgentRefreshBeforeStart: Refresh before Start names the reason, as Request and Command do
+// for the same situation, instead of returning an empty view and a nil error.
+func TestAgentRefreshBeforeStart(t *testing.T) {
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", nil)
+	views, err := a.Refresh(startCtx(t))
+	if err == nil {
+		t.Fatal("Refresh before Start succeeded; it must name the reason")
+	}
+	if views != nil {
+		t.Errorf("Refresh before Start returned a view: %v", views)
+	}
+	if !strings.Contains(err.Error(), "not started") {
+		t.Errorf("the Refresh error does not name the reason: %v", err)
+	}
+}
+
+// TestAgentRescanWithoutSpec: a rescan that finds peers but has no self spec yet must return via
+// the guard, not nil-deref in the callability rules. The peer's publication pair is real, so the
+// scan succeeds and reaches the pairing.
+func TestAgentRescanWithoutSpec(t *testing.T) {
+	root := t.TempDir()
+	spec, err := buildSpec(Options{ID: "beta", AcceptsCommandsFrom: []string{}}, nil, time.Now())
+	if err != nil {
+		t.Fatalf("buildSpec(beta): %v", err)
+	}
+	peerDir := filepath.Join(root, "beta")
+	if err := os.MkdirAll(peerDir, 0o755); err != nil {
+		t.Fatalf("mkdir beta: %v", err)
+	}
+	for name, value := range map[string]any{"spec.json": spec, "status.json": buildStatus("beta", StatusIdle, time.Now(), nil)} {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(peerDir, name), raw, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	a := newTestAgent(t, root, "alpha", nil)
+	a.st.folders.root = root // a valid tree: the scan succeeds and would pair the nil spec
+	a.rescan()               // the guard must return before the callability rules touch the nil self
 }
 
 // TestAgentFailPublishesError: Fail publishes the error state and announces it; the agent keeps
