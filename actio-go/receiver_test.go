@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -479,6 +480,125 @@ func TestRecvCode106NamespaceMismatch(t *testing.T) {
 	if tt.calls() != 0 {
 		t.Fatalf("the handler ran %d times, want 0", tt.calls())
 	}
+}
+
+// 7.7 (oracle verdict; design items I11 and D-7): code 106 is computed against the requestor's spec as DISCOVERED by the last
+// scan — the unfiltered map the agent keeps for the setPeerSpec hook — and not against the
+// callable view. Both peers below fail callability rule 6 as seen from us (no usable capability:
+// its accepts_from excludes us; no commands for us), so both are absent from Agmen() while their
+// discovered specs are present. With a shared namespace the request is not refused with 106 — the
+// next check after 106 (capacity, expiry) passes, so the work runs and the answer is a success —
+// and without one it is refused with 106. A hook that read the callable view would see no spec for
+// either peer, and the second answer would no longer be 106.
+func TestRecvNamespaceMismatchUsesTheDiscoveredSpec(t *testing.T) {
+	root := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	a := newTestAgent(t, root, "agent", func(o *Options) { o.Namespaces = []*string{strp("lab")} })
+	if err := a.Capability(echoCap(), nilHandler()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The two rule-6-dropped peers: ghost shares our namespace, stranger does not.
+	peer := func(id, ns string) *Agent {
+		p := newTestAgent(t, root, id, func(o *Options) { o.Namespaces = []*string{strp(ns)} })
+		c := echoCap()
+		c.Name = id + "cap"
+		c.Actio.AcceptsFrom = []string{"nobody"} // not usable for us: rule 6 drops the peer
+		if err := p.Capability(c, nilHandler()); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	ghost := peer("ghost", "lab")
+	_ = peer("stranger", "other")
+	// One scan each: ours sees both peers (discovered, view-dropped); ghost sees us.
+	if _, err := a.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ghost.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []AgentID{"ghost", "stranger"} {
+		if _, in := a.Agmen()[id]; in {
+			t.Fatalf("%s is in the view, but rule 6 must drop it (no usable capability, no commands)", id)
+		}
+	}
+
+	t.Run("a rule-6-dropped peer with a shared namespace is not refused with 106", func(t *testing.T) {
+		out, err := ghost.Request(ctx, "agent", "echo", map[string]any{"x": 1}, RequestOptions{})
+		if err != nil {
+			t.Fatalf("the request from the rule-6-dropped peer: %v", err)
+		}
+		if out.Response == nil {
+			t.Fatalf("no response: %+v", out)
+		}
+		if out.Response.Error {
+			var er ErrorResult
+			_ = json.Unmarshal(out.Response.Result, &er)
+			t.Fatalf("the request was refused (106 must pass for a shared namespace): %+v", er)
+		}
+		// Named outcome: the next check after 106 passes, so the work runs and the answer is a
+		// success — not 106, not any other code.
+	})
+
+	t.Run("a rule-6-dropped peer without a shared namespace is refused with 106", func(t *testing.T) {
+		// Stranger cannot Request us (we are not in its view: no shared namespace), so the
+		// request lands the way the protocol says: a file in our inbox.
+		rid := newULID(time.Now())
+		now := time.Now()
+		body := RequestBody{TS: now.Unix(), Nonce: newNonce(), Signature: nil, Name: "echo", Parameters: json.RawMessage(`{}`), Timeout: 0, Attachments: []string{}}
+		rawBody, _ := marshalJSON(body)
+		reqFile := RequestFile{
+			Header:  Header{RID: rid, Src: "stranger", Dst: "agent", Datetime: formatISO(now), Type: TypeRequest, ActioVersion: "1.0"},
+			Request: rawBody,
+		}
+		rawFile, _ := marshalJSON(reqFile)
+		reqPath := filepath.Join(root, "agent", "inbox", string(rid)+".json")
+		if err := os.WriteFile(reqPath, rawFile, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		resPath := filepath.Join(root, "agent", "inbox", string(rid)+".res.json")
+		deadline := time.Now().Add(5 * time.Second) // named bound: the 106 answer is written at A0
+		var raw []byte
+		var err error
+		for {
+			raw, err = os.ReadFile(resPath)
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no response for the stranger's request within 5s: %v", err)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		var f ResponseFile
+		if err := json.Unmarshal(raw, &f); err != nil {
+			t.Fatal(err)
+		}
+		var b ResponseBody
+		if err := json.Unmarshal(f.Response, &b); err != nil {
+			t.Fatal(err)
+		}
+		if !b.Error {
+			t.Fatal("the request was accepted: with the callable view the peer has no spec and 106 is not made — the hook must read the discovered spec")
+		}
+		var er ErrorResult
+		if err := json.Unmarshal(b.Result, &er); err != nil {
+			t.Fatal(err)
+		}
+		if er.Code == nil || *er.Code != CodeNamespaceMismatch {
+			t.Fatalf("want code 106 (namespace_mismatch against the discovered spec), got %+v", er)
+		}
+		if !strings.Contains(er.Msg, "namespace_mismatch") {
+			t.Fatalf("the 106 message is not namespace_mismatch: %q", er.Msg)
+		}
+	})
 }
 
 func TestRecvCode107CapacityExceeded(t *testing.T) {
@@ -1044,6 +1164,85 @@ func TestRecvDroppedCommandArchivesDropped(t *testing.T) {
 	}
 	if env.FinalStatus != FinalDropped {
 		t.Fatalf("the dropped command has final_status %q, want %q", env.FinalStatus, FinalDropped)
+	}
+}
+
+// 6.11 (protocol §7: "Commands (type=\"cmd\") only use the request file and cannot be
+// cancelled"): a .can.json with a running custom command's rid changes nothing. The command's rid
+// is not a tracked exchange, so the cancellation is parked as a deferred envelope and never
+// applied: no .res.json is written (a command is never answered), the handler's ctx is not
+// cancelled, and the command archives completed with its request envelope alone.
+func TestRecvCommandCannotBeCancelled(t *testing.T) {
+	const workDuration = time.Second // the handler's run, measured when the ctx stays uncancelled
+	tt := newRecvTest(t, 5*time.Second)
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	var ctxErrAtFinish atomic.Value // string: the handler's ctx.Err() at finish; "" = never cancelled
+	if err := tt.r.registerCommand("slowcmd", func(ctx context.Context, params json.RawMessage, cmd *CommandContext) error {
+		close(started)
+		select {
+		case <-ctx.Done():
+		case <-time.After(workDuration):
+		}
+		if e := ctx.Err(); e == nil {
+			ctxErrAtFinish.Store("")
+		} else {
+			ctxErrAtFinish.Store(e.Error())
+		}
+		close(finished)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tt.start()
+	rid := tt.newRID()
+	tt.writeCommand(t, rid, "slowcmd", json.RawMessage(`{}`))
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second): // named bound: the handler is running
+		t.Fatal("the command handler did not start")
+	}
+	now := tt.now()
+	canBody := CancellationBody{TS: now.Unix(), Nonce: newNonce(), Signature: nil, Name: "slowcmd", Force: false}
+	rawCan, _ := marshalJSON(canBody)
+	canFile := CancellationFile{
+		Header:       Header{RID: rid, Src: "peer", Dst: "agent", Datetime: formatISO(now), Type: TypeRequest, ActioVersion: "1.0"},
+		Cancellation: rawCan,
+	}
+	if err := tt.st.files.writeJSONAtomic(filepath.Join(tt.st.folders.inbox, string(rid)+".can.json"), canFile, tt.st.folders.agent); err != nil {
+		t.Fatal(err)
+	}
+	// (c) the command archives completed: one inreq line, the command envelope alone.
+	tt.waitForInreqLines(t, 1, 5*time.Second)
+	lines := tt.inreqLines(t)
+	if len(lines) != 1 {
+		t.Fatalf("the inreq diarium has %d lines, want 1 (the command)", len(lines))
+	}
+	var env ExchangeEnvelopes
+	if err := json.Unmarshal(lines[0].EventData, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.FinalStatus != FinalCompleted {
+		t.Fatalf("final_status = %q, want %q (a command cannot be cancelled)", env.FinalStatus, FinalCompleted)
+	}
+	if len(env.Req) == 0 || string(env.Req) == "null" {
+		t.Fatal("the inreq line has no request envelope")
+	}
+	if !isJSONNull(env.Can) || !isJSONNull(env.Res) || !isJSONNull(env.Con) {
+		t.Fatalf("the command archive carries envelopes it must not: can=%v res=%v con=%v", env.Can, env.Res, env.Con)
+	}
+	// (b) the handler ran to the end of its work, and its ctx was never cancelled.
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the command handler did not finish")
+	}
+	if got, _ := ctxErrAtFinish.Load().(string); got != "" {
+		t.Fatalf("the command handler's ctx was cancelled by the .can.json: %v", got)
+	}
+	// (a) no .res.json ever appeared: a command is never answered.
+	if _, err := os.Stat(tt.resPath(rid)); !os.IsNotExist(err) {
+		t.Fatalf("a .res.json exists for the command: a command cannot be cancelled, and is never answered")
 	}
 }
 
