@@ -237,7 +237,14 @@ bash orchestra/run-checks.sh                    # gofmt, vet, the suite, budgets
 go test -race -count=1 ./...
 GOMAXPROCS=1 go test -race -count=1 ./...       # the scheduler, one processor
 go test -tags interop -race -count=1 -run TestInterop .
+bash orchestra/stress.sh                        # before a milestone: the same tests, many times
 ```
+
+`orchestra/stress.sh` is the step the standing gate does not have: 15 lifecycle tests at `-count=40` at
+`GOMAXPROCS=4`, `16` and `1`, and the four flake-prone tests at `-count=25` twice more — 2 000 runs, about 20 minutes. It
+exists because a flake counts as a failure and a gate that runs each test once cannot see the class: one test started an
+agent and never stopped it, so the agent's writes raced `t.TempDir()`'s cleanup — 38 of 40 runs failed on the oracle's
+machine, 0 of 100 on ours. The same lesson is in `orchestra/issues.md`.
 
 The e2e scenarios are E1–E21 of the protocol's own scenario list (`e2e_a_test.go`, `e2e_b_test.go`). The
 `interop` build tag runs **two implementations in one root** — a TypeScript echo agent under `tsx` and this
