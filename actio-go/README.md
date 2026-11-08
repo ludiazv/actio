@@ -208,6 +208,11 @@ their tests:
   count mutex (`requestor.go`), the watcher's folder-table mutex (`watch.go`). No agent-lifecycle mutex: the
   lifecycle is a channel, and `onEvent` queues callbacks instead of holding a mutex across them.
 
+The decisions named above are the ones that changed something. **Every other decision in the plan's table — D-2, D-3,
+D-4, D-5, D-6, D-8, D-12, D-13, D-14, D-16, D-17, D-21 — is recorded there as *as in `actio-ts`***: the port copies
+the reference's behaviour and nothing in this module re-decides it. The table is `orchestra/master_plan.md` §6 (the
+plan is not in git; the handover says where the record lives).
+
 ## Differences from `actio-ts`
 
 Each row is a place where this code and the reference behave differently on purpose, and each has a test or a

@@ -96,15 +96,15 @@ full audit behind that rewrite is `orchestra/conformance-audit.md`.
 
 | # | Normative statement | Implementation | Tests |
 | --- | --- | --- | --- |
-| 7.1 | "A rejected request is answered with `error=true` following the *request error schema* … with the `code` of the failed check" | `receiver.go` `accept` + `respond` | `unit:TestRecvCode105InvalidParameters` (one test per code), `e2e:TestE2UnknownCapability`/`TestE3AcceptanceRejections` |
-| 7.2 | 100 `agent_disabled` ("the receiver's spec.json has `disabled=true`") — Required | `receiver.go` `accept` (fresh `spec().disabled`) | `unit:TestRecvCode105InvalidParameters`, `e2e:TestE3AcceptanceRejections` (100) |
-| 7.3 | 101 `unknown_capability` — Required | `receiver.go` `accept` | `unit:TestRecvCode105InvalidParameters`, `e2e:TestE2UnknownCapability` |
-| 7.4 | 102 `capability_disabled` — Required | `receiver.go` `accept` | `unit:TestRecvCode105InvalidParameters`, `e2e:TestE3AcceptanceRejections` (102) |
-| 7.5 | 103 `requestor_not_allowed` — Required | `receiver.go` `accept` (the capability's `AcceptsFrom`) | `unit:TestRecvCode105InvalidParameters`, `e2e:TestE3AcceptanceRejections` (103) |
+| 7.1 | "A rejected request is answered with `error=true` following the *request error schema* … with the `code` of the failed check" | `receiver.go` `accept` + `respondError`/`writeResponse` | `unit:TestRecvCode100AgentDisabled`, `TestRecvCode101UnknownCapability`, `TestRecvCode102CapabilityDisabled`, `TestRecvCode103RequestorNotAllowed`, `TestRecvCode105InvalidParameters`, `TestRecvCode106NamespaceMismatch`, `TestRecvCode107CapacityExceeded`, `TestRecvCode108RequestExpired` (one test per code), `e2e:TestE2UnknownCapability`/`TestE3AcceptanceRejections` |
+| 7.2 | 100 `agent_disabled` ("the receiver's spec.json has `disabled=true`") — Required | `receiver.go` `accept` (fresh `spec().disabled`) | `unit:TestRecvCode100AgentDisabled`, `e2e:TestE3AcceptanceRejections` (100) |
+| 7.3 | 101 `unknown_capability` — Required | `receiver.go` `accept` | `unit:TestRecvCode101UnknownCapability`, `e2e:TestE2UnknownCapability` |
+| 7.4 | 102 `capability_disabled` — Required | `receiver.go` `accept` | `unit:TestRecvCode102CapabilityDisabled`, `e2e:TestE3AcceptanceRejections` (102) |
+| 7.5 | 103 `requestor_not_allowed` — Required | `receiver.go` `accept` (the capability's `AcceptsFrom`) | `unit:TestRecvCode103RequestorNotAllowed`, `e2e:TestE3AcceptanceRejections` (103) |
 | 7.6 | 105 `invalid_parameters` (the capability `parameters` schema, D-19) | `receiver.go` `accept` (`entry.compiled.validateParams`) | `unit:TestRecvCode105InvalidParameters`, `e2e:TestE3AcceptanceRejections` (105) |
 | 7.7 | 106 `namespace_mismatch` — against the requestor's spec **as discovered**, before the callability filter (D-7) | `agent.go` (the `discovered` view) + `receiver.go` `setPeerSpec`/`peerSpec` (I-11); `receiver.go` `accept` | `unit:TestRecvCode106NamespaceMismatch`, `e2e:TestE3AcceptanceRejections` (106); **no test** that the spec read is the *discovered* one rather than a self-reported one |
-| 7.8 | 107 `capacity_exceeded` ("at `max_parallel` … reject, no queue") | `receiver.go` `accept` (`entry.running >= max_parallel`) | `unit:TestRecvCode105InvalidParameters`, `e2e:TestE3AcceptanceRejections` (107) |
-| 7.9 | 108 `request_expired` ("`ts + timeout < now`") | `receiver.go` `accept` | `unit:TestRecvCode105InvalidParameters`, `e2e:TestE3AcceptanceRejections` (108), `e2e:TestE17PendingEnvelopesAtStartup` (expired) |
+| 7.8 | 107 `capacity_exceeded` ("at `max_parallel` … reject, no queue") | `receiver.go` `accept` (`entry.running >= max_parallel`) | `unit:TestRecvCode107CapacityExceeded`, `e2e:TestE3AcceptanceRejections` (107) |
+| 7.9 | 108 `request_expired` ("`ts + timeout < now`") | `receiver.go` `accept` | `unit:TestRecvCode108RequestExpired`, `e2e:TestE3AcceptanceRejections` (108), `e2e:TestE17PendingEnvelopesAtStartup` (expired) |
 | 7.10 | 104 `version_not_supported` — Optional, **not implemented** (D-7) | absent by design | `unit:TestValidateAcceptsGoodAndRejectsMinimalBreaks` (the version is informative; the vectors prove acceptance) |
 | 7.11 | 300 `agent_stopping` ("an accepted request that ends without a result … the receiver stops") | `receiver.go` `stop` (code 300 for accepted-unanswered) | `unit:TestRecvStopAnswers300WithinGrace`, `e2e:TestE12StopWithRequestInFlight` |
 | 7.12 | "Files that do not conform to the schemas are ignored … and are never answered" (D-15/D-14) | `receiver.go` `scanAndProcess`/`ignore` | `unit:TestRecvMalformedInboxFileIgnored`, `e2e:TestE14MalformedFilesIgnored` |
@@ -150,7 +150,7 @@ full audit behind that rewrite is `orchestra/conformance-audit.md`.
 | 11.3 | B3: "Just before writing the confirmation, append an `outreq` event … Then write `<rid>.con.json`" (D-13) | `requestor.go` `confirm` | `unit:TestRequestD13ArchivedBeforeConfirm`, `e2e:TestE1NormalRequest` |
 | 11.4 | B4: "Write `<rid>.can.json` … the request attachments are not deleted here" | `requestor.go` `buildCancellation` | `unit:TestRequestCancelWaitsForConfirmation`, `e2e:TestE8RequestorTimeoutCancels` |
 | 11.5 | B5: "Delete only the request attachments in `forum`" | `requestor.go` `deleteAttachments` | `unit:TestRequestAttachmentsPublishedAndDeleted`, `e2e:TestE16AttachmentsCleaned` |
-| 11.6 | A0: the acceptance checks (7.2–7.9) + "If a cancellation file for the request is already present, no work is started and a cancellation response is written" | `receiver.go` `accept`/`acceptAndRun` | `unit:TestRecvCode105InvalidParameters`, `e2e:TestE3AcceptanceRejections`/`TestE5CancelledBeforeAcceptance` |
+| 11.6 | A0: the acceptance checks (7.2–7.9) + "If a cancellation file for the request is already present, no work is started and a cancellation response is written" | `receiver.go` `accept`/`acceptAndRun` | `unit:TestRecvCode100AgentDisabled`–`TestRecvCode108RequestExpired` (the eight), `e2e:TestE3AcceptanceRejections`/`TestE5CancelledBeforeAcceptance` |
 | 11.7 | A1: "run handler with AbortSignal; status … busy" | `receiver.go` `acceptAndRun/startWork`; `agent.go` (D-8) | `unit:TestRecvNormalExchangeConfirmed`, `e2e:TestE6CancelledDuringWork` |
 | 11.8 | A2: "Writes the response file … Waits for confirmation or confirmation timeout … If a cancellation arrives after the response was written, no second response is written" | `receiver.go` `respondSuccess/respondError/respondCancellation/respondHandlerError/writeResponse`/`writeResponse` | `unit:TestRecvSecondResponseNotWritten`, `e2e:TestE7CancelledAfterResponse` |
 | 11.9 | A3: "A cancellation file appeared; the work is stopped as gracefully as possible" → the cancellation response | `receiver.go` `acceptAndRun/startWork` (the abort path) | `unit:TestRecvCancellationDuringWork`, `e2e:TestE6CancelledDuringWork` |
@@ -186,15 +186,15 @@ full audit behind that rewrite is `orchestra/conformance-audit.md`.
 | --- | --- | --- | --- |
 | 14.1 | *Security features* (sign / encrypt / issuer_sign, the postures untrusted/secret/zero-trust, codes 200–299) | `n/a (security)` — `security_support: []`, posture `trusted`; base64 bodies received are ignored + logged (D-14) | `e2e:TestE14MalformedFilesIgnored` (the base64 body case), `unit:TestRecvMalformedInboxFileIgnored` |
 | 14.2 | 104 `version_not_supported` (optional) | `n/a` — not implemented (D-7; the version is informative) | `unit:TestValidateAcceptsGoodAndRejectsMinimalBreaks` (the version vectors accept) |
-| 14.3 | Queueing at `max_parallel` | `n/a` — rejected with 107, no queue (D-7) | `unit:TestRecvCode105InvalidParameters`, `e2e:TestE3AcceptanceRejections` (107) |
+| 14.3 | Queueing at `max_parallel` | `n/a` — rejected with 107, no queue (D-7) | `unit:TestRecvCode107CapacityExceeded`, `e2e:TestE3AcceptanceRejections` (107) |
 
 ## 15. Process rules the implementation adds (from the review history)
 
 | # | Statement (the I-x rows of `README.md`) | Implementation | Tests |
 | --- | --- | --- | --- |
-| 15.1 | I-2: every file the library writes is self-validated before writing | `status.go`, `diarium.go`, `requestor.go`, `receiver.go` (the inline `validate*` checks) | the unit suites of each writer |
+| 15.1 | I-2: every file the library writes is self-validated before writing | `status.go`, `diarium.go`, `requestor.go`, `receiver.go` (the inline `validate*` checks) | `unit:TestPublishStatus`, `TestPublishSpec`, `TestPublishAnnounce`, `TestDiariaAppendInvalid`, `TestRequestSelfValidationRefusesNonconformingFile`; **no unit test** that a non-conforming response or confirmation file is refused before its write (the validators themselves are `TestValidateAcceptsGoodAndRejectsMinimalBreaks`) |
 | 15.2 | I-3/I-11: the capability registrations carry their compiled schemas (D-19); the 106 hook reads the DISCOVERED specs | `types.go` (the compiled schemas), `agent.go` (`Capability`), `receiver.go` (`accept` 106) | `unit:TestAgentCapabilityRejectsDuplicates`, `unit:TestRecvCode105InvalidParameters` (106) |
-| 15.3 | I-10: one sync provider per process | `io.go` (the provider); `agent.go` `Start` | `unit:TestSyncProviderForms` |
+| 15.3 | I-10: one sync provider per process | `io.go` (the provider); `agent.go` `newSyncProvider` at `Start` | `unit:TestSyncProviderForms`, `e2e:TestE20SyncProvidersIdentical`. Go makes **one per agent run**, not one per process: §9's basis is "no `io.ts`-level sync global", so the provider hangs off the run's `agentState` and two agents in one process get one each |
 | 15.4 | the rules the review rounds settled, stated as the code keeps them: an ignored request file drops the envelopes deferred for its rid (D-15); a failed atomic rename leaves no temp file; `receiver.stop` resolves only once every archive has landed (D-9); the `confirmTimeout` timer is tracked, so `stop` awaits it | `receiver.go` (the deferred-drop, the awaited `stop`, the tracked confirm timer), `io.go` (`writeBytesAtomic`) | `unit:TestRecvDeferredEnvelopeKeepsRaw`, `unit:TestRecvIgnoredRequestDropsDeferred`, `unit:TestRecvStopAfterLossSettlesOnce`, `unit:TestWriteBytesAtomicTempNameAndCleanup` |
 
 ## 16. Interop (Go ↔ TypeScript)
