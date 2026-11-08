@@ -1140,6 +1140,69 @@ func TestRecvDiariumEnvelopesAsExchanged(t *testing.T) {
 	}
 }
 
+// TestRecvArchiveInreqBeforeFileRemoval pins the A4 order (protocol *Archive*): by the moment the
+// request file is removed from the inbox, the diarium already holds the rid's inreq line. A folder
+// watch on the inbox observes the removal; at that moment the diarium is read and the line is
+// required. A test that waits for the line and then checks the file is gone proves nothing: the
+// assertion is about which comes first, so the diarium read happens when the removal is observed.
+func TestRecvArchiveInreqBeforeFileRemoval(t *testing.T) {
+	tt := newRecvTest(t, 5*time.Second)
+	tt.registerEcho()
+	tt.start()
+
+	sub, err := tt.watch.subscribe(tt.st.folders.inbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tt.watch.unsubscribe(sub)
+
+	rid := tt.newRID()
+	tt.writeRequest(t, rid, "echo", json.RawMessage(`{}`), 0)
+	path := filepath.Join(tt.st.folders.inbox, string(rid)+".json")
+	tt.waitForFile(t, tt.resPath(rid), 3*time.Second) // the receiver answered
+	tt.writeConfirmation(t, rid)                      // triggers the archive
+
+	// Observe the removal of <rid>.json and, at that moment, require the inreq line to be present.
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case <-sub.changed():
+			// Look again: has the request file been removed?
+			if _, err := os.Stat(path); err == nil {
+				continue // still present
+			} else if !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			// The removal is observed. The diarium must already hold the inreq line for this rid.
+			if !tt.inreqHasRID(t, rid) {
+				t.Fatalf("the inbox no longer holds %s.json, but the diarium has no inreq line for it: the inreq line must be appended before the files are removed", rid)
+			}
+			return
+		case <-timeout:
+			t.Fatalf("the request file %s.json was never removed within 5s", rid)
+		}
+	}
+}
+
+// inreqHasRID reports whether the diarium already holds an inreq line whose req envelope names rid.
+func (tt *recvTest) inreqHasRID(t *testing.T, rid RID) bool {
+	t.Helper()
+	for _, l := range tt.inreqLines(t) {
+		var env ExchangeEnvelopes
+		if err := json.Unmarshal(l.EventData, &env); err != nil {
+			continue
+		}
+		var req RequestFile
+		if err := json.Unmarshal(env.Req, &req); err != nil {
+			continue
+		}
+		if req.RID == rid {
+			return true
+		}
+	}
+	return false
+}
+
 // TestRecvRetrackKeepsEnvelopes is the D-4 retrack at start: a previous run left the response and
 // the cancellation (no request file). The retracked exchange must archive with the files' bytes
 // as exchanged — "null" in the diarium means the file was never written, not that we lost it.

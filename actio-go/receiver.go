@@ -956,6 +956,21 @@ func (r *receiver) archive(ex *exchange) {
 	if ex.timer != nil {
 		ex.timer.Stop()
 	}
+	// A4 is two steps in this order (protocol, *Archive*): (1) the inreq line, then (2) the files.
+	// A request whose answer was not written (the inbox was lost) gets no line: the protocol has no
+	// `dropped` for a request. It stays unsettled, with one log line naming the rid.
+	finalStatus := FinalCompleted
+	if ex.res == nil {
+		r.st.logf("the answer for %s was not written (the inbox was lost); the exchange is left unsettled", ex.rid)
+	} else {
+		if ex.canSeen {
+			finalStatus = FinalCancelled
+		} else if ex.con != nil {
+			finalStatus = FinalConfirmed
+		}
+		env := ExchangeEnvelopes{FinalStatus: finalStatus, Req: ex.reqRaw, Can: ex.canRaw, Res: ex.resRaw, Con: ex.conRaw}
+		_ = r.st.diaria.append(inreqEvent(r.st.id, r.st.now(), finalStatus, env))
+	}
 	// The files are cleaned and the exchange leaves the working set whether or not it is archived:
 	// an unsettled exchange must not be leaked.
 	for _, suffix := range []string{".json", ".can.json", ".res.json", ".con.json"} {
@@ -965,22 +980,9 @@ func (r *receiver) archive(ex *exchange) {
 		_ = r.st.files.removePath(filepath.Join(r.st.folders.forum, name))
 	}
 	delete(r.exchanges, ex.rid)
-	// A request whose answer was not written (the inbox was lost) is never given a final status: the
-	// protocol has no `dropped` for a request. It stays out of the archive, unsettled, with one log
-	// line naming the rid and why it has no answer.
-	if ex.res == nil {
-		r.st.logf("the answer for %s was not written (the inbox was lost); the exchange is left unsettled", ex.rid)
-		return
+	if ex.res != nil {
+		r.st.emit(InreqEvent{RID: ex.rid, FinalStatus: finalStatus})
 	}
-	finalStatus := FinalCompleted
-	if ex.canSeen {
-		finalStatus = FinalCancelled
-	} else if ex.con != nil {
-		finalStatus = FinalConfirmed
-	}
-	env := ExchangeEnvelopes{FinalStatus: finalStatus, Req: ex.reqRaw, Can: ex.canRaw, Res: ex.resRaw, Con: ex.conRaw}
-	_ = r.st.diaria.append(inreqEvent(r.st.id, r.st.now(), finalStatus, env))
-	r.st.emit(InreqEvent{RID: ex.rid, FinalStatus: finalStatus})
 }
 
 // retrackFromResponse is D-4: re-track a pending .res.json (a previous run) and restart the
