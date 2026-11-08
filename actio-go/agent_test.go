@@ -2326,3 +2326,63 @@ func TestAgentE21OwnInboxLossFailsInOrder(t *testing.T) {
 		t.Fatalf("the diarium has no log line for the inbox loss")
 	}
 }
+
+// TestAgentRestartPendingDuringOperatorStart pins matrix row 11.14: a `restart` with a delay that is
+// pending (the agent is down, the delay is counting) meets an operator `Start` in the delay. After the
+// delay there must be exactly one live run, `Done` still open, and no error logged. Without
+// `startLocked` closing `restartAbort`, the delayed restart hits "already started" and then closes
+// `Done` while the agent runs — this test catches both.
+func TestAgentRestartPendingDuringOperatorStart(t *testing.T) {
+	const delaySeconds = 2.0            // the restart command's delay, in seconds (the schema's number)
+	const settleBound = 3 * time.Second // the delay (2s) + a 1s margin: the restart loop has had its turn
+
+	root := t.TempDir()
+	a := newTestAgent(t, root, "alpha", func(o *Options) { o.AcceptsCommandsFrom = []string{"beta"} })
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	b := newTestAgent(t, root, "beta", nil)
+	if err := b.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+
+	// Observe the log through the hook the harness already has: capture every LogEvent's message.
+	var logMu sync.Mutex
+	var logs []string
+	a.OnEvent(func(e Event) {
+		if le, ok := e.(LogEvent); ok {
+			logMu.Lock()
+			logs = append(logs, le.Message)
+			logMu.Unlock()
+		}
+	})
+
+	// 1. Cause a restart with a delay: alpha goes down and the delay counts.
+	if _, err := b.Command(startCtx(t), "alpha", "restart", map[string]any{"delay": delaySeconds}); err != nil {
+		t.Fatalf("Command(restart): %v", err)
+	}
+	waitFor(t, 10*time.Second, "alpha to stop for the delayed restart", func() bool { return !a.cur().running.Load() })
+
+	// 2. During the delay, an operator Start from the public API meets the pending restart.
+	if err := a.Start(startCtx(t)); err != nil {
+		t.Fatalf("the operator Start during the restart delay failed: %v", err)
+	}
+
+	// 3. After the delay, the restart loop has had its turn: assert one run, Done open, no error.
+	time.Sleep(settleBound) // the delay (2s) + a margin: the restart loop has run and finished
+	if !a.cur().running.Load() {
+		t.Fatalf("after the delay the agent is not running: the operator Start must leave one live run")
+	}
+	select {
+	case <-a.Done():
+		t.Fatalf("Done is closed while the agent runs: an operator Start in the delay must not let the restart close it")
+	default:
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	for _, m := range logs {
+		if strings.Contains(m, "already started") {
+			t.Fatalf("an 'already started' error was logged: %q", m)
+		}
+	}
+}
