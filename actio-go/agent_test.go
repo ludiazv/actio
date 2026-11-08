@@ -386,6 +386,10 @@ func TestAgentStartFailureArmsNothing(t *testing.T) {
 	if err := a2.Start(startCtx(t)); err != nil {
 		t.Fatalf("a corrected Start: %v", err)
 	}
+	// a2 must end before the test's folder is removed: a running agent writes into it.
+	if err := a2.Stop(startCtx(t), StopOptions{Force: true}); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
 	_ = a
 }
 
@@ -1224,6 +1228,32 @@ func TestAgentRescanWithoutSpec(t *testing.T) {
 	a := newTestAgent(t, root, "alpha", nil)
 	a.cur().folders.root = root // a valid tree: the scan succeeds and would pair the nil spec
 	a.rescan()                  // the guard must return before the callability rules touch the nil self
+}
+
+// Row 2.3 (protocol §2, a MUST): a change in nuntium triggers a scan. Alpha runs; beta starts
+// afterwards; without any Refresh call, alpha's Agmen() gains beta within the debounce plus a
+// margin. The neighbour TestAgentRescanWithoutSpec pins the nil-spec guard; this pins the watch —
+// the nuntium.changed() case of discoveryLoop schedules the debounced scan.
+func TestAgentNuntiumChangeTriggersScan(t *testing.T) {
+	root := t.TempDir()
+	alpha := newTestAgent(t, root, "alpha", nil)
+	if err := alpha.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(alpha): %v", err)
+	}
+	// Beta starts afterwards: its announce file lands in nuntium, waking alpha's discovery. Beta
+	// accepts alpha's commands, so the callability rules keep it in the view (rule 6).
+	beta := newTestAgent(t, root, "beta", func(o *Options) { o.AcceptsCommandsFrom = []string{"alpha"} })
+	if err := beta.Start(startCtx(t)); err != nil {
+		t.Fatalf("Start(beta): %v", err)
+	}
+	// No Refresh: the scan is triggered by the nuntium change, debounced at 1 s (the default
+	// NuntiumDebounce). The bound is the debounce plus a margin for the scan and the view swap;
+	// 5 s is enough — the scan is a tree read, well under a second, and the margin covers
+	// scheduler latency at GOMAXPROCS=1.
+	waitFor(t, 5*time.Second, "alpha's Agmen() to gain beta without a Refresh", func() bool {
+		_, ok := alpha.Agmen()["beta"]
+		return ok
+	})
 }
 
 // TestAgentFailPublishesError: Fail publishes the error state and announces it; the agent keeps
