@@ -48,9 +48,14 @@ type gate struct {
 // gates is the registry of the decision gates (D-9); v1 is D-14.
 var gates []gate
 
-// findGate looks a gate up by name.
+// findGate looks a gate up by name: the first registry entry with that name.
 func findGate(name string) (gate, bool) {
-	panic("not implemented: findGate")
+	for _, g := range gates {
+		if g.name == name {
+			return g, true
+		}
+	}
+	return gate{}, false
 }
 
 // decide runs the decision step through the configured gate (D-9).
