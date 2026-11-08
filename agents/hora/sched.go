@@ -88,25 +88,50 @@ type runner struct {
 
 // newRunner builds a runner that calls fire for each firing.
 func newRunner(fire func(id string)) *runner {
-	panic("not implemented: newRunner")
+	return &runner{
+		cron: cron.New(cron.WithLocation(time.UTC)),
+		ids:  map[string]cron.EntryID{},
+		fire: fire,
+	}
 }
 
-// add schedules the entry.
+// add parses the entry's stored expression and schedules it; on an error it
+// adds nothing.
 func (r *runner) add(e Entry) error {
-	panic("not implemented: add")
+	schedule, _, err := parseSchedule(e.SchedType, e.SchedExpression, time.UTC, time.Now())
+	if err != nil {
+		return err
+	}
+	id := r.cron.Schedule(schedule, cron.FuncJob(func() { r.fire(e.SchedID) }))
+	r.mu.Lock()
+	r.ids[e.SchedID] = id
+	r.mu.Unlock()
+	return nil
 }
 
-// remove unschedules the entry.
+// remove unschedules the entry; an unknown id is not an error.
 func (r *runner) remove(id string) {
-	panic("not implemented: remove")
+	r.mu.Lock()
+	eid, ok := r.ids[id]
+	delete(r.ids, id)
+	r.mu.Unlock()
+	if ok {
+		r.cron.Remove(eid)
+	}
 }
 
 // start begins firing.
 func (r *runner) start() {
-	panic("not implemented: start")
+	r.cron.Start()
 }
 
-// stop ends firing, cancelling pending firings and waiting for running jobs (D-12).
+// stop ends firing and waits for the running jobs, bounded by ctx (D-12).
 func (r *runner) stop(ctx context.Context) error {
-	panic("not implemented: stop")
+	done := r.cron.Stop()
+	select {
+	case <-done.Done():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
