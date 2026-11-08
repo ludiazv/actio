@@ -4,16 +4,78 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
 )
 
+// oneShot is a cron.Schedule that yields its instant once and the zero time
+// after, so the runner fires it exactly once (D-4).
+type oneShot struct {
+	t     time.Time
+	fired bool
+}
+
+// Next returns the instant on the first call and the zero time afterwards.
+func (o *oneShot) Next(time.Time) time.Time {
+	if o.fired {
+		return time.Time{}
+	}
+	o.fired = true
+	return o.t
+}
+
 // parseSchedule validates an expression for typ and returns its schedule and
 // the stored form of the expression (D-4, D-5, D-6).
 func parseSchedule(typ, expr string, loc *time.Location, now time.Time) (cron.Schedule, string, error) {
-	panic("not implemented: parseSchedule")
+	switch typ {
+	case "one-shot":
+		t, err := time.Parse(time.RFC3339, expr)
+		if err != nil {
+			return nil, "", fmt.Errorf("one-shot %s: not RFC 3339", expr)
+		}
+		if t.Nanosecond() != 0 {
+			return nil, "", fmt.Errorf("one-shot %s: fractional second", expr)
+		}
+		if !t.After(now) {
+			return nil, "", fmt.Errorf("one-shot %s: not after now", expr)
+		}
+		return &oneShot{t: t}, t.UTC().Format("2006-01-02T15:04:05Z"), nil
+	case "periodic":
+		if !strings.HasPrefix(expr, "@every ") {
+			return nil, "", fmt.Errorf("periodic %s: must be @every <d>", expr)
+		}
+		d, err := time.ParseDuration(expr[len("@every "):])
+		if err != nil {
+			return nil, "", fmt.Errorf("periodic %s: bad duration", expr)
+		}
+		if d < time.Second {
+			return nil, "", fmt.Errorf("periodic %s: less than 1s", expr)
+		}
+		if d%time.Second != 0 {
+			return nil, "", fmt.Errorf("periodic %s: not a whole number of seconds", expr)
+		}
+		return cron.Every(d), expr, nil
+	case "cron":
+		stored := expr
+		if !strings.HasPrefix(expr, "CRON_TZ=") && !strings.HasPrefix(expr, "TZ=") {
+			stored = "CRON_TZ=" + loc.String() + " " + expr
+		}
+		parser := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		s, err := parser.Parse(stored)
+		if err != nil {
+			return nil, "", fmt.Errorf("cron %s: %v", expr, err)
+		}
+		if s.Next(now).IsZero() {
+			return nil, "", fmt.Errorf("cron %s: never fires", expr)
+		}
+		return s, stored, nil
+	default:
+		return nil, "", fmt.Errorf("unknown schedule type: %s", typ)
+	}
 }
 
 // runner wraps one cron.Cron in UTC and maps sched ids to cron entries (D-10).
