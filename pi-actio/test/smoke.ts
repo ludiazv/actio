@@ -1,5 +1,5 @@
 // End-to-end smoke run, run with `npm run smoke`.
-// One line per step, exit 0 when all steps pass, 1 otherwise. No LLM call: the faux model (§3.8).
+// One line per step, exit 0 when all steps pass, 1 otherwise. No LLM call: the faux model.
 // Every directory is temporary, so nothing of the user's pi or actio root is touched.
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -60,7 +60,7 @@ async function askPi1(msg: string): Promise<{ id: string; answer: string }> {
 }
 
 try {
-  // pi1 must show up in the team view with the four prompt capabilities (§6.3).
+  // pi1 must show up in the team view with the four prompt capabilities.
   let pi1: AgentView | undefined;
   for (let i = 0; i < 60 && pi1 === undefined; i++) {
     const view: Map<AgentId, AgentView> = await tester.refresh();
@@ -71,7 +71,7 @@ try {
   step("setup: pi1 is in the team view, exposePrompt published its capabilities",
     pi1 !== undefined && caps === "cancel compact prompt retrieve", `capabilities: ${caps || "none"}`);
 
-  // The smoke steps (§8).
+  // The smoke steps.
   const first = await askPi1("hello");
   step("prompt + retrieve: the answer is the faux echo of the prompt", first.answer === "echo: hello", `answer: ${first.answer}`);
 

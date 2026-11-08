@@ -1,4 +1,4 @@
-// Tests of the receiver (WP5): lane A (dispatch, acceptance (A0), work (A1/A3), response +
+// Tests of the receiver: lane A (dispatch, acceptance (A0), work (A1/A3), response +
 // confirmation wait (A2), archive (A4), the D-4/D-5/D-11/D-14/D-15 rules) and lane D (command
 // dispatch: D0–D4, the built-in commands and the archive around the agent lifecycle hooks).
 import assert from "node:assert/strict";
@@ -368,7 +368,7 @@ test("rejected at A0: error response with the code, then `confirmed`", async (t)
   assert.equal(data.final_status, "confirmed");
 });
 
-test("request + cancellation both pending at start → cancellation response, `inreq cancelled`, no `log` line (R1-5)", async (t) => {
+test("request + cancellation both pending at start → cancellation response, `inreq cancelled`, no `log` line", async (t) => {
   let called = false;
   const env = await makeEnv(t, {
     entries: [makeEntry("echo", async () => {
@@ -672,7 +672,7 @@ test("response attachments: published to the forum, listed in the response, dele
   await assert.rejects(fsp.access(forumFile), "response attachments are deleted at A4");
 });
 
-test("stop(): a request in work → code 300 + `inreq completed` + inbox deleted, ALL before stop() resolves (R1-2)", async (t) => {
+test("stop(): a request in work → code 300 + `inreq completed` + inbox deleted, ALL before stop() resolves", async (t) => {
   const env = await makeEnv(t, {
     entries: [makeEntry("slow", async (_params, ctx) => {
       await new Promise<void>((resolve) => {
@@ -705,7 +705,7 @@ test("stop(): a request in work → code 300 + `inreq completed` + inbox deleted
   assert.equal(env.receiver.workingCount(), 0);
 });
 
-test("stop(): an exchange waiting for confirmation is archived at once (R1-2)", async (t) => {
+test("stop(): an exchange waiting for confirmation is archived at once", async (t) => {
   const env = await makeEnv(t, { entries: [makeEntry("echo", async () => ({ ok: true }))] });
   await env.receiver.start(() => {});
   const rid = ulid();
@@ -726,7 +726,7 @@ test("stop(): an exchange waiting for confirmation is archived at once (R1-2)", 
   assert.deepEqual(await inboxNames(env.inbox), []);
 });
 
-test("a published attachment is deleted at A4 even when the exchange is cancelled (R1-3)", async (t) => {
+test("a published attachment is deleted at A4 even when the exchange is cancelled", async (t) => {
   const handler: CapabilityHandler = async (_params, ctx) => {
     await ctx.publishAttachment("art/leak.bin", new TextEncoder().encode("leak"));
     await new Promise<void>((resolve) => {
@@ -752,7 +752,7 @@ test("a published attachment is deleted at A4 even when the exchange is cancelle
   await assert.rejects(fsp.access(forumFile), "the file the handler published is deleted at A4");
 });
 
-test("a pending request is processed exactly once: the watcher's initial scan is the single delivery path (R1-5)", async (t) => {
+test("a pending request is processed exactly once: the watcher's initial scan is the single delivery path", async (t) => {
   let runs = 0;
   const env = await makeEnv(t, {
     entries: [makeEntry("echo", async () => {
@@ -917,7 +917,7 @@ test("D0 reads the spec afresh: the same command is dropped before `enable` and 
   const env = await makeEnv(t, {
     specOf: () => spec,
     hooks: {
-      // what the agent does in D2: rewrite spec.json (fresh datetime) and re-announce (WP7 does it for real)
+      // what the agent does in D2: rewrite spec.json (fresh datetime) and re-announce (the agent does it for real)
       onCommandEnable: async (enabled) => {
         spec = {
           ...spec,
@@ -1205,9 +1205,9 @@ test("one archive per exchange: a confirmation landing mid-archive adds no secon
   assert.equal(inreqs(env)[0]?.final_status, "completed", "the confirmTimeout ended it (D-13)");
 });
 
-// --- Carry-overs (WP5-E-1: P-3, P-5) ---
+// --- deferred envelopes, and stop after an archive in flight ---
 
-test("P-3: a deferred can for an ignored request is dropped and logged once; the files stay (D-15, D-16)", async (t) => {
+test("a deferred can for an ignored request is dropped and logged once; the files stay (D-15, D-16)", async (t) => {
   const env = await makeEnv(t); // no capabilities: the (valid-shape) request can never be tracked
   const rid = ulid();
   // The request file is present but schema-invalid (no `attachments`): it is ignored (D-15) and
@@ -1232,7 +1232,7 @@ test("P-3: a deferred can for an ignored request is dropped and logged once; the
   assert.ok(logs.some((l) => l.startsWith(`ignored ${rid}.json:`)), "the request's ignore line");
   assert.ok(
     logs.some((l) => l === `deferred ${canFull}: the request of rid ${rid} was ignored (D-15)`),
-    "the deferred drop line (the brief's format)",
+    "the deferred drop line (its format)",
   );
   assert.deepEqual(
     (await inboxNames(env.inbox)).sort(),
@@ -1247,7 +1247,7 @@ test("P-3: a deferred can for an ignored request is dropped and logged once; the
   assert.equal(logLines(env).length, 2, "still two log lines after redelivery");
 });
 
-test("P-5: stop() resolves only after an archive that is already in flight (the lane-C order, E12)", async (t) => {
+test("stop() resolves only after an archive that is already in flight (the lane-C order, E12)", async (t) => {
   let open!: () => void;
   const gate = new Promise<void>((resolve) => {
     open = resolve;
@@ -1263,13 +1263,13 @@ test("P-5: stop() resolves only after an archive that is already in flight (the 
   await waitFor(() => readRes(env.inbox, rid).then((r) => r !== undefined), 3_000);
   await writeJson(env.inbox, `${rid}.con.json`, makeConfirmation(req)); // confirmation → the archive starts
   await waitFor(() => inreqs(env).length === 1, 3_000); // the inreq line is in; the archive is held
-  const stopP = env.receiver.stop(); // the archive is in flight: stop() must wait for it (P-5)
+  const stopP = env.receiver.stop(); // the archive is in flight: stop() must wait for it
   let stopped = false;
   void stopP.then(() => {
     stopped = true;
   });
   await sleep(30); // the gate still holds: stop() must NOT have resolved
-  assert.equal(stopped, false, "stop() is waiting for the in-flight archive (P-5)");
+  assert.equal(stopped, false, "stop() is waiting for the in-flight archive");
   open(); // the archive resumes and removes the envelopes
   await stopP;
   assert.equal(stopped, true);

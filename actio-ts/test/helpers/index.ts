@@ -1,4 +1,4 @@
-// Shared test helpers (WP0): temp .actio roots, fake clock, fast config, inbox recorder, waitFor.
+// Shared test helpers: temp .actio roots, fake clock, fast config, inbox recorder, waitFor.
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -49,7 +49,7 @@ export interface InboxEvent {
 }
 
 /**
- * Records the order in which files appear in and disappear from `dir` (§7 snapshots). Armed with an
+ * Records the order in which files appear in and disappear from `dir` (snapshots). Armed with an
  * initial readdir (present files count as appeared); deliberately self-contained (own fs.watch +
  * readdir diff), independent of src/watch.ts, so e2e assertions measure the inbox independently.
  */

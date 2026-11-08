@@ -1166,7 +1166,7 @@ func TestRecvDroppedCommandArchivesDropped(t *testing.T) {
 	}
 }
 
-// 6.11 (protocol §7: "Commands (type=\"cmd\") only use the request file and cannot be
+// 6.11 (protocol: "Commands (type=\"cmd\") only use the request file and cannot be
 // cancelled"): a .can.json with a running custom command's rid changes nothing. The command's rid
 // is not a tracked exchange, so the cancellation is parked as a deferred envelope and never
 // applied: no .res.json is written (a command is never answered), the handler's ctx is not

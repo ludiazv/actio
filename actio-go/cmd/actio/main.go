@@ -1,4 +1,4 @@
-// The actio command (§2.8): ls, diarium, call, cmd, broadcast, validate over one shared actio
+// The actio command: ls, diarium, call, cmd, broadcast, validate over one shared actio
 // root. It reads the same environment as the reference CLI (ACTIO_DIR and the timer overrides,
 // resolved by the library) and consumes only the public API of the library.
 package main

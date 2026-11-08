@@ -77,8 +77,8 @@ func outreqEvent(id AgentID, now time.Time, finalStatus string, envelopes Exchan
 // last line without its newline is skipped without being reported: an append may be in progress.
 // Filtering is the caller's job.
 //
-// os.ReadFile is the one os call this file makes: the diarium is exempt from io.go by §5 of the
-// seams document, and the frozen seam takes a folder, not a *fileIO.
+// os.ReadFile is the one os call this file makes: the reader takes a folder, not a *fileIO, so a
+// tool can read any agent's diarium without an agent.
 func ReadDiarium(folder string) (DiariumRead, error) {
 	raw, err := os.ReadFile(filepath.Join(folder, "diarium.jsonl"))
 	if err != nil {

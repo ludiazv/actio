@@ -1,4 +1,4 @@
-// echo: the conformance target agent (§2.9) — the black-box harness and the interop suite drive
+// echo: the conformance target agent — the black-box harness and the interop suite drive
 // it the same way they drive the reference. It answers echo, sleeps, fails, and refuses.
 //
 // Env: ACTIO_AGENT_ID (default "echo"), ACTIO_COMMANDERS (comma list), ACTIO_NAMESPACES (comma

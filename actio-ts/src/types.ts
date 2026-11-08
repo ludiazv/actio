@@ -38,7 +38,7 @@ export interface AgentView {
   capabilities: Map<string, Capability>;
 }
 
-/** Observability event: every protocol event, including ignored files (§2.7). */
+/** Observability event: every protocol event, including ignored files. */
 export type ActioEvent =
   | { event: "status"; state: StatusState }
   | { event: "announce"; text: string }
@@ -83,7 +83,7 @@ export class ActioResultError extends Error {
   }
 }
 
-/** Storage synchronization provider (§2.6). */
+/** Storage synchronization provider. */
 export interface SyncProvider {
   /** io.ts: fsync the written file before the rename and its parent folder after it. */
   fsync: boolean;
@@ -94,7 +94,7 @@ export interface SyncProvider {
   close(): Promise<void>;
 }
 
-/** All timers of one agent, in milliseconds; tests inject a fake `clock` (§2.4). */
+/** All timers of one agent, in milliseconds; tests inject a fake `clock`. */
 export interface ActioConfig {
   root: string;
   /** Raw `ACTIO_SYNC` value; parsed into a SyncProvider at `start()` (D-21). */
@@ -108,7 +108,7 @@ export interface ActioConfig {
   clock: () => number;
 }
 
-/** Options of `new ActioAgent(...)` (§2.7). */
+/** Options of `new ActioAgent(...)`. */
 export interface AgentOptions {
   id: AgentId;
   description: string;
@@ -122,7 +122,7 @@ export interface AgentOptions {
   config?: Partial<ActioConfig>;
 }
 
-/** Options of `agent.request(...)` (§2.7). */
+/** Options of `agent.request(...)`. */
 export interface RequestOptions {
   /** Requestor timeout in seconds; 0 = wait forever unless `signal` aborts (D-6). */
   timeout?: number;
@@ -131,13 +131,13 @@ export interface RequestOptions {
   signal?: AbortSignal;
 }
 
-/** Result of `agent.request(...)` (§2.7); `response` is present whenever one was received and confirmed. */
+/** Result of `agent.request(...)`; `response` is present whenever one was received and confirmed. */
 export interface RequestOutcome {
   finalStatus: "confirmed" | "cancelled" | "abandoned";
   response?: ResponseBody;
 }
 
-/** Context passed to a capability handler (§2.7). */
+/** Context passed to a capability handler. */
 export interface CapabilityContext {
   rid: Rid;
   src: AgentId;
@@ -186,7 +186,7 @@ export interface AgentContext {
   spec(): Spec;
   /** The current status state. */
   state(): StatusState;
-  /** Observability event stream (§2.7 `agent.on("event", ...)`). */
+  /** Observability event stream (`agent.on("event", ...)`). */
   emit(event: ActioEvent): void;
   /** Appends a validated diarium line (throws on invalid events: a bug, not a peer, produced it). */
   appendDiarium(event: DiariumLine): Promise<void>;

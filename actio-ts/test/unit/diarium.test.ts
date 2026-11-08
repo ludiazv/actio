@@ -1,4 +1,4 @@
-// Tests of the diarium append and the five typed event builders (WP3-A).
+// Tests of the diarium append and the five typed event builders.
 import assert from "node:assert/strict";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";

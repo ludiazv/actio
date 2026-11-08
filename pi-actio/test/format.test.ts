@@ -1,4 +1,4 @@
-// Golden strings for the `actio` tool output (format.ts); pins every §6.2 output row.
+// Golden strings for the `actio` tool output (format.ts); pins every output row.
 // Text outputs are golden strings; JSON outputs are compared after `JSON.parse` (D-20).
 import assert from "node:assert/strict";
 import { test } from "node:test";

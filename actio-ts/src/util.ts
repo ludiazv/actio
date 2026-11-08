@@ -1,4 +1,4 @@
-// Small pure utilities: time, ULID, nonce, sleep (§2.2).
+// Small pure utilities: time, ULID, nonce, sleep.
 import crypto from "node:crypto";
 
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";

@@ -1230,7 +1230,7 @@ func TestAgentRescanWithoutSpec(t *testing.T) {
 	a.rescan()                  // the guard must return before the callability rules touch the nil self
 }
 
-// Row 2.3 (protocol §2, a MUST): a change in nuntium triggers a scan. Alpha runs; beta starts
+// Row 2.3 (a MUST): a change in nuntium triggers a scan. Alpha runs; beta starts
 // afterwards; without any Refresh call, alpha's Agmen() gains beta within the debounce plus a
 // margin. The neighbour TestAgentRescanWithoutSpec pins the nil-spec guard; this pins the watch —
 // the nuntium.changed() case of discoveryLoop schedules the debounced scan.
@@ -1468,7 +1468,7 @@ func TestAgentSecondStartBadConfigReturns(t *testing.T) {
 	}
 }
 
-// TestAgentStopWritesAbandonLinesBeforeInactive: D-9 (v1.11) — the stop waits, within its ctx, for the
+// TestAgentStopWritesAbandonLinesBeforeInactive: D-9 — the stop waits, within its ctx, for the
 // outbound exchanges it abandoned, so their outreq lines come before the inactive, as in TS. Over the
 // probe's 20 stops × 3 in-flight requests, zero abandoned lines may come after the inactive: each
 // exchange writes its outreq line before its deferred inflight.Done(), so the stop's wait is a

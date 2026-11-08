@@ -1,8 +1,8 @@
-// Smoke test (WP8, §4 acceptance): spawn `examples/echo-agent.ts` as a child process with fast
+// Smoke test: spawn `examples/echo-agent.ts` as a child process with fast
 // timers, run the `actio` CLI against it from a cold start, and verify the full loop: announce,
 // `call` for `echo` / `fail` / `sleep`+cancel, `validate` on the produced files, and
 // `cmd … stop` → the agent exits 0 on its own. Every child is spawned here and reaped here
-// (kill logic scoped to these PIDs only; no /proc walking — the WP8-A-1 incident note).
+// (kill logic scoped to these PIDs only; no /proc walking).
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fsp from "node:fs/promises";
@@ -14,7 +14,7 @@ import { waitFor } from "../helpers/index.js";
 
 const projectRoot = path.resolve(fileURLToPath(import.meta.url), "../../..");
 
-/** The §2.4 env of the smoke world: a per-test temp root and fast protocol timers (seconds). */
+/** The env of the smoke world: a per-test temp root and fast protocol timers (seconds). */
 function actioEnv(root: string): NodeJS.ProcessEnv {
   return {
     ...process.env,
@@ -92,7 +92,7 @@ test("smoke: echo-agent + the actio CLI, end to end from a cold start", { timeou
 
   // e. call `sleep` with a 1 s CLI timeout: the receiver aborts the work (A3) and answers with a
   //    cancellation response, so the exchange ends `cancelled` WITH a response → exit 0.
-  //    (The brief expected the abandon path / exit 1; that is unreachable here: the echo agent
+  //    (The abandon path / exit 1 is unreachable here: the echo agent
   //    answers cancellations in milliseconds and ACTIO_CANCEL_WAIT must be a positive number of
   //    seconds. The abandon path itself is covered by the requestor unit tests.)
   const sleep = runCli(root, ["call", "smoke", "echo", "sleep", '{"seconds":5}', "--timeout", "1"]);

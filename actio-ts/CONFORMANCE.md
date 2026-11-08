@@ -2,7 +2,7 @@
 
 Traceability matrix: one row per normative statement of *The protocol* (`doc/actio_protocol.md`), with the implementing file:function and the tests that exercise it. Rows outside the core profile are marked `n/a (security)`.
 
-Conventions: **§** references point into `doc/actio_protocol.md`; "v" references point into the master plan's decisions (D-x). Tests: `unit:*` = `test/unit/<file>.test.ts`, `e2e:*` = `test/e2e/<file>.test.ts`, `vectors` = `test/vectors/` + `test/unit/vectors.test.ts`.
+Conventions: **§** references point into `doc/actio_protocol.md`; D-x are the decisions in README.md (*Implementation choices*); I-x the implementation rules listed after them. Tests: `unit:*` = `test/unit/<file>.test.ts`, `e2e:*` = `test/e2e/<file>.test.ts`, `vectors` = `test/vectors/` + `test/unit/vectors.test.ts`.
 
 ## 1. Structure, ownership, announcement
 
@@ -156,7 +156,7 @@ Conventions: **§** references point into `doc/actio_protocol.md`; "v" reference
 | # | Normative statement | Implementation | Tests |
 | --- | --- | --- | --- |
 | 12.1 | "`sync`: Signal the storage layer that files have changed" | `src/sync.ts` (the four providers) + `src/io.ts` (the write hooks) | `unit:sync`, `unit:io`, `e2e:robustness` E20 |
-| 12.2 | "`watch_dir`: Watch a directory non-recursively … report new and modified files … keeping a per-file change marker" | `src/watch.ts` `watchDir()`/`diffMarkers()` (event-driven; no timers and no polling, §2.1) | `unit:watch` (13 scenarios), `unit:io` (the atomic-write loop) |
+| 12.2 | "`watch_dir`: Watch a directory non-recursively … report new and modified files … keeping a per-file change marker" | `src/watch.ts` `watchDir()`/`diffMarkers()` (event-driven; no timers and no polling) | `unit:watch` (13 scenarios), `unit:io` (the atomic-write loop) |
 | 12.3 | "`write_json`: Write a json to file/object as atomically as possible" (the temp-then-rename example) | `src/io.ts` `writeJsonAtomic()` (temp `<tmpDir>/.<name>.<nonce>.tmp` → rename, with the sync hooks; a failed rename unlinks the temp) | `unit:io` (the atomicity loop + the temp-file cleanup test) |
 | 12.4 | "Errors … a bad `<ms>` … is a configuration error at `start()`" (D-21) | `src/sync.ts` `createSyncProvider()`; `src/agent.ts` `start()` | `unit:sync` (the parser/rejection tables), `unit:agent` (the bad-sync test) |
 | 12.5 | E20: the four providers produce identical protocol outcomes | `e2e:robustness` E20 (the deep-equal across providers) | `e2e:robustness` E20 |
@@ -179,11 +179,11 @@ Conventions: **§** references point into `doc/actio_protocol.md`; "v" reference
 | 14.2 | 104 `version_not_supported` (optional) | `n/a` — not implemented (D-7; the version is informative) | `unit:validate` (the version vectors accept) |
 | 14.3 | Queueing at `max_parallel` | `n/a` — rejected with 107, no queue (D-7) | `unit:receiver`, `e2e:requests` E3-107 |
 
-## 15. Process rules the implementation adds (from the review history)
+## 15. Implementation rules the code adds
 
 | # | Statement (the I-x rows of `README.md`) | Implementation | Tests |
 | --- | --- | --- | --- |
 | 15.1 | I-2: every file the library writes is self-validated before writing | `src/status.ts`, `src/diarium.ts`, `src/requestor.ts`, `src/receiver.ts` (the `mustValidate`/inline checks) | the unit suites of each writer |
 | 15.2 | I-3/I-11: the capability registrations carry their compiled schemas (D-19); the 106 hook reads the DISCOVERED specs | `src/types.ts` (`CapabilityEntry.compiled`), `src/agent.ts` (`capability()`), `src/receiver.ts` (`accept()` 106) | `unit:agent` (the registration tests), `unit:receiver` (106) |
 | 15.3 | I-10: one sync provider per process | `src/io.ts` `setSyncProvider()`; `src/agent.ts` `start()` | `unit:io` (the provider tests) |
-| 15.4 | the rules the review rounds settled, stated as the code keeps them: an ignored request file drops the envelopes deferred for its rid (D-15); a failed atomic rename leaves no temp file (§2.1 `write_json`); `receiver.stop()` resolves only once every archive has landed (D-9); the `confirmTimeout` timer is tracked, so `stop()` awaits it | `src/receiver.ts` (`dropDeferredFor`, `startArchive`, the awaited `stop()`, the tracked `confirmTimer`), `src/io.ts` (`writeJsonAtomic`) | `unit:receiver` (the deferred-drop and archive-await tests), `unit:io` (the temp-file cleanup test) |
+| 15.4 | rules the code keeps: an ignored request file drops the envelopes deferred for its rid (D-15); a failed atomic rename leaves no temp file (`write_json`); `receiver.stop()` resolves only once every archive has landed (D-9); the `confirmTimeout` timer is tracked, so `stop()` awaits it | `src/receiver.ts` (`dropDeferredFor`, `startArchive`, the awaited `stop()`, the tracked `confirmTimer`), `src/io.ts` (`writeJsonAtomic`) | `unit:receiver` (the deferred-drop and archive-await tests), `unit:io` (the temp-file cleanup test) |

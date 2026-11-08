@@ -18,7 +18,7 @@ test("writeJsonAtomic + readJson round-trip, no trailing whitespace, no temp lef
   assert.deepEqual(await io.listDir(tmpDir), []); // temp file renamed away
 });
 
-test("writeJsonAtomic: a failed rename rejects and leaves no .tmp behind (P-4)", async (t) => {
+test("writeJsonAtomic: a failed rename rejects and leaves no .tmp behind", async (t) => {
   const root = await makeRoot(t);
   const tmpDir = path.join(root, "tmp");
   // The target's parent does not exist: the temp file is written, then the rename fails (ENOENT).

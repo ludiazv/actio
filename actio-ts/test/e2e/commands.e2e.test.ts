@@ -1,6 +1,6 @@
-// E2E — command and lifecycle scenarios E10–E13 (plan §7): real temp .actio roots, two
+// E2E — command and lifecycle scenarios E10–E13: real temp .actio roots, two
 // ActioAgents in-process (alpha = command issuer, beta = receiver-side) with fastConfig().
-// Every scenario asserts the four §7 properties: (a) order of files in the receiver inbox with
+// Every scenario asserts the four properties: (a) order of files in the receiver inbox with
 // recordInbox, (b) inbox empty after archive, (c) every diarium line of both agents validates
 // and the inreq/outreq final statuses, (d) attachments cleaned per the Envelope lifecycle.
 //
@@ -12,13 +12,12 @@
 // - E11's "no status/spec/nuntium change" is asserted BYTE-identical: the fastConfig heartbeat
 //   (200 ms) rewrites status.json's datetime, so this scenario runs with a long heartbeatInterval.
 // - E12: receiver.stop() writes the code-300 response and archives the exchange immediately
-//   (R1-2: the archive completes before C1), so the res file's lifetime is milliseconds; (a)
+//   (the archive completes before C1), so the res file's lifetime is milliseconds; (a)
 //   asserts the req → res appearances, and the 300 body is asserted from the archived envelope
 //   (the diarium) as well as from alpha's captured outcome.
 // - E12's "status inactive" is asserted from the DIARIUM `status` event, the announce file AND the
-//   final status.json content. The syncBusy/C1 race that used to leave status.json `idle` after the
-//   stop is fixed (f2eb08d), and the R3 probes (oracle/R3-probes.test.ts: 10/10 stops with a request
-//   in flight, 40/40 forced stops racing a 1 ms heartbeat) confirm it is gone.
+//   final status.json content. A syncBusy/C1 race once left status.json `idle` after the stop; it
+//   is gone (10/10 stops with a request in flight, 40/40 forced stops racing a 1 ms heartbeat).
 import assert from "node:assert/strict";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -129,7 +128,7 @@ async function pair(
   return { root: h.root, a: a.agent, b: b.agent, ea: a.events, eb: b.events };
 }
 
-// --- the four §7 properties, all on REAL files --------------------------------------------------
+// --- the four properties, all on REAL files --------------------------------------------------
 
 const statusOf = (root: string, id: string): Promise<Status> =>
   fsp.readFile(path.join(root, id, "status.json"), "utf8").then((s) => JSON.parse(s) as Status);
@@ -374,8 +373,8 @@ test("E12: stop with a request in flight — error 300, inreq archived before C1
     () => announceOf(h.root, "beta").then((a) => a.nuntium === "agent beta is inactive"),
     8_000,
   );
-  // The final status.json content: `inactive` (§7 E12). The syncBusy/C1 race that used to leave it
-  // `idle` is gone (f2eb08d; the R3 probes in the file header).
+  // The final status.json content: `inactive` (E12). The syncBusy/C1 race that used to leave it
+  // `idle` is gone (see the file header).
   assert.equal((await statusOf(h.root, "beta")).status, "inactive");
   // alpha's in-flight request resolves with the code-300 error outcome (B2 captured the 300 res).
   const out = await outP;

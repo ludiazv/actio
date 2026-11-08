@@ -110,7 +110,7 @@ export class Requestor {
   /** Lane B for `type="cmd"`: write the command; `outreq` "sent" right after (B1). */
   async command(dst: AgentId, name: string, params: unknown): Promise<string> {
     const { rid, req } = await this.beginOutbound(dst, name, params, "cmd", 0, []);
-    // §2.7: the diarium is the durable record — append it first, then the live signal (same order at all four outreq points).
+    // The diarium is the durable record — append it first, then the live signal (same order at all four outreq points).
     await this.ctx.appendDiarium(outreqEvent(this.ctx.id, this.ctx.now(), "sent", this.exchangeData("sent", req, null, null, null)));
     this.ctx.emit({ event: "outreq", rid, finalStatus: "sent" });
     return rid;

@@ -1,4 +1,4 @@
-// File primitives (§2.5): atomic JSON writes, JSONL appends, small fs helpers. Every write of a
+// File primitives: atomic JSON writes, JSONL appends, small fs helpers. Every write of a
 // protocol file goes through writeJsonAtomic or appendJsonl and applies the sync provider's hooks.
 import { access, copyFile as fsCopyFile, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
@@ -13,7 +13,7 @@ export function setSyncProvider(p: SyncProvider): void {
   provider = p;
 }
 
-/** fsync a directory; some platforms do not allow it, so errors are ignored (§2.6). */
+/** fsync a directory; some platforms do not allow it, so errors are ignored. */
 async function fsyncDir(dir: string): Promise<void> {
   const dh = await open(dir, "r");
   try {
@@ -25,7 +25,7 @@ async function fsyncDir(dir: string): Promise<void> {
   }
 }
 
-/** Post-write hooks of §2.6 (after the rename, or after the append for JSONL). */
+/** The sync provider's post-write hooks (after the rename, or after the append for JSONL). */
 async function postWriteHooks(target: string): Promise<void> {
   if (provider.fsync) await fsyncDir(path.dirname(target));
   provider.notify();

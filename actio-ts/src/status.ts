@@ -10,7 +10,7 @@ import type { Validated } from "./validate.js";
 import type { AgentId, Health, StatusState } from "./types.js";
 
 // Health thresholds (*Agent's status* rules 4–7, *Timers and thresholds*): protocol constants, not
-// config (plan §2.4). A status state whose age a peer can rate; the other two have no health (8).
+// config. A status state whose age a peer can rate; the other two have no health (8).
 const HEALTHY_MS = 60_000; // rule 4: updated less than 60 s ago
 const ONLINE_MS = 100_000; // rule 5: 60–100 s (rule 3's ≤ 90 s heartbeat keeps peers out of degraded)
 const DEGRADED_MS = 600_000; // rule 6: 100–600 s; rule 7: zombie only after MORE than 600 s
@@ -32,7 +32,7 @@ export function buildStatus(id: AgentId, state: StatusState, nowMs: number, capa
 /** Writes spec.json (atomic; the caller publishes status before re-announcing). */
 export async function publishSpec(folder: string, spec: Spec): Promise<void> {
   const validated = mustValidate("spec.json", validateSpec(spec));
-  await writeJsonAtomic(path.join(folder, "spec.json"), validated, folder); // tmpDir = own agent folder (§2.5)
+  await writeJsonAtomic(path.join(folder, "spec.json"), validated, folder); // tmpDir = own agent folder
 }
 
 /** Writes status.json (atomic; immediate on change, and on every heartbeat tick). */

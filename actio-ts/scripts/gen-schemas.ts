@@ -1,4 +1,4 @@
-// Schema generator (master plan §2.3): embeds the 11 protocol schemas as JSON constants and
+// Schema generator: embeds the 11 protocol schemas as JSON constants and
 // generates TypeScript interfaces from them. Run by `npm run gen`. Never hand-edit src/generated/.
 import fs from "node:fs";
 import path from "node:path";
@@ -12,7 +12,7 @@ const projectDir = path.resolve(scriptDir, "..");
 const schemasDir = path.resolve(projectDir, "..", "doc", "schemas");
 const outDir = path.join(projectDir, "src", "generated");
 
-// --- fixed name maps (§2.3: names are fixed by the generator, not by title heuristics) ---
+// --- fixed name maps (names are fixed by the generator, not by title heuristics) ---
 
 const ROOT_NAMES: Record<string, string> = {
   "actio.schema.json": "ActioMeta",
@@ -31,7 +31,7 @@ const ROOT_NAMES: Record<string, string> = {
 /** capitalize-first: `agentId` -> `AgentId` (deterministic, no title heuristics). */
 function defName(file: string, def: string): string {
   if (!(file in ROOT_NAMES) && file !== "common.schema.json") throw new Error(`unknown schema file ${file}`);
-  // The four envelope-body defs would collide on the bare capitalized name; the plan fixes their names.
+  // The four envelope-body defs would collide on the bare capitalized name; their names are fixed here.
   const override: Record<string, string> = {
     "request.schema.json:body": "RequestBody",
     "cancellation.schema.json:body": "CancellationBody",
@@ -68,7 +68,7 @@ for (const file of files) {
   schemas.set(file, schema);
 }
 
-// 1. Strict compile gate: same Ajv options as the runtime (§2.3). Fails the build loudly.
+// 1. Strict compile gate: same Ajv options as the runtime. Fails the build loudly.
 const ajv = new Ajv2020({ strict: true, allErrors: false });
 for (const file of files) ajv.addSchema(schemas.get(file) as Json);
 let compiled = 0;
@@ -144,9 +144,9 @@ function rewriteRefs(node: unknown, currentFile: string, where: string): void {
 }
 
 // 3. One json-schema-to-typescript run per target; merge declarations by name.
-// Targets are exactly the plan's list (§2.3); further defs (e.g. diarium Exchange) are emitted
+// Targets are a fixed list; further defs (e.g. diarium Exchange) are emitted
 // automatically when referenced. if/then/else-only defs (requestRules, commandRules) are not
-// emitted: json-schema-to-typescript ignores if/then/else (known limit, §2.3).
+// emitted: json-schema-to-typescript ignores if/then/else (a known limit).
 const targets: string[] = [
   "ActioMeta", "Spec", "Status", "Announce", "RequestFile", "CancellationFile", "ResponseFile",
   "ConfirmationFile", "ErrorResult", "DiariumLine", "Exchange",

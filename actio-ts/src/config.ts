@@ -1,8 +1,8 @@
-// ActioConfig: defaults, env reading and the injectable clock (§2.4). Durations are milliseconds
+// ActioConfig: defaults, env reading and the injectable clock. Durations are milliseconds
 // internally; the env overrides of the protocol timers are in seconds (spec *Timers and thresholds*).
 import type { ActioConfig } from "./types.js";
 
-/** Protocol defaults equal to §2.4 (root and clock are always resolved, never defaulted here). */
+/** Protocol defaults (root and clock are always resolved, never defaulted here). */
 export const defaultConfig: Omit<ActioConfig, "root" | "clock"> = {
   sync: "none",
   heartbeatInterval: 30_000,

@@ -148,6 +148,31 @@ The history is **in memory, per session**: `/reload`, `/new` or `/fork` starts i
 - Everything the tool prints is a peer's answer rendered as text or JSON; nothing is invented locally.
 - A prompt's answer is the last assistant text of the run, which may be empty after an abort.
 
+The code cites these decisions by number:
+
+| Id | Decision |
+| --- | --- |
+| D-1 | The config file is `actio.json` in pi's agent dir; a missing file means all defaults |
+| D-2 | An invalid config (bad JSON, schema violation) registers and starts nothing, and is notified once |
+| D-3 | `disabled: true` turns the extension fully off: no agent, no tool, no command, until `/reload` |
+| D-4 | The default `agentId` is the cwd basename made safe, cut to 27 characters, plus `-` and 4 hex characters, kept per process and cwd |
+| D-5 | `actioDir` (with `~/` expanded) is the root; absent, actio-ts applies `$ACTIO_DIR` or `~/.actio` |
+| D-6 | Identity: description `pi coding agent in <cwd>`, no protocol commands accepted, capabilities only from the prompt service |
+| D-7 | The agent starts in `session_start` and stops in `session_shutdown` with `force`; a failed start is notified |
+| D-8 | The team view excludes the agent itself |
+| D-9 | `list-team` scans again; `info`, `call` and the Explorer use the current view |
+| D-10 | A call is validated before anything is written: the target's form, the agent in the view, the capability, its parameters |
+| D-11 | A peer's error answer is a normal tool result; only a local failure throws |
+| D-12 | Prompt ids are 8 lower-case hex characters, redrawn on a collision |
+| D-13 | Prompt states are `queued`, `running`, `done`; `retrieve` of a done prompt and `cancel` forget the id; an unknown id is error 1000 |
+| D-14 | A prompt is sent now when the session is idle, steered when busy and `asap`, queued otherwise; it is done on `agent_settled` |
+| D-15 | Cancelling a running prompt aborts the whole run |
+| D-16 | `compact` returns `null` whatever happens; while busy it waits for the run to settle |
+| D-17 | `acceptPrompt` becomes each prompt capability's `accepts_from`, omitted when empty |
+| D-18 | `reportActivity: true` notifies the pi user of each prompt received and each call that ends |
+| D-19 | The Explorer's history is in memory, per runtime, with no cap |
+| D-20 | `json: true` makes every tool result pretty-printed JSON; otherwise it is Markdown |
+
 ## Limits
 
 - One tool, three commands, one command, four capabilities: nothing else, on purpose.

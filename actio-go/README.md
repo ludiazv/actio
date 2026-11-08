@@ -238,7 +238,7 @@ The last line runs the lifecycle tests many times at three processor counts. A f
 run of each test once cannot see that class: one test once started an agent and never stopped it, so the agent's
 writes raced `t.TempDir()`'s cleanup — 38 of 40 runs failed on one machine and 0 of 100 on another.
 
-The e2e scenarios are E1–E21 of the protocol's own scenario list (`e2e_a_test.go`, `e2e_b_test.go`). The
+The e2e scenarios are E1–E21, the same scenario list as the reference's e2e suites (`e2e_a_test.go`, `e2e_b_test.go`). The
 `interop` build tag runs **two implementations in one root** — a TypeScript echo agent under `tsx` and this
 one as a binary — and 25 rows: calls both ways, both CLIs listing both agents, each CLI validating every kind
 of file the other writes (`spec`, `status`, the announce, the broadcast, the diarium, a command envelope), and

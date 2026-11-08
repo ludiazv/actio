@@ -383,7 +383,7 @@ func (a *Agent) stopInternal(ctx context.Context, opts StopOptions, closeDone bo
 		return ctx.Err()
 	}
 	st.req.stop()
-	// D-9 (v1.11): the outbound abandons, then C1. The stop waits, within its ctx, for the exchanges
+	// D-9: the outbound abandons, then C1. The stop waits, within its ctx, for the exchanges
 	// it abandoned so their outreq lines land before the inactive, as in TS. This is a guarantee, not
 	// a race we usually win: each exchange writes its outreq line before its deferred inflight.Done(),
 	// so the wait is a happens-before edge over the line. D-9's other half: a blocked exchange costs a
@@ -671,8 +671,8 @@ func (a *Agent) announceAfterDelay(ctx context.Context, text string) error {
 
 // discoveryLoop is the agent's discovery goroutine: a nuntium wake-up schedules one debounced full
 // scan (D-17), a loss is D-22, and the stop ends it with the pending debounce dropped. The timer
-// and its fired channel belong to this goroutine alone; the timer callback only sends, as §5.4
-// orders.
+// and its fired channel belong to this goroutine alone; the timer callback only sends, so no
+// timer state is shared.
 func (a *Agent) discoveryLoop(nuntium *folderWatch) {
 	st := a.cur()
 	var timer *time.Timer

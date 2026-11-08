@@ -1,4 +1,4 @@
-// Tests of the agent (WP7): the lifecycle spine (steps 1–5, lane C), the D-8 status policy, the
+// Tests of the agent: the lifecycle spine (steps 1–5, lane C), the D-8 status policy, the
 // discovery wiring (D-3, D-17), the callability gate of request()/command(), the built-in commands'
 // lifecycle side (D2, D-10), D-22, D-12 and the D-19 peer cache, and the observability stream.
 // Every agent of a test is stopped before its folder is removed: after-hooks run in order, so one
@@ -498,7 +498,7 @@ test("a duplicate capability, a shadowed built-in command, and a non-strict sche
   assert.throws(() => a.onCommand("x", async () => undefined), /command "x" is already registered/);
 });
 
-test("R3-3: the library copies caller objects — a later mutation changes neither the spec nor A0", opts, async (t) => {
+test("the library copies caller objects — a later mutation changes neither the spec nor A0", opts, async (t) => {
   const h = await harness(t);
   // Caller-owned objects: the capability and the options' namespaces array.
   const cap: Capability = structuredClone(ECHO);
@@ -514,7 +514,7 @@ test("R3-3: the library copies caller objects — a later mutation changes neith
   const specBefore = await specOf(h.root, "alpha");
   assert.deepEqual(specBefore.namespaces, ["green"]);
   assert.equal(specBefore.capabilities.find((c) => c.name === "echo")?.actio?.disabled, undefined);
-  // The caller mutates its own objects after capability()/start(): with R3-3 neither the agent's
+  // The caller mutates its own objects after capability()/start(): with the copy neither the agent's
   // registration nor its options are aliased, so the mutation must reach nowhere.
   cap.actio!.disabled = true;
   ns.push("blue");
@@ -589,7 +589,7 @@ test("refresh() sees a peer that started after us, where the nuntium debounce wo
   assert.deepEqual([...(a.agent.agmen().get("beta")?.capabilities.keys()) ?? []], ["echo"]);
 });
 
-// --- the R2 regressions (WP7-C-1): one test per finding; the oracle's probes are separate -----------
+// --- lifecycle regressions: one test per defect -----------------------------------------------------
 
 /** A request envelope as a peer would write it: the local gate of `request()` refuses to produce one. */
 function requestFile(
@@ -642,7 +642,7 @@ async function delegating(
   return { a: a.agent, g: g.agent };
 }
 
-test("R2-1: enable(false) survives the heartbeat and ping; only a fresh start clears it (D-10)", opts, async (t) => {
+test("enable(false) survives the heartbeat and ping; only a fresh start clears it (D-10)", opts, async (t) => {
   const h = await harness(t);
   const timers = { nuntiumDebounce: 10_000, heartbeatInterval: 100 };
   const b = agent(h, "beta", { acceptsCommandsFrom: ["alpha"] }, timers);
@@ -670,7 +670,7 @@ test("R2-1: enable(false) survives the heartbeat and ping; only a fresh start cl
   assert.deepEqual(again.response?.result, { text: "echo: fresh" }, "the restarted agent serves again");
 });
 
-test("R2-2: a graceful stop lets a delegating handler finish inside stopGrace (D-9 order)", opts, async (t) => {
+test("a graceful stop lets a delegating handler finish inside stopGrace (D-9 order)", opts, async (t) => {
   const h = await harness(t);
   const timers = { nuntiumDebounce: 10_000, stopGrace: 3_000 };
   let innerFinal = "";
@@ -697,7 +697,7 @@ test("R2-2: a graceful stop lets a delegating handler finish inside stopGrace (D
   assert.deepEqual(finalsOf(await diaryOf(h.root, "gamma"), "inreq"), ["confirmed"], "gamma served it");
 });
 
-test("R2-2: force=true skips the wait: the client gets 300, the inner request is abandoned (D-9)", opts, async (t) => {
+test("force=true skips the wait: the client gets 300, the inner request is abandoned (D-9)", opts, async (t) => {
   const h = await harness(t);
   const timers = { nuntiumDebounce: 10_000, stopGrace: 3_000 };
   let innerFinal = "";
@@ -717,7 +717,7 @@ test("R2-2: force=true skips the wait: the client gets 300, the inner request is
   assert.equal((await statusOf(h.root, "alpha")).status, "inactive");
 });
 
-test("R2-3: a stop command pending at start ends with the agent inactive and nothing armed", opts, async (t) => {
+test("a stop command pending at start ends with the agent inactive and nothing armed", opts, async (t) => {
   const h = await harness(t);
   const timers = { heartbeatInterval: 100, nuntiumDebounce: 10_000 };
   // beta starts first so alpha's own initial scan (row 4) discovers it: the long debounce would
@@ -736,7 +736,7 @@ test("R2-3: a stop command pending at start ends with the agent inactive and not
   const file = path.join(h.root, "beta", "status.json");
   const written = await mtimeOf(file);
   await sleep(500); // five heartbeat intervals: nothing may rewrite it
-  assert.equal(await mtimeOf(file), written, "no heartbeat and no watcher survived the stop (R2-3)");
+  assert.equal(await mtimeOf(file), written, "no heartbeat and no watcher survived the stop");
   assert.deepEqual(await inboxOf(h.root, "beta"), [], "the command was archived (D3)");
   assert.equal(b.agent.agmen().size, 0, "C2 dropped the view");
   // idle+inactive from the explicit stop() above, idle from this start(), inactive from the pending one.
@@ -749,7 +749,7 @@ test("R2-3: a stop command pending at start ends with the agent inactive and not
   await waitFor(async () => (await statusOf(h.root, "beta")).status === "idle", 6_000);
 });
 
-test("R2-3: a restart command pending at start leaves exactly one instance running", opts, async (t) => {
+test("a restart command pending at start leaves exactly one instance running", opts, async (t) => {
   const h = await harness(t);
   const timers = { heartbeatInterval: 150, nuntiumDebounce: 10_000 };
   // beta starts first so alpha's own initial scan (row 4) discovers it: the long debounce would
@@ -789,7 +789,7 @@ test("R2-3: a restart command pending at start leaves exactly one instance runni
   assert.equal(await mtimeOf(file), stopped, "and after the final stop() nothing is rewritten");
 });
 
-test("R2-4: a discovered peer with no shared namespace is answered 106 (A0, D-7)", opts, async (t) => {
+test("a discovered peer with no shared namespace is answered 106 (A0, D-7)", opts, async (t) => {
   const h = await harness(t);
   const timers = { nuntiumDebounce: 10_000 };
   const d = agent(h, "delta", { namespaces: ["blue"], acceptsCommandsFrom: [] }, timers);
@@ -815,7 +815,7 @@ test("R2-4: a discovered peer with no shared namespace is answered 106 (A0, D-7)
   await waitFor(async () => finalsOf(await diaryOf(h.root, "beta"), "inreq").join() === "completed", 8_000);
 });
 
-test("R2-6: a bad environment value throws at start(), never at construction (D-21)", opts, async (t) => {
+test("a bad environment value throws at start(), never at construction (D-21)", opts, async (t) => {
   const h = await harness(t);
   process.env["ACTIO_HEARTBEAT"] = "abc";
   try {

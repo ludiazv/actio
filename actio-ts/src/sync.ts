@@ -1,4 +1,4 @@
-// Sync providers (§2.6): none, delay, fsync+delay, mutagen. Exactly these four; parsed from
+// Sync providers: none, delay, fsync+delay, mutagen. Exactly these four; parsed from
 // the ACTIO_SYNC value selected in config.sync. Write hooks are applied by io.ts.
 import { execFile } from "node:child_process";
 import type { SyncProvider } from "./types.js";
@@ -47,7 +47,7 @@ function parseDelayMs(value: string, raw: string | undefined): number {
  * read from `ACTIO_MUTAGEN_BIN` (default `mutagen`) at run time. Failures (spawn error or
  * non-zero exit) call `onError` once per failed run and never throw.
  *
- * §2.6: a flush request is never absorbed by the run already in flight. While a run is going, at most ONE
+ * A flush request is never absorbed by the run already in flight. While a run is going, at most ONE
  * follow-up run is promised (`pendingRun`): a `notify()` or `flush()` arriving mid-run coalesces into
  * it, and `flush()` resolves only once a run that started after the call has finished — so the writes
  * made during a flush are still covered by the next one.
@@ -127,7 +127,7 @@ function mutagenProvider(session: string, onError?: (err: Error) => void): SyncP
  * Unknown values or a bad `<ms>` (not an integer in 1–10 000) throw (configuration error at start()).
  * The mutagen binary path comes from `ACTIO_MUTAGEN_BIN` (default `mutagen`). Mutagen run failures
  * never throw into the protocol logic: they are reported through the optional `onError` hook
- * (issues.md I-1), which the agent wires to its log event.
+ * (I-1), which the agent wires to its log event.
  */
 export function createSyncProvider(value: string, onError?: (err: Error) => void): SyncProvider {
   if (value === "none") return nopProvider(false, 0);

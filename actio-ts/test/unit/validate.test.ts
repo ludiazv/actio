@@ -1,4 +1,4 @@
-// Tests of the runtime validators, the non-schema rules and capability compilation (WP2-A).
+// Tests of the runtime validators, the non-schema rules and capability compilation.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Validated } from "../../src/validate.js";
@@ -27,7 +27,7 @@ import {
 } from "../../src/validate.js";
 import type { Capability, CancellationBody, Header, RequestBody, Spec } from "../../src/generated/types.js";
 
-// --- fixtures (hand-written; the vector suite of WP2-B covers every schema branch) ---
+// --- fixtures (hand-written; the vector suite covers every schema branch) ---
 
 const RID = "01J4ZZQ8H9T3WVXBH0M5K2C8P0";
 const NONCE = "0123456789abcdef0123456789abcdef";

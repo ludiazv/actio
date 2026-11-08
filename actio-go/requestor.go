@@ -437,8 +437,8 @@ func (r *requestor) buildConfirmation(header *Header) ([]byte, error) {
 }
 
 // reportIgnored is the D-11 report: one log per file state, in the diarium and to the event
-// callbacks. The reference dedups per (path, mtime); the Go file primitives expose no mtime
-// outside the five files (§9), so the key is (path, content): a rewrite that changes a byte is
+// callbacks. The reference dedups per (path, mtime); the Go file primitives expose no mtime,
+// so the key is (path, content): a rewrite that changes a byte is
 // reported again, and a byte-identical re-send is not.
 func (r *requestor) reportIgnored(path string, raw []byte, reason string) {
 	sum := sha256.Sum256(raw)

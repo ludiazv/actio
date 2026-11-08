@@ -109,7 +109,7 @@ test("mutagen: close() cancels a pending debounced run", async (t) => {
   assert.deepEqual(await logLines(log), []);
 });
 
-// --- R1-4: coalescing behind a run that is already in flight -------------------------------------
+// --- coalescing behind a run that is already in flight -------------------------------------
 
 /**
  * A slow fake mutagen: it logs `run` when the flush starts and `end` when it finishes, and stays
@@ -136,7 +136,7 @@ const count = (lines: string[], word: string): number => lines.filter((l) => l =
 const waitRuns = (log: string, n: number, word = "run"): Promise<void> =>
   waitFor(async () => count(await logLines(log), word) >= n, 8_000, 10);
 
-test("mutagen: notify()s arriving during a run coalesce into exactly one more run (R1-4)", async (t) => {
+test("mutagen: notify()s arriving during a run coalesce into exactly one more run", async (t) => {
   const log = await slowFake(t);
   const p = createSyncProvider("mutagen:s1");
   p.notify();
@@ -154,7 +154,7 @@ test("mutagen: notify()s arriving during a run coalesce into exactly one more ru
   await p.close();
 });
 
-test("mutagen: flush() during a run resolves only after a run that started after the call (R1-4)", async (t) => {
+test("mutagen: flush() during a run resolves only after a run that started after the call", async (t) => {
   const log = await slowFake(t);
   const p = createSyncProvider("mutagen:s1");
   p.notify();
@@ -174,7 +174,7 @@ test("mutagen: flush() during a run resolves only after a run that started after
   await p.close();
 });
 
-test("mutagen: notify()s during the follow-up run coalesce the same way (R1-4)", async (t) => {
+test("mutagen: notify()s during the follow-up run coalesce the same way", async (t) => {
   const log = await slowFake(t);
   const p = createSyncProvider("mutagen:s1");
   p.notify();

@@ -1,4 +1,4 @@
-// Tests of the `actio` CLI (WP8): the six subcommands and their output, the exit codes, the
+// Tests of the `actio` CLI: the six subcommands and their output, the exit codes, the
 // temporary lane-B vehicle of `call`/`cmd`, and the direct-run entry point of `tsx src/cli.ts`.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -327,7 +327,7 @@ test("call: an unanswered request is cancelled then abandoned, and the CLI exits
   assert.deepEqual((await diaryOf(h.root, "alpha")).map(finalOf), ["abandoned"]);
 });
 
-/** Plan v10 / Q3 §2: the CLI always sends a timeout > 0; 0, a negative and a non-number are usage errors. */
+/** The CLI always sends a timeout > 0; 0, a negative and a non-number are usage errors. */
 test("call --timeout: omitted means 60 in the envelope; 0, -5 and soon are usage errors", opts, async (t) => {
   const h = await harness(t);
   const inbox = path.join(h.root, "beta", "inbox");

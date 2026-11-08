@@ -1,4 +1,4 @@
-// ActioAgent: lifecycle steps 1–5, lane C wiring, commands, and the public API of §2.7.
+// ActioAgent: lifecycle steps 1–5, lane C wiring, commands, and the public API.
 import path from "node:path";
 import { defaultConfig, loadConfig } from "./config.js";
 import * as diarium from "./diarium.js";
@@ -59,7 +59,7 @@ export class ActioAgent {
   private readonly listeners: ((e: ActioEvent) => void)[] = [];
   /** D-19 (peer side): compiled peer capabilities, cached per (id, spec datetime, capability). */
   private readonly peerSchemas = new Map<string, CompiledCapability | null>();
-  /** §2.6, D-21: nothing of the environment is read at construction; `start()` loads the config.
+  /** D-21: nothing of the environment is read at construction; `start()` loads the config.
    * `root: ""` is a placeholder: no path of the shared tree may be used before `start()`. */
   private config: ActioConfig = { ...defaultConfig, root: "", clock: Date.now };
   private folders: AgentFolders = { root: "", agent: "", inbox: "", forum: "", nuntium: "" };
@@ -114,7 +114,7 @@ export class ActioAgent {
 
   /** Subscribes to the observability event stream (every protocol event, incl. ignored files). */
   on(event: "event", handler: (e: ActioEvent) => void): void {
-    void event; // the only event name in §2.7
+    void event; // the only event name
     this.listeners.push(handler);
   }
 
@@ -279,7 +279,7 @@ export class ActioAgent {
     // (5) C1: status first …
     await this.setStatus("inactive");
     await this.reannounceAfterDelay(`agent ${this.options.id} is inactive`); // … then, delayed, the announce
-    await this.sync.flush(); // before C1 completes (§2.6): the last writes must reach the shared tree
+    await this.sync.flush(); // before C1 completes: the last writes must reach the shared tree
     // C2: deinit. The watchers are gone, the in-memory view and the exchange bookkeeping are dropped.
     this.nuntiumWatcher?.close();
     this.nuntiumWatcher = undefined;
@@ -336,7 +336,7 @@ export class ActioAgent {
     await this.fail(`watch lost ${dir}`);
   }
 
-  /** The observability fan-out; a listener's error is the listener's problem (§2.7). */
+  /** The observability fan-out; a listener's error is the listener's problem. */
   private emit(event: ActioEvent): void {
     for (const listener of [...this.listeners]) listener(event);
   }

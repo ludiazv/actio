@@ -1,4 +1,4 @@
-// Conformance vector runner (WP2-B-1): walks test/vectors/<schema>/{valid,invalid} and asserts
+// Conformance vector runner: walks test/vectors/<schema>/{valid,invalid} and asserts
 // each file against the matching validate.ts validator. One test() per schema folder; an unknown
 // folder (or a missing one) fails the suite, so new schemas cannot slip in untested.
 import assert from "node:assert/strict";

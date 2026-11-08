@@ -1,28 +1,28 @@
-// E2E — request scenarios E1–E9 (plan §7): real temp .actio roots, two ActioAgents in-process
+// E2E — request scenarios E1–E9: real temp .actio roots, two ActioAgents in-process
 // (alpha = requestor-side, beta = receiver-side) with fastConfig(). Every scenario asserts the
-// four §7 properties: (a) order of files in the receiver inbox with recordInbox, (b) inbox empty
+// four properties: (a) order of files in the receiver inbox with recordInbox, (b) inbox empty
 // after archive (E9 leaves its files), (c) every diarium line of both agents validates and the
 // inreq/outreq final statuses, (d) attachments cleaned per the Envelope lifecycle.
 //
 // Notes on what the public API can express (documented in the report):
 // - 101/102/103/106 are reachable in e2e: 101/102/103 through request files written DIRECTLY into
 //   beta's inbox (no requestor involved; A0 answers from its in-memory registry), 106 through the
-//   R2-4 scenario (a namespace-disjoint peer, the same idiom), and 100 through the stale-view
+//   discovered-peer scenario (a namespace-disjoint peer, the same idiom), and 100 through the stale-view
 //   technique (alpha's nuntiumDebounce is 30 s; the real `enable` command changes beta's state and
 //   republishes its spec, so the request passes the local gate and beta's A0 answers the code).
 //   101 (E2) uses a phantom capability that exists only in the spec file; the direct 102/103 name
 //   capabilities registered disabled / restricted FROM THE START (the `off`/`private` fixtures) —
-//   R3-3 makes the library copy caller objects, so no test may mutate a registered capability.
-// - The requestor's local gate (§2.7, ActioCallError) is a separate contract, unit-tested in
+//   the library copies caller objects, so no test may mutate a registered capability.
+// - The requestor's local gate (ActioCallError) is a separate contract, unit-tested in
 //   agent.test.ts: it is why a normal request() never sends an uncallable request in the first place.
 // - 105/107/108 produce real responses: 108 through a request file written directly into
-//   beta's inbox. R2-4 (WP7-C-1) adds a second scenario that uses the same idiom for 106: the peer
+//   beta's inbox. A second scenario that uses the same idiom for 106: the peer
 //   is a namespace-disjoint one, which the callability rules keep out of the Agmen view for good.
 // - E7: the requestor cannot cancel after it captured a response (giveUp bails on ex.res !== null),
 //   so the e2e variant stops the requestor before the response is written; the receiver side is
 //   exactly A.4 (cancellation after the response, single response with cancellation=false).
 // - E4/E9: the requestor side ends `abandoned` (it is gone before confirming / the receiver is
-//   inactive); the brief's table fixes only the receiver status for E4 and the outreq status for E9.
+//   inactive); the scenario table fixes only the receiver status for E4 and the outreq status for E9.
 import assert from "node:assert/strict";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -204,7 +204,7 @@ async function pair(
   return { root: h.root, a: a.agent, b: b.agent, ea: a.events, eb: b.events, sleepCalls, get holdCalls() { return holdCalls; }, releaseHold };
 }
 
-// --- the four §7 properties, all on REAL files --------------------------------------------------
+// --- the four properties, all on REAL files --------------------------------------------------
 
 const statusOf = (root: string, id: string): Promise<Status> =>
   fsp.readFile(path.join(root, id, "status.json"), "utf8").then((s) => JSON.parse(s) as Status);
@@ -365,7 +365,7 @@ test("E2: unknown capability — the peer's A0 answers 101, confirmed / confirme
 // --- E3 — the seven acceptance codes ------------------------------------------------------------
 
 test("E3: requests rejected 100, 102, 103, 105, 106, 107, 108 — matching code each", opts, async (t) => {
-  // 106 of the plan row is not exercised HERE: it is the R2-4 scenario in this file (a
+  // 106 is not exercised HERE: it is the discovered-peer scenario in this file (a
   // namespace-disjoint peer answered 106 through a direct write).
   const h = await harness(t);
   // A long debounce keeps alpha's view of beta stale after `enable(false)`, so the 100 request
@@ -384,9 +384,9 @@ test("E3: requests rejected 100, 102, 103, 105, 106, 107, 108 — matching code 
   await p.a.command("beta", "enable", { enabled: true });
   await waitFor(() => specDisabled(h.root, "beta").then((d) => d === false), 6_000);
 
-  // --- R2-9: 101/102/103 via direct inbox writes — no requestor involved; A0 answers from its
+  // --- 101/102/103 via direct inbox writes — no requestor involved; A0 answers from its
   // in-memory registry. The idiom is the 108 one below: write `<rid>.json` into beta's inbox and
-  // wait for the archive (the file is gone). No caller object is mutated (R3-3): 102/103 name
+  // wait for the archive (the file is gone). No caller object is mutated: 102/103 name
   // capabilities that were registered disabled / restricted from the start.
   const directReq = (name: string, parameters: unknown): Promise<string> => {
     const rid = ulid();
@@ -520,8 +520,8 @@ test("E3: requests rejected 100, 102, 103, 105, 106, 107, 108 — matching code 
     finalsOf(await diaries(h.root, "alpha"), "outreq").sort(),
     ["confirmed", "confirmed", "confirmed", "confirmed", "sent", "sent"],
   );
-  // every archived error response carries its code: the seven rejection codes of the plan row
-  // (106 is the R2-4 scenario in this file)
+  // every archived error response carries its code: the seven rejection codes
+  // (106 is the discovered-peer scenario in this file)
   const codes = bLines
     .filter((l) => l.event === "inreq")
     .map((l) => resBody(exchangeOf(l)))
@@ -748,13 +748,13 @@ test("E9: receiver inactive — outreq `abandoned`, attachments removed, files s
   const [rid9] = [...byRid(rec).keys()];
   assert.deepEqual(appearedSeq(rec, rid9), ["req", "can"]);
 });
-// --- R2-4 (WP7-C-1): a real 106, from a peer the callability rules discarded -----------------------
+// --- a real 106, from a peer the callability rules discarded ---------------------------------------
 
-test("R2-4: a discovered peer with no shared namespace is answered 106", opts, async (t) => {
+test("a discovered peer with no shared namespace is answered 106", opts, async (t) => {
   const h = await harness(t);
   // A0 judges the request against the spec the last scan DISCOVERED, not against the Agmen view (the
-  // view of WP4 is filtered by callability, so a namespace-disjoint peer is not in it at all). The
-  // envelope is written directly: gamma's own agent cannot send it, the local gate of request() (WP7)
+  // view is filtered by callability, so a namespace-disjoint peer is not in it at all). The
+  // envelope is written directly: gamma's own agent cannot send it, the local gate of request()
   // refuses a peer that is not in the view. The idiom is E3's 108.
   const g = makeAgent(h, "gamma", { namespaces: ["blue"] }, { nuntiumDebounce: 30_000 });
   await g.agent.start();

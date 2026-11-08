@@ -1,4 +1,4 @@
-// `actio` CLI (§2.8): ls, diarium, call, cmd, broadcast, validate. Reads ACTIO_DIR/ACTIO_SYNC.
+// `actio` CLI: ls, diarium, call, cmd, broadcast, validate. Reads ACTIO_DIR/ACTIO_SYNC.
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -113,7 +113,7 @@ export async function main(argv: string[], sinks: Sinks = terminal): Promise<num
       sinks.err(sub === undefined ? USAGE : `unknown subcommand "${sub}"\n${USAGE}`);
       return 1;
     }
-    const { config, sync } = resolved(sinks); // ACTIO_DIR and ACTIO_SYNC (§2.8), I-10 process-wide
+    const { config, sync } = resolved(sinks); // ACTIO_DIR and ACTIO_SYNC, I-10 process-wide
     io.setSyncProvider(sync);
     const c: Call = { config, sync, json, pos: pos.slice(1), opt, out: sinks.out, err: sinks.err };
     return await handler(c);
@@ -126,14 +126,14 @@ export async function main(argv: string[], sinks: Sinks = terminal): Promise<num
 /** Config and sync provider from the environment: a bad value is fatal before anything runs. */
 function resolved(sinks: Sinks): { config: ActioConfig; sync: SyncProvider } {
   try {
-    const config = loadConfig(); // ACTIO_DIR and ACTIO_SYNC (§2.8)
+    const config = loadConfig(); // ACTIO_DIR and ACTIO_SYNC
     return { config, sync: createSyncProvider(config.sync, (err) => sinks.err(`sync: ${err.message}`)) };
   } catch (err) {
     throw new Error(`config: ${why(err)}`);
   }
 }
 
-/** The six subcommands of §2.8. */
+/** The six subcommands. */
 const SUBS: Record<string, (c: Call) => Promise<number>> = {
   ls,
   diarium: readDiarium,
@@ -195,7 +195,7 @@ async function readDiarium(c: Call): Promise<number> {
   return 0;
 }
 
-/** The lane-B vehicle of `call`/`cmd`. Not an agent: no spec, no status, no announce (brief §3.4). */
+/** The lane-B vehicle of `call`/`cmd`. Not an agent: no spec, no status, no announce. */
 function vehicle(c: Call, src: string, logs: string[]): Requestor {
   const agent = path.join(c.config.root, src);
   const folders: AgentFolders = {
@@ -286,7 +286,7 @@ async function broadcast(c: Call): Promise<number> {
   return 0;
 }
 
-/** `--as` kinds and their validators; the file name decides when `--as` is absent (brief §3.7). */
+/** `--as` kinds and their validators; the file name decides when `--as` is absent. */
 const VALIDATORS: Record<string, (x: unknown) => v.Validated<unknown>> = {
   actio: v.validateActio,
   spec: v.validateSpec,

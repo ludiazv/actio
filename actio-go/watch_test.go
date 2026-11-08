@@ -48,7 +48,7 @@ func inotifyCount(t *testing.T) int {
 	return n
 }
 
-// The deadlock, ported to the v1.7 seams: a finished request stops reading, more files arrive, a
+// The deadlock: a finished request stops reading, more files arrive, a
 // second request subscribes to the same inbox, and the first unsubscribes. Nothing may block, so
 // all of it finishes (D-23).
 func TestWatchDeadlockTwoRequests(t *testing.T) {
@@ -85,7 +85,7 @@ func TestWatchDeadlockTwoRequests(t *testing.T) {
 	}
 }
 
-// The deaf folder, ported to the v1.7 seams: a folder deleted (or renamed away) and recreated
+// The deaf folder: a folder deleted (or renamed away) and recreated
 // under the same name must report a loss — a reported lost() is the only pass, seeing a file in
 // the new folder is not — and the same path must be watchable again (D-22).
 func TestWatchFolderRecreatedIsNotDeaf(t *testing.T) {
@@ -136,7 +136,7 @@ func TestWatchFolderRecreatedIsNotDeaf(t *testing.T) {
 	}
 }
 
-// The inbox owner, ported to the v1.7 seams: every file of a 500-file burst is seen exactly once,
+// The inbox owner: every file of a 500-file burst is seen exactly once,
 // files already present are reported by the first look, and a replaced file (a new inode) is seen
 // again (D-23).
 func TestWatchOwnerSeesEveryFileOnce(t *testing.T) {

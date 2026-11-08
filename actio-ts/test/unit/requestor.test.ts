@@ -1,4 +1,4 @@
-// Tests of the requestor (WP6-A-1, lane B). A scripted fake receiver writes `.res.json` files
+// Tests of the requestor. A scripted fake receiver writes `.res.json` files
 // by hand into the destination inbox; the diarium `outreq` content is asserted against the
 // actual envelope files.
 import assert from "node:assert/strict";
@@ -201,7 +201,7 @@ test("request: confirmed — response, confirmation, outreq matches the files, B
   assert.ok(fx.stateChanges.length >= 2, `onStateChange on 0<->nonzero transitions (got ${fx.stateChanges.length})`);
 });
 
-test("R1-1: two concurrent requests to the same dst, staggered responses, both confirmed", async (t) => {
+test("two concurrent requests to the same dst, staggered responses, both confirmed", async (t) => {
   const fx = await makeFixture(t);
   const p1 = fx.requestor.request("beta", "summarize", { text: "a" }, {});
   const p2 = fx.requestor.request("beta", "summarize", { text: "b" }, {});
@@ -219,7 +219,7 @@ test("R1-1: two concurrent requests to the same dst, staggered responses, both c
   assert.equal(fx.requestor.outboundCount(), 0);
 });
 
-test("R1-1: the dst watcher is closed after the last exchange — deleting the folder fires no watch error", async (t) => {
+test("the dst watcher is closed after the last exchange — deleting the folder fires no watch error", async (t) => {
   const fx = await makeFixture(t);
   const p = fx.requestor.request("beta", "summarize", { text: "a" }, {});
   await waitFor(() => fsp.readdir(fx.betaInbox).then((n) => n.some(isReqFile)), 2_000);
@@ -233,7 +233,7 @@ test("R1-1: the dst watcher is closed after the last exchange — deleting the f
   assert.equal(fx.watchErrors.length, 0, "the watcher was released with the last exchange (D-18)");
 });
 
-test("R1-6: a response with a mismatched header is ignored and logged once (D-11); the exchange stays in B2", async (t) => {
+test("a response with a mismatched header is ignored and logged once (D-11); the exchange stays in B2", async (t) => {
   const fx = await makeFixture(t);
   const p = fx.requestor.request("beta", "summarize", { text: "a" }, {});
   await waitFor(() => fsp.readdir(fx.betaInbox).then((n) => n.some(isReqFile)), 2_000);

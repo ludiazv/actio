@@ -1,4 +1,4 @@
-// Runtime validation (§2.3): Ajv validators over the embedded protocol schemas, the rules the
+// Runtime validation: Ajv validators over the embedded protocol schemas, the rules the
 // schemas cannot express, and the capability schemas compiled on demand (D-19). No schema is
 // re-implemented by hand.
 import { Ajv2020 } from "ajv/dist/2020.js";
@@ -26,7 +26,7 @@ import type {
 /** Result of a runtime validator: `ok` with the narrowed value, or the Ajv error texts. */
 export type Validated<T> = { ok: true; value: T } | { ok: false; errors: string[] };
 
-// The same options as the generator's strict compile gate (§2.3): no Ajv option is relaxed.
+// The same options as the generator's strict compile gate: no Ajv option is relaxed.
 const AJV_OPTIONS = { strict: true, allErrors: false };
 
 let protocolAjv: Ajv2020 | undefined; // created once per process, on first use
@@ -42,7 +42,7 @@ function protocol(): Ajv2020 {
   return protocolAjv;
 }
 
-/** The capability Ajv instance (D-19, §2.3): same strict options, no protocol schemas added, and
+/** The capability Ajv instance (D-19): same strict options, no protocol schemas added, and
  * `addUsedSchema: false` so a compiled schema is not registered under its `$id`: a rescan builds
  * fresh schema objects, and two objects with the same `$id` must each compile and validate. */
 function capabilities(): Ajv2020 {

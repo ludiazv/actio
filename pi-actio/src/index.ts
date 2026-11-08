@@ -41,7 +41,7 @@ export default function (pi: ExtensionAPI): void {
     handler: (_args, ctx) => openExplorer(ctx, team, history, config.exposePrompt),
   });
 
-  // The latest context, kept from session_start and agent_settled (D-18, §3.2).
+  // The latest context, kept from session_start and agent_settled (D-18).
   let latest: ExtensionContext | undefined;
 
   // 5. The activity subscription is the only notifier (D-18).

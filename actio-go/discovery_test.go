@@ -1,5 +1,5 @@
 // The tests of discovery.go: one per callability rule (1–8, named), the scan's handling of the
-// reserved folders, duplicates, the malformed shapes, and the §5.4 traps.
+// reserved folders, duplicates, the malformed shapes, and the filesystem traps.
 package actio
 
 import (
@@ -502,7 +502,7 @@ func TestScanRootMissing(t *testing.T) {
 	}
 }
 
-// §5.4: the scan's order is lexical, whatever the order the filesystem hands back.
+// The scan's order is lexical, whatever the order the filesystem hands back.
 func TestScanResultsSortedLexical(t *testing.T) {
 	root := t.TempDir()
 	zebraSpec := strings.Replace(peerSpecJSON, `"id":"peer"`, `"id":"zebra"`, 1)
@@ -521,7 +521,7 @@ func TestScanResultsSortedLexical(t *testing.T) {
 	}
 }
 
-// §5.4: a folder that is gone by the time the scan reaches it (a dangling link plays the part)
+// A folder that is gone by the time the scan reaches it (a dangling link plays the part)
 // is silent — as in the reference — and not an error out of Scan.
 func TestScanVanishedFolderIsSilent(t *testing.T) {
 	root := t.TempDir()

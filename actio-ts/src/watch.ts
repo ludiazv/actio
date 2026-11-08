@@ -1,4 +1,4 @@
-// Event-driven folder watcher (§2.1): fs.watch events trigger a folder scan; no timers,
+// Event-driven folder watcher: fs.watch events trigger a folder scan; no timers,
 // no polling, no re-arming: the watcher never decides for itself what to look at.
 import fs from "node:fs";
 import fsp from "node:fs/promises";

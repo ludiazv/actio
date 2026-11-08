@@ -1013,7 +1013,7 @@ func TestRequestAbandonLogsAttachmentDeletionFailure(t *testing.T) {
 
 // D-11 dedup is per file state, not per path: a broken response rewritten is reported again, and
 // a byte-identical re-send is not. (The reference keys on (path, mtime); the Go file primitives
-// expose no mtime outside the five files (§9), so the key is (path, content) — reportIgnored.)
+// expose no mtime, so the key is (path, content) — reportIgnored.)
 func TestRequestIgnoredRewriteReportedAgain(t *testing.T) {
 	events := make(chan Event, 64)
 	x := newReqTest(t, "me", "peer", events)

@@ -1,4 +1,4 @@
-// Tests of the spec builder: agent options + registered capabilities to a schema-valid spec (WP7-B).
+// Tests of the spec builder: agent options + registered capabilities to a schema-valid spec.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { buildSpec } from "../../src/spec-builder.js";
@@ -25,7 +25,7 @@ function options(overrides: Partial<AgentOptions> = {}): AgentOptions {
   return { id: ID, description: "translates text", acceptsCommandsFrom: ["beta"], ...overrides };
 }
 
-/** A registered capability: what WP7 hands over after `actio.register()`. */
+/** A registered capability: what the agent hands over after `actio.register()`. */
 function cap(name: string, actio: Partial<Capability["actio"]> = {}): Capability {
   return { name, description: `does ${name}`, parameters: { type: "object" }, actio: { result: true, ...actio } };
 }
@@ -88,7 +88,7 @@ test("namespaces: absent stays absent, an explicit null survives, lists are carr
   assert.ok("namespaces" in explicitNull, "null is a value the operator chose, not an absence");
   assert.equal(explicitNull.namespaces, null);
   // `null` may also appear *inside* the list (*Namespaces*); `AgentOptions` cannot express that, so the
-  // builder must at least carry it through untouched for whoever hands it over (WP7-A-1 may widen it).
+  // builder must at least carry it through untouched for whoever hands it over.
   for (const namespaces of [[], ["*"], ["alpha"], ["alpha", "beta"], ["null"], ["alpha", null] as string[]]) {
     const spec = build({ namespaces });
     mustValidate(spec);

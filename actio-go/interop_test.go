@@ -158,7 +158,7 @@ func TestInterop(t *testing.T) {
 		})
 	}
 
-	// The validate rows (§8, v1.11): every kind each side publishes, in both directions. Each CLI
+	// The validate rows: every kind each side publishes, in both directions. Each CLI
 	// prints "OK <kind>"; the kind word is asserted, not just exit 0, and for the shared broadcast
 	// file both CLIs' kind words are compared. A row that cannot be run is reported as not
 	// demonstrated; a row that runs and disagrees fails.

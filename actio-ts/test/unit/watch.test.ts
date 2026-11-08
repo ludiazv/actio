@@ -1,4 +1,4 @@
-// Tests of the folder watcher and the pure marker diff (WP1-C).
+// Tests of the folder watcher and the pure marker diff.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import fsp from "node:fs/promises";

@@ -1,18 +1,17 @@
-// E2E — the child-process run (plan §7's last piece, WP9-D-1): the black-box style of the oracle's
-// final validation (oracle §9.6). `examples/echo-agent.ts` runs as a REAL child process on a scratch
+// E2E — the child-process run, in the black-box style. `examples/echo-agent.ts` runs as a REAL child process on a scratch
 // `ACTIO_DIR`; every envelope of every scenario is hand-written into its inbox — no library requestor,
 // no CLI — and every file the child produces is validated against `../doc/schemas/` with a FRESH
 // `Ajv2020` assembled in this file: not `src/validate.ts`, and not the embedded generated schemas.
 // This file imports no runtime module from `src/`: the envelope shapes are transcribed from the schema
 // files and Appendix A of the protocol, so a mistake in the implementation's own types cannot hide here.
 //
-// Scenarios (the hand-driven set the brief fixes, from plan §7's table):
+// Scenarios (a hand-driven set of the E table):
 //   E1  normal request (A.1)            E2  A0 acceptance errors (A.2)      E5  cancelled (A.3)
 //   E12 `stop` with a request in flight E14 malformed files in the inbox
 //   E4  (added) no confirmation ever arrives — with no library requestor there is nobody to confirm,
 //       which is the confirmation-timeout path, and it is reachable ONLY by hand-writing envelopes.
 //
-// §7's four checks, in the child-process reading:
+// The four checks, in the child-process reading:
 //   (a) the order of files in the receiver inbox, with `recordInbox` (the helper watches the directory
 //       from our side, so it works across processes); asserted where the writes are separated in time
 //       (E1, E12) and as a presence set where they are not (E5: the req and the can are written back to
@@ -165,7 +164,7 @@ interface Archived {
 const resultOf = (res: ResFile | null): { code?: number; msg?: string } =>
   (res?.response.result ?? {}) as { code?: number; msg?: string };
 
-// ---------------------------------------------------------------- the independent validator (§9.6)
+// ---------------------------------------------------------------- the independent validator
 const schemaDir = path.resolve(projectRoot, "..", "doc", "schemas");
 
 /** The contract schema files, read once per process (a data-file read, not a module import). */
@@ -224,7 +223,7 @@ function exitCodeOf(child: ChildProcess, ms: number): Promise<number> {
 /**
  * Spawns `examples/echo-agent.ts` as a child process on its own temp root with fast protocol timers
  * (seconds, as the environment gives them), and reaps it by its own PID in the cleanup hook: only the
- * children this file spawned, never a pattern and never a /proc walk (the WP8-A-1 incident note).
+ * children this file spawned, never a pattern and never a /proc walk .
  */
 async function spawnEcho(t: TestContext, env: Record<string, string> = {}): Promise<Child> {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), ".actio-child-"));
@@ -257,7 +256,7 @@ async function spawnEcho(t: TestContext, env: Record<string, string> = {}): Prom
   return child;
 }
 
-/** The recorder of §7 (a), armed on the child's inbox from our side. */
+/** The (a) recorder, armed on the child's inbox from our side. */
 function watchInbox(
   t: TestContext,
   dir: string,
@@ -286,7 +285,7 @@ function watchInbox(
   };
 }
 
-/** Every diarium line of the child, parsed, and each one validated against the contract (§7 c). */
+/** Every diarium line of the child, parsed, and each one validated against the contract. */
 async function diaryOf(child: Child): Promise<DiaryLine[]> {
   const text = await fsp.readFile(path.join(child.agent, "diarium.jsonl"), "utf8");
   const lines = text.split("\n").filter((l) => l.trim() !== "").map((l) => JSON.parse(l) as DiaryLine);
@@ -319,7 +318,7 @@ test("E1 (hand-written): a normal echo request, Appendix A.1, `confirmed` on bot
   assert.deepEqual(
     (spec as { capabilities: { name: string }[] }).capabilities.map((c) => c.name),
     ["echo", "sleep", "fail", "off", "private"],
-    "the §2.9 fixed capability set",
+    "the fixed capability set",
   );
   await assertValidDoc("status", await readJson(path.join(child.agent, "status.json")), "the child's status.json");
   await assertValidDoc("announce", await readJson(path.join(child.root, "nuntium", `${ECHO}.n.json`)), "the announce");
@@ -351,7 +350,7 @@ test("E1 (hand-written): a normal echo request, Appendix A.1, `confirmed` on bot
   // Our confirmation closes it; the archive then empties the inbox.
   await writeEnvelope(child.inbox, `${rid}.con.json`, handConfirm(rid));
   await waitFor(() => entries(child.inbox).then((n) => n.length === 0), 20_000);
-  assert.deepEqual(seq.seq(rid), ["req", "res", "con"], "the order of the files in the inbox (§7 a)");
+  assert.deepEqual(seq.seq(rid), ["req", "res", "con"], "the order of the files in the inbox");
 
   const lines = await diaryOf(child);
   const ex = inreqsOf(lines, rid)[0];
@@ -361,12 +360,12 @@ test("E1 (hand-written): a normal echo request, Appendix A.1, `confirmed` on bot
   assert.equal(lines.filter((l) => l.event === "inreq").length, 1, "one exchange, one archive (D-5)");
   await waitFor(() => statusOf(child).then((s) => s === "idle"), 20_000);
   assert.equal((await announceOf(child)).nuntium, "agent echo is active", "busy/idle is not announced (D-8)");
-  assert.deepEqual(await entries(path.join(child.root, "forum")), [], "no attachments, the forum stays empty (§7 d)");
+  assert.deepEqual(await entries(path.join(child.root, "forum")), [], "no attachments, the forum stays empty");
 });
 
 test("E2 (hand-written): A0 answers the acceptance codes 101, 102, 103", opts, async (t) => {
   const child = await spawnEcho(t);
-  // The echo agent is fixed (§2.9): `off` is capability-level disabled and `private` accepts only
+  // The echo agent is fixed: `off` is capability-level disabled and `private` accepts only
   // `nobody`, so all three unusability codes are reachable against the conformance target.
   const probes = [
     { name: "nope", code: 101, msg: /^unknown_capability/, rid: handRid(11) },
@@ -471,7 +470,7 @@ test("E12 (hand-written): `stop` with a request in flight → 300, archive, inac
   // Commands are never answered: no response file for the command rid, and the inbox is empty.
   assert.equal(await exists(path.join(child.inbox, `${cmdRid}.res.json`)), false, "a command gets no response");
   assert.deepEqual(await entries(child.inbox), [], "lane C archived everything (D-9)");
-  // §7 (a): the whole inbox timeline of this scenario, in the order the files appeared — the work is
+  // (a): the whole inbox timeline of this scenario, in the order the files appeared — the work is
   // answered only because the command made the agent stop, so the answer must come last.
   const label = (name: string): string => {
     const who = seq.ridOf(name) === workRid ? "work" : seq.ridOf(name) === cmdRid ? "cmd" : "other";
@@ -501,7 +500,7 @@ test("E12 (hand-written): `stop` with a request in flight → 300, archive, inac
   assert.equal(stopCmd.res, null, "with no response in the archive");
   assert.equal(inreqsOf(lines, workRid).length, 1, "one exchange, one archive (D-5)");
 
-  // The plan's E12 order: the archive precedes C1 — `inreq` comes before the `status` event of inactive.
+  // E12's order: the archive precedes C1 — `inreq` comes before the `status` event of inactive.
   const indexOfInreq = lines.findIndex((l) => l.event === "inreq" && (l.event_data as Archived)?.req?.rid === workRid);
   const indexOfInactive = lines.findIndex((l) => l.event === "status" && l.event_data === "inactive");
   assert.ok(indexOfInreq >= 0 && indexOfInactive >= 0, "both events are in the diarium");

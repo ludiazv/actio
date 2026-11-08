@@ -1,4 +1,4 @@
-// Tests of the shared test helpers themselves (WP0-C).
+// Tests of the shared test helpers themselves.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { fakeClock, fastConfig, makeRoot, recordInbox, waitFor } from "../helpers/index.js";

@@ -1,10 +1,10 @@
-// Planner (Plan §2.9): a small requestor demo — an ActioAgent with no capabilities that, when
+// Planner: a small requestor demo — an ActioAgent with no capabilities that, when
 // run, sends ONE `echo` request to ACTIO_TARGET (default "echo") and prints the outcome.
 //
 // Env:
 //   ACTIO_AGENT_ID  this agent's id (default "planner")
 //   ACTIO_TARGET    the destination agent (default "echo")
-//   plus the config env overrides of §2.4 (ACTIO_DIR, ACTIO_SYNC, …).
+//   plus the config env overrides (ACTIO_DIR, ACTIO_SYNC, …).
 import { ActioAgent } from "../src/agent.js";
 import { ActioCallError, ActioResultError } from "../src/types.js";
 

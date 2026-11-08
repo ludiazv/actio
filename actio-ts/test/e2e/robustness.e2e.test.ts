@@ -1,8 +1,8 @@
-// E2E — robustness, discovery, sync and watch: scenarios E14–E21 (plan §7).
+// E2E — robustness, discovery, sync and watch: scenarios E14–E21.
 //
-// Same shape as `requests.e2e.test.ts`, with its own copy of the harness (the brief asks for the
+// Same shape as `requests.e2e.test.ts`, with its own copy of the harness (the
 // patterns, not that file's internals): real temp `.actio` roots, `ActioAgent`s in-process, and
-// `fastConfig()` timers. Every scenario with an exchange asserts the §7 recipe:
+// `fastConfig()` timers. Every scenario with an exchange asserts the recipe:
 //   (a) the order of the files in the receiver inbox, with `recordInbox`,
 //   (b) the inbox empty after the archive,
 //   (c) every diarium line of every agent validates, plus the `inreq`/`outreq` final statuses,
@@ -101,7 +101,7 @@ const peerCap = (name: string, over: Partial<NonNullable<Capability["actio"]>> =
 
 const echoHandler: CapabilityHandler = async (params) => ({ text: `echo: ${(params as { text: string }).text}` });
 
-// --- the harness (the WP9-A/B patterns; copied, so each e2e file stands on its own) ---------------
+// --- the harness (copied, so each e2e file stands on its own) --------------------------------------
 
 interface Harness {
   root: string;
@@ -192,7 +192,7 @@ async function pair(
   };
 }
 
-// --- the §7 recipe, on real files ----------------------------------------------------------------
+// --- the recipe, on real files ----------------------------------------------------------------
 
 /** Directory names without the atomic-write temp files (`.<name>.<nonce>.tmp`), in lexical order. */
 const clean = (names: string[]): string[] => names.filter((n) => !n.startsWith(".")).sort();
@@ -265,7 +265,7 @@ const streamIgnored = (events: ActioEvent[]): { path: string; reason: string }[]
 const streamStatuses = (events: ActioEvent[]): string[] =>
   events.flatMap((e) => (e.event === "status" ? [e.state] : []));
 
-/** The live view of the outbound exchanges (WP6-C-1): `"<rid>:<finalStatus>"`. */
+/** The live view of the outbound exchanges: `"<rid>:<finalStatus>"`. */
 const streamOutreq = (events: ActioEvent[]): string[] =>
   events.flatMap((e) => (e.event === "outreq" ? [`${e.rid}:${e.finalStatus}`] : []));
 
@@ -294,7 +294,7 @@ function ridsOf(rec: Rec): string[] {
   return [...new Set(rec.events().map((e) => ridOf(e.name)))];
 }
 
-/** (a) helper: the APPEARANCE-only sequence of one rid, in `recordInbox` order (the WP9-A pattern:
+/** (a) helper: the APPEARANCE-only sequence of one rid, in `recordInbox` order (the pattern:
  * disappearances can be lost to inotify coalescing, appearances cannot). */
 function appearedSeq(rec: Rec, rid: string): string[] {
   return rec.events().filter((e) => e.kind === "appeared" && ridOf(e.name) === rid).map((e) => kindOf(e.name));
@@ -631,7 +631,7 @@ test("E16: two request attachments and one response attachment: the forum ends e
   const outbound = exchangeOf(aLines.find((l) => l.event === "outreq")!);
   assert.deepEqual((outbound.req!.request as RequestBody).attachments, ["a1.txt", "a2.txt"]);
   assert.deepEqual(resBody(exchangeOf(bLines.find((l) => l.event === "inreq")!))?.attachments, ["out.bin"]);
-  // the stream carries the same final statuses as the two diaria (WP6-C-1)
+  // the stream carries the same final statuses as the two diaria
   const rid = ridsOf(rec)[0]!;
   assert.deepEqual(streamOutreq(p.ea), [`${rid}:confirmed`], "alpha: outreq confirmed");
   assert.ok(p.eb.some((e) => e.event === "inreq" && e.rid === rid), "beta: inreq on the stream too");
@@ -745,7 +745,7 @@ test("E18: an agent calling itself works like any other exchange", opts, async (
   // D-8 saw both the inbound and the outbound side of the same exchange: one busy period, then idle
   assert.deepEqual(diaryStatuses(lines), ["idle", "busy", "idle"], "the self-call makes us busy once, not twice");
   assert.equal((await statusOf(h.root, "alpha")).status, "idle");
-  // the live stream carries both sides too (WP6-C-1): the diarium is the durable record, not the only one
+  // the live stream carries both sides too: the diarium is the durable record, not the only one
   const rid = ridsOf(rec)[0]!;
   assert.deepEqual(streamOutreq(events), [`${rid}:confirmed`], "outreq on the stream, as in the diarium");
   assert.ok(events.some((e) => e.event === "inreq" && e.rid === rid), "and inreq as well");
@@ -797,7 +797,7 @@ test("E19: the heartbeat keeps status.json fresh; the diarium status event does 
 
 // --- E20 — the four sync providers run the same protocol ------------------------------------------
 
-/** The providers of §2.6, as `ActioConfig.sync` values. */
+/** The sync providers, as `ActioConfig.sync` values. */
 const PROVIDERS = ["none", "delay:20", "fsync+delay:20", "mutagen:robustness"];
 
 interface Run {
@@ -812,7 +812,7 @@ interface Run {
   responseError: boolean | undefined;
 }
 
-test("E20: E1 runs identically with the four sync providers of §2.6", opts, async (t) => {
+test("E20: E1 runs identically with the four sync providers", opts, async (t) => {
   const savedBin = process.env.ACTIO_MUTAGEN_BIN;
   t.after(() => {
     if (savedBin === undefined) delete process.env.ACTIO_MUTAGEN_BIN;
@@ -884,7 +884,7 @@ test("E21: own inbox deleted → error; a dst inbox deleted in B2 → abandoned"
   await waitFor(() => statusOf(h.root, "beta").then((s) => s.status === "error"), 6_000);
   await waitFor(async () => (await announceOf(h.root, "beta")).nuntium.includes("failed"), 6_000);
   const betaStatusEvents = async (): Promise<string[]> => diaryStatuses(await diaries(h.root, "beta"));
-  assert.ok(streamLogs(p.eb).some((m) => /^watch lost /.test(m)), "the watch loss is reported (D-22 text, R2-5)");
+  assert.ok(streamLogs(p.eb).some((m) => /^watch lost /.test(m)), "the watch loss is reported (D-22 text)");
   assert.deepEqual(await betaStatusEvents(), ["idle", "error"], "exactly one status change: idle → error");
   assert.ok(streamStatuses(p.eb).includes("error"), "status error is observable");
   const failed = await announceOf(h.root, "beta");
@@ -921,7 +921,7 @@ test("E21: own inbox deleted → error; a dst inbox deleted in B2 → abandoned"
   await waitFor(() => statusOf(h.root, "alpha").then((s) => s.status === "idle"), 6_000);
   const aLines = await diaries(h.root, "alpha");
   assert.deepEqual(finalsOf(aLines, "outreq"), ["abandoned"]);
-  assert.equal(streamOutreq(p.ea).length, 1, "the stream reports the abandoned exchange (WP6-C-1)");
+  assert.equal(streamOutreq(p.ea).length, 1, "the stream reports the abandoned exchange");
   assert.match(streamOutreq(p.ea)[0]!, /:abandoned$/);
   assert.equal(exchangeOf(aLines.find((l) => l.event === "outreq")!).res, null, "no response was ever captured");
   // (b) alpha's own inbox never held anything of an exchange it could not finish

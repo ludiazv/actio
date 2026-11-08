@@ -1,4 +1,4 @@
-// Tests of the public API barrel: the entry re-exports what the plan names, so a consumer of the
+// Tests of the public API barrel: the entry re-exports the public API, so a consumer of the
 // `actio-ts` package (which may not deep-import `src/…`) reaches every public API through it.
 import assert from "node:assert/strict";
 import { test } from "node:test";

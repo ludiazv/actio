@@ -1,4 +1,4 @@
-// Tests of status/spec/announce publication, health derivation and the heartbeat (WP3-A).
+// Tests of status/spec/announce publication, health derivation and the heartbeat.
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { writeFile } from "node:fs/promises";
@@ -163,7 +163,7 @@ test("announce creates the nuntium folder and leaves no temp file in the agent f
   assert.equal(await io.exists(nuntium), false); // announce creates it
   await announce(agent, nuntium, ID, "first", T0);
   assert.deepEqual(await io.listDir(nuntium), ["alpha.n.json"]); // the only content of the shared folder
-  assert.deepEqual(await io.listDir(agent), ["diarium.jsonl"]); // tmpDir = the agent folder (§2.5), no leftovers
+  assert.deepEqual(await io.listDir(agent), ["diarium.jsonl"]); // tmpDir = the agent folder, no leftovers
 });
 
 test("announce writes the signal to the nuntium folder only, never into the agent folder", async (t) => {
@@ -324,7 +324,7 @@ test("the heartbeat rewrites status.json with a fresh datetime and stays healthy
   const onDisk = JSON.parse(await readFile(path.join(root, "status.json"), "utf8")) as Status;
   assert.equal(onDisk.datetime, published[published.length - 1]); // the last completed write is on disk
   assert.ok(validateStatus(onDisk).ok, errorText(validateStatus(onDisk)));
-  assert.equal(health(onDisk, clock()), "healthy"); // plan WP3: never older than the 90 s heartbeat bound
+  assert.equal(health(onDisk, clock()), "healthy"); // never older than the 90 s heartbeat bound
 });
 
 test("the heartbeat advances status.json' mtime and stop() halts it", async (t) => {
@@ -409,7 +409,7 @@ startHeartbeat(10, async () => {
   );
   const nodeArgs = ["--import", "tsx", script];
   const { stdout } = await execFileAsync(process.execPath, nodeArgs, { cwd: projectRoot, timeout: 15_000 });
-  assert.match(stdout, /SEEN Error: tick failed/); // the caller (WP7) can install its own error policy
+  assert.match(stdout, /SEEN Error: tick failed/); // the caller (the agent) can install its own error policy
   assert.match(stdout, /TICKS 1/); // the chain stops: no further tick after a rejection
 });
 

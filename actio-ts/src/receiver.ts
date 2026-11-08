@@ -39,7 +39,7 @@ import type {
   Spec,
 } from "./generated/types.js";
 
-/** Lifecycle callbacks the receiver hands over to the owning agent (§2.7). */
+/** Lifecycle callbacks the receiver hands over to the owning agent. */
 export interface ReceiverHooks {
   /** Watch error on the own inbox (D-22): the agent logs and fails itself. */
   onWatchError(dir: string, err: Error): void;
@@ -139,7 +139,7 @@ export class Receiver {
     private readonly commands: Map<string, CommandHandler>,
   ) {}
 
-  /** Arms the inbox watcher. The watcher's initial scan (§2.1) is the SINGLE delivery path
+  /** Arms the inbox watcher. The watcher's initial scan is the SINGLE delivery path
    * for the pending envelopes (D-4): every present file is reported exactly once, in lexical order.
    * `start` resolves after arming; the delivery itself is asynchronous. Every file event → `onFile`. */
   async start(onFile: (name: string) => void): Promise<void> {
@@ -321,7 +321,7 @@ export class Receiver {
     await this.archiveCommand(file, "completed"); // executed: the envelope was accepted and run
   }
 
-  /** `D1` for the four mandatory commands: the parsed parameters go to the agent lifecycle hooks (§2.7). */
+  /** `D1` for the four mandatory commands: the parsed parameters go to the agent lifecycle hooks. */
   private async runStandardCommand(name: string, parameters: unknown): Promise<void> {
     // `commandRules` fixed the shape (`stop {force?}`, `enable {enabled}`, `restart {force?, delay?}`,
     // `ping null`), so these reads cover every accepted envelope; anything else never reached here.

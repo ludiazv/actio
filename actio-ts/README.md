@@ -54,7 +54,7 @@ await alpha.stop();
 await beta.stop();
 ```
 
-Running examples live in [`examples/`](examples): `echo-agent.ts` (the §2.9 conformance target, driven by `ACTIO_AGENT_ID` / `ACTIO_COMMANDERS` / `ACTIO_NAMESPACES` + the config env vars) and `planner.ts` (a minimal requestor).
+Running examples live in [`examples/`](examples): `echo-agent.ts` (the conformance target, driven by `ACTIO_AGENT_ID` / `ACTIO_COMMANDERS` / `ACTIO_NAMESPACES` + the config env vars) and `planner.ts` (a minimal requestor).
 
 ```sh
 npm run echo        # tsx examples/echo-agent.ts
@@ -107,7 +107,7 @@ The protocol's "signal the storage layer" primitive — pick with `ACTIO_SYNC`:
 | `fsync+delay[:<ms>]` | fsync the file (and the parent folder) before returning | storages where data or renames may not be visible to other readers yet |
 | `mutagen:<session>` | a debounced (200 ms) `mutagen sync flush <session>` via `execFile` | replicated setups (e.g. Docker ↔ host); the binary is `ACTIO_MUTAGEN_BIN` (default `mutagen`) |
 
-`<ms>` is an integer in 1–10 000. An unknown value is a configuration error at `start()`. **One provider per process** (documented choice I-10): all agents of a team share one `.actio` root and therefore one storage behavior; the last-started agent installs it.
+`<ms>` is an integer in 1–10 000. An unknown value is a configuration error at `start()`. **One provider per process** (I-10): all agents of a team share one `.actio` root and therefore one storage behavior; the last-started agent installs it.
 
 **Requirement:** the storage must deliver local change notifications (local disks, or a sync tool that writes locally). No polling fallback exists (`watch.ts` is event-driven only). Network file systems without notifications are unsupported.
 
@@ -169,7 +169,7 @@ Where the protocol leaves room, the implementation decided — each choice is ob
 | D-21 | a bad `ACTIO_SYNC`/env value is a configuration error at `start()` — never at construction |
 | D-22 | a watch error on the own inbox or `nuntium` is fatal: `log` (`watch lost <dir>: <code>`) + `fail()`; a destination watch error abandons the requestor's exchanges there (the agent stays up) |
 
-From the review history: **I-1** the mutagen `onError` hook; **I-2** every written file is self-validated before writing; **I-3** `CapabilityEntry.compiled` (D-19 registration) and `ReceiverHooks.peerSpec` (I-11); **I-4** D-12 validated in `agent.request()`; **I-5** `announce()` takes two folders; **I-6** exactly 100 s → `degraded`; **I-7** a captured base64 (encrypted) response body is treated as received: the exchange is confirmed and `request()` resolves `confirmed` with `response: undefined`; **I-8** no `dst` check at A0/D0 (the inbox is the address); **I-9** `namespaces` admits `null` items; **I-10** one sync provider per process; **I-11** the `peerSpec` hook. Deferred: a shared protocol-version constant (the version string is written where it is needed).
+Implementation rules: **I-1** the mutagen `onError` hook; **I-2** every written file is self-validated before writing; **I-3** `CapabilityEntry.compiled` (D-19 registration) and `ReceiverHooks.peerSpec` (I-11); **I-4** D-12 validated in `agent.request()`; **I-5** `announce()` takes two folders; **I-6** exactly 100 s → `degraded`; **I-7** a captured base64 (encrypted) response body is treated as received: the exchange is confirmed and `request()` resolves `confirmed` with `response: undefined`; **I-8** no `dst` check at A0/D0 (the inbox is the address); **I-9** `namespaces` admits `null` items; **I-10** one sync provider per process; **I-11** the `peerSpec` hook. Deferred: a shared protocol-version constant (the version string is written where it is needed).
 
 ## Limitations (core profile)
 

@@ -138,7 +138,7 @@ func checkOne(t *testing.T, what string, props map[string]schemaLocation, requir
 				t.Errorf("%s: %q is a JSON %s, but %s of type %s cannot hold it", what, name, jsonType, field.field.Name, field.field.Type)
 			}
 		}
-		// D-20 v1.6, rule one: an optional boolean or number must be a pointer, so a written
+		// D-20, rule one: an optional boolean or number must be a pointer, so a written
 		// false or 0 survives a round trip. Two properties are excepted by name: max_parallel
 		// (the schema says "0: unbounded") and recommended_timeout (absent means no
 		// recommendation); absent equals zero there, so a plain type is right.
@@ -167,7 +167,7 @@ func checkOne(t *testing.T, what string, props map[string]schemaLocation, requir
 	}
 }
 
-// checkEnums is D-20 v1.6, rule two: each protocol enum equals its Go constants, both ways
+// checkEnums is D-20, rule two: each protocol enum equals its Go constants, both ways
 // round. The allowed values are read from the embedded schemas at run time — a rule that copied
 // the schema into a second hand-written list would prove nothing.
 func checkEnums(t *testing.T, loaded map[string]*schemaNode) {

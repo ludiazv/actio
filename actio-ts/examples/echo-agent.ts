@@ -1,10 +1,10 @@
-// Echo agent (Plan §2.9): the oracle's black-box conformance target — its behavior is FIXED.
+// Echo agent: the black-box conformance target — its behavior is FIXED.
 //
 // Env:
 //   ACTIO_AGENT_ID    agent id (default "echo"); its folder is <root>/<id>
 //   ACTIO_COMMANDERS  comma list → acceptsCommandsFrom (default empty)
 //   ACTIO_NAMESPACES  comma list (absent by default)
-//   plus the config env overrides of §2.4: ACTIO_DIR, ACTIO_SYNC, ACTIO_HEARTBEAT,
+//   plus the config env overrides: ACTIO_DIR, ACTIO_SYNC, ACTIO_HEARTBEAT,
 //   ACTIO_CONFIRM_TIMEOUT, ACTIO_CANCEL_WAIT (read by loadConfig at start()).
 //
 // Runs until `stop` (a command) or SIGINT/SIGTERM (graceful lane C); exits 0.
