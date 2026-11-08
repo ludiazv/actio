@@ -176,7 +176,7 @@ func v1Questions(capNames []string) ai.ClassifierQuestions {
 	qs := []ai.ClassifierQuestionEntry{
 		{ID: "valid", Question: ai.ClassifierBoolQuestion{
 			Instructions: "Is the request a valid scheduling request?",
-			Criteria:     ai.ClassifierBoolCriteria{True: "asks to schedule a capability call at a time or interval", False: "does not ask to schedule a capability call"},
+			Criteria:     ai.ClassifierBoolCriteria{True: "it asks for something to happen at a time or repeatedly", False: "it does not ask to schedule anything"},
 		}},
 		{ID: "type", Question: ai.ClassifierChoiceQuestion{
 			Instructions: "Which scheduling mode does the request ask for?",

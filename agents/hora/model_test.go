@@ -342,6 +342,43 @@ func TestDecide(t *testing.T) {
 			t.Fatalf("capability hint = %q, want scan", got.Hints.Capability)
 		}
 	})
+
+	t.Run("the valid question carries the fixed texts", func(t *testing.T) {
+		rec := &recorded{}
+		srv := newSystemOneServer(t, rec, `{"valid":{"type":"noul","noul":0.9},"type":{"type":"choice","choice":"periodic","probabilities":{"one-shot":0.05,"cron":0.05,"periodic":0.9},"confidence":0.9}}`)
+		defer srv.Close()
+		m := newModels(Config{
+			Model:         "chat-model",
+			URL:           "http://chat.invalid",
+			DecisionModel: "decision-model",
+			DecisionURL:   srv.URL,
+			DecisionGate:  "v1",
+		})
+		if _, err := m.decide(context.Background(), "call echo every 5 minutes", "dest: echo-agent; capabilities: echo", []string{"echo"}); err != nil {
+			t.Fatalf("decide: %v", err)
+		}
+		questions, ok := rec.body["questions"].(map[string]any)
+		if !ok {
+			t.Fatalf("questions = %T, want an object", rec.body["questions"])
+		}
+		valid, ok := questions["valid"].(map[string]any)
+		if !ok {
+			t.Fatalf("questions.valid = %v, want the valid question", questions["valid"])
+		}
+		criteria, ok := valid["criteria"].(map[string]any)
+		if !ok {
+			t.Fatalf("valid criteria = %v, want the criteria object", valid["criteria"])
+		}
+		if got := valid["instructions"]; got != "Is the request a valid scheduling request?" {
+			t.Fatalf("valid instructions = %q, want the fixed text", got)
+		}
+		if got := criteria["true"]; got != "it asks for something to happen at a time or repeatedly" {
+			t.Fatalf("valid criteria true = %q, want the fixed text", got)
+		}
+		if got := criteria["false"]; got != "it does not ask to schedule anything" {
+			t.Fatalf("valid criteria false = %q, want the fixed text", got)
+		}
+	})
 }
 
 func TestV1Verdict(t *testing.T) {
