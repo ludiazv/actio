@@ -1161,7 +1161,7 @@ func TestAgentRestartFractionalDelayIsHonoured(t *testing.T) {
 // TestAgentClampedRestartDelay: the restart delay policy, unit-tested at the helper: a huge delay
 // clamps to the bound, a delay at the bound passes through, a delay under the bound passes
 // through, and zero or negative delays arm no wait. The constant's value is what its comment
-// claims — if the oracle moves the bound at R2, one line of this table moves with it.
+// claims — if the bound moves, one line of this table moves with it.
 func TestAgentClampedRestartDelay(t *testing.T) {
 	if maxRestartDelay != 60*time.Second {
 		t.Errorf("maxRestartDelay = %s; the comment claims 60s", maxRestartDelay)
@@ -1383,7 +1383,7 @@ func testConfigWithRoot(root string) Config {
 	return cfg
 }
 
-// --- the R2 round: one run is one object, and the lifecycle has a gate ------------------------
+// --- one run is one object, and the lifecycle has a gate -------------------------------------
 
 // doneOf reports whether Done has closed, without blocking.
 func doneOf(a *Agent) bool {

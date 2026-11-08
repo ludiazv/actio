@@ -476,7 +476,7 @@ func TestValidatePath(t *testing.T) {
 	})
 }
 
-// TestKindOfRoundTripsTheNamesTheLibraryWrites is the guard whose absence let R2b-3 through:
+// TestKindOfRoundTripsTheNamesTheLibraryWrites is the guard whose absence once let a wrong name rule through:
 // the two file names the library itself writes into nuntium/ — <agent_id>.n.json (publishAnnounce)
 // and nuntium.json (Broadcast) — must come back as "announce" from the library's own kind
 // inference and must validate under it. If a future change to announceFileNames or KindOf breaks

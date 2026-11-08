@@ -5,8 +5,8 @@ implementing file:function and the tests that exercise it. The rows mirror `../a
 *Implementation* and *Tests* columns are rewritten for the Go module. Rows outside the core profile are marked
 `n/a (security)`.
 
-Conventions: **§** references point into `doc/actio_protocol.md`; "v" references point into the master plan's
-decisions (D-x). Tests: `unit:<Test>` = a test in the module's `*_test.go`, `e2e:<Test>` = a test in
+Conventions: **§** references point into `doc/actio_protocol.md`; D-x are this port's decisions
+(README.md, *Implementation choices*); I-x are the reference's implementation rules, as numbered in its own matrix. Tests: `unit:<Test>` = a test in the module's `*_test.go`, `e2e:<Test>` = a test in
 `e2e_a_test.go`/`e2e_b_test.go`, `interop:<Test>` = a test in `interop_test.go` (build tag `interop`),
 `vectors` = the schema conformance vectors. **no unit test** in a Tests cell is an admission, not a citation: the
 row says what covers the statement instead (an `e2e:` row, `vectors`, `interop:`) or that nothing does. A citation
@@ -14,8 +14,7 @@ was written here only after `grep -n "func <Test>" *_test.go` found it and `go t
 passed. **That proves existence, not coverage.** A row's test has to exercise the row's statement: a row about one
 request error code cites *that code's* test (`TestRecvCode107CapacityExceeded` for 107, never the 105 test), a row about
 a behaviour no test reaches says **no unit test** rather than borrowing a neighbour's name, and a cell must not describe
-the reference's design when it is ours. The full audit behind the rewrite is `orchestra/conformance-audit.md`; the
-oracle's §14 finding that fifteen rows cited the wrong test is M5-4 of `orchestra/oracle/validation.md`.
+the reference's design when it is ours.
 
 ## 1. Structure, ownership, announcement
 

@@ -21,7 +21,6 @@ actio-go/
   e2e_a_test.go e2e_b_test.go   scenarios E1–E21, end to end
   interop_test.go       this implementation and actio-ts in one root (build tag `interop`)
   CONFORMANCE.md        every MUST row of the protocol, with its Go code and its test
-  orchestra/            the process: plan, briefs, reports, budgets, probes (not part of the module)
 ```
 
 ## Install
@@ -41,9 +40,8 @@ github.com/fsnotify/fsnotify            v1.10.1
 github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 ```
 
-The test environment is `orchestra/env.sh`: `GOTOOLCHAIN=local` (nothing may switch toolchains mid-build),
-a writable `GOPATH`, `GOFLAGS` cleared, `CGO_ENABLED=1` (the race detector needs it). Everything below runs
-under that file. The whole module is also green under the released **go1.26.10**:
+Tests run with `GOTOOLCHAIN=local` (nothing may switch toolchains mid-build), `GOFLAGS` cleared and
+`CGO_ENABLED=1` (the race detector needs it). The whole module is also green under the released **go1.26.10**:
 
 ```
 $ GOTOOLCHAIN=go1.26.10 go test -race -count=1 ./...
@@ -120,8 +118,7 @@ CLI's rule (`actio-ts/src/cli.ts:225`), not a Go invention.
 ## The API
 
 `doc.go` carries the same text; `go doc actio-go` prints it. The surface is the reference's surface — every
-export of `../actio-ts/src/index.ts` has a Go counterpart and a named test; the mapping, row by row, is
-`orchestra/handover-api.md`.
+export of `../actio-ts/src/index.ts` has a Go counterpart and a named test.
 
 Constructing and starting:
 
@@ -139,7 +136,7 @@ err = a.Start(ctx)
 Serving is a handler: `func(ctx, params json.RawMessage, cap *actio.CapabilityContext) (any, error)`. The
 `ctx` is the exchange's: it is cancelled when a cancellation arrives, when the requestor's timer expires, and
 when the agent stops. A returned error becomes an ordinary error answer; a panicking handler is caught and
-answered as a failure, never a crash (semantic 3 of §4).
+answered as a failure, never a crash.
 
 Calling is `Request`, which builds and sends the envelope itself:
 
@@ -152,8 +149,7 @@ out, err := a.Request(ctx, actio.RequestOptions{
 
 `err` is non-nil only when the protocol exchange could not run (an uncallable peer, a bad capability name, the
 local gate). A peer's error answer comes back inside `out` — `out.Response.Error`, `out.FinalStatus`
-(`confirmed`, `cancelled`, `completed`, `failed`, `timed_out`, `dropped`) — and is never a Go error. That is
-semantic 2, and a consumer program outside this module proves it: `orchestra/consumer/`.
+(`confirmed`, `cancelled`, `completed`, `failed`, `timed_out`, `dropped`) — and is never a Go error.
 
 The rest: `Agmen()` and `Refresh()` for the discovery view, `Fail()` and `Stop()`, `Diarium()` and
 `ReadDiarium()`, `HealthOf()`, `Scan()` and the eight callability rules, `CheckParams()`, `Call` and
@@ -208,10 +204,9 @@ their tests:
   count mutex (`requestor.go`), the watcher's folder-table mutex (`watch.go`). No agent-lifecycle mutex: the
   lifecycle is a channel, and `onEvent` queues callbacks instead of holding a mutex across them.
 
-The decisions named above are the ones that changed something. **Every other decision in the plan's table — D-2, D-3,
-D-4, D-5, D-6, D-8, D-12, D-13, D-14, D-16, D-17, D-21 — is recorded there as *as in `actio-ts`***: the port copies
-the reference's behaviour and nothing in this module re-decides it. The table is `orchestra/master_plan.md` §6 (the
-plan is not in git; the handover says where the record lives).
+The decisions named above are the ones where this port chose something. **The other decision numbers — D-2, D-3,
+D-4, D-5, D-6, D-8, D-12, D-13, D-14, D-16, D-17, D-21 — are *as in `actio-ts`***: the port copies the reference's
+behaviour and nothing in this module re-decides it.
 
 ## Differences from `actio-ts`
 
@@ -224,27 +219,24 @@ record. The protocol's own behaviour is not in this list.
 | **`restart` clamps its delay at 60 s, and a stop or a start cancels the pending restart** (D-10). | The reference sleeps for whatever `delay` says and nothing cancels the sleep, so `delay: 100000` parks an agent and a stop during it is ignored. The clamp (`maxRestartDelay`) and the cancellation are ours. | `TestAgentClampedRestartDelay`, `TestAgentRestartFractionalDelayIsHonoured`, `TestAgentStopDuringRestartDelayLeavesDown` |
 | **A broken peer response is reported once per `(path, content hash)`, not `(path, mtime)`** (D-11). | A byte-identical rewrite is not new news. The key only limits repeated reports; nothing is skipped that was not already reported. | `TestRequestIgnoredRewriteReportedAgain`: one report through many looks, a second when the bytes change, still two when the same bytes are re-sent under a new mtime |
 | **Capability schemas are RE2.** No lookahead, no backreferences; Ajv's other strict checks (`strictTypes`, `strictRequired`) are not ported (D-19). | Go's `regexp` cannot express those constructs. An own schema using one is a registration error; a peer's schema that fails to compile skips the parameter checks and logs once — the same path Ajv's unknown-keyword failure takes. | `TestCompileCapability`, `TestBadSchemaFailsAtCompile`, `TestNilCapabilitySchemasSkipChecks` |
-| **Five exports the reference does not have:** `Call`, `SendCommand`, `Broadcast`, `Validate`, `KindOf`. | Go gives `cmd/actio` no way to reach package internals, and the reference's CLI reaches its own helpers. `KindOf` is the protocol's name→kind table in one place (R2b-3: two copies of that inference produced a bug that lived for five waves). | the parity table `orchestra/handover-api.md`, the CLI tests |
+| **Five exports the reference does not have:** `Call`, `SendCommand`, `Broadcast`, `Validate`, `KindOf`. | Go gives `cmd/actio` no way to reach package internals, and the reference's CLI reaches its own helpers. `KindOf` is the protocol's name→kind table in one place: two copies of that inference once disagreed, and both were wrong. | the CLI tests, and `TestKindOfRoundTripsTheNamesTheLibraryWrites` |
 | **`validate` without `--as` decides by the name, as the reference does; our library export decides name-then-bytes.** | The CLI's rule is the reference's, including its last line — `if (base.endsWith(".json")) return "request"` (`actio-ts/src/cli.ts:312`) — so a valid request file named `copy.json` is `OK request` (exit 0) in both, and a valid **response** file under that name is refused by both (the reference refuses it too, because it guesses `request`). `Validate(path, "")`, which TS has no counterpart for, still settles a nameless file by its bytes. | `TestValidateResolvesNameThenBytes`, the seven-row `validate` table in `cmd/actio/main_test.go` |
-| **A zero timer in an override means "not set" in Go and "zero" in the reference.** | Go's `Config` cannot distinguish an explicit zero from an unset field; the plan's §15 risk row accepts that because no key needs an explicit zero — nothing in `actio-ts` passes one either. The environment path agrees on both sides (`ACTIO_*` must be a positive number of seconds). | `TestConfigZeroOverrideMeansNotSet`, `TestConfigSetButEmptyTimerIsNotAnOverride` |
+| **A zero timer in an override means "not set" in Go and "zero" in the reference.** | Go's `Config` cannot distinguish an explicit zero from an unset field; that is accepted because no key needs an explicit zero — nothing in `actio-ts` passes one either. The environment path agrees on both sides (`ACTIO_*` must be a positive number of seconds). | `TestConfigZeroOverrideMeansNotSet`, `TestConfigSetButEmptyTimerIsNotAnOverride` |
 | **Local storage must deliver change notifications.** As in the reference: no polling fallback, no re-arm. This is tested on Linux; fsnotify's other backends differ (kqueue opens every file in a watched folder). | D-23 as written. | `TestWatchRealOverflowWakesEverySubscriber`, `TestWatchOverflowWakesEverySubscriber`, the loss tests |
 
 ## Testing
 
 ```sh
-. orchestra/env.sh
-bash orchestra/run-checks.sh                    # gofmt, vet, the suite, budgets, §9's greps
+gofmt -l . && go vet ./... && GOOS=windows go vet ./...
 go test -race -count=1 ./...
-GOMAXPROCS=1 go test -race -count=1 ./...       # the scheduler, one processor
+GOMAXPROCS=1 go test -race -count=1 ./...                       # the scheduler, one processor
 go test -tags interop -race -count=1 -run TestInterop .
-bash orchestra/stress.sh                        # before a milestone: the same tests, many times
+for p in 4 16 1; do GOMAXPROCS=$p go test -race -count=40 -run '^TestAgent' .; done   # before a release
 ```
 
-`orchestra/stress.sh` is the step the standing gate does not have: 15 lifecycle tests at `-count=40` at
-`GOMAXPROCS=4`, `16` and `1`, and the four flake-prone tests at `-count=25` twice more — 2 000 runs, about 20 minutes. It
-exists because a flake counts as a failure and a gate that runs each test once cannot see the class: one test started an
-agent and never stopped it, so the agent's writes raced `t.TempDir()`'s cleanup — 38 of 40 runs failed on the oracle's
-machine, 0 of 100 on ours. The same lesson is in `orchestra/issues.md`.
+The last line runs the lifecycle tests many times at three processor counts. A flake counts as a failure, and a
+run of each test once cannot see that class: one test once started an agent and never stopped it, so the agent's
+writes raced `t.TempDir()`'s cleanup — 38 of 40 runs failed on one machine and 0 of 100 on another.
 
 The e2e scenarios are E1–E21 of the protocol's own scenario list (`e2e_a_test.go`, `e2e_b_test.go`). The
 `interop` build tag runs **two implementations in one root** — a TypeScript echo agent under `tsx` and this
@@ -252,9 +244,9 @@ one as a binary — and 25 rows: calls both ways, both CLIs listing both agents,
 of file the other writes (`spec`, `status`, the announce, the broadcast, the diarium, a command envelope), and
 each rejecting garbage. It is behind a tag because it needs `actio-ts` checked out beside this module.
 
-`orchestra/blackbox-go.sh` runs the reference's independent black-box suite
-(`../actio-ts/test/blackbox/blackbox.mjs`) against our echo binary with one spawn line changed: envelopes
-written by hand, every produced file validated by that suite's own Ajv. 19/19.
+The reference's independent black-box suite (`../actio-ts/test/blackbox/blackbox.mjs`) drives this module's
+echo binary when its `startAgent` spawn line runs the built `examples/echo` instead of the TypeScript echo:
+envelopes written by hand, every produced file validated by that suite's own Ajv. 19/19, in 64 of 64 runs.
 
 Two rules hold every test honest. **A test whose control passes does not count:** for each rule a test is
 meant to hold, someone must break the rule in a scratch copy and name the test that fails. **No test may

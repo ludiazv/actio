@@ -348,8 +348,8 @@ func TestConfigNilClockMeansWallClock(t *testing.T) {
 }
 
 // Claim 5: the sync string is not parsed by LoadConfig. Unknown values pass it untouched, and
-// newSyncProvider — which runs at Start — is what rejects them. That pair is the plan's "a bad
-// sync value surfaces at Start".
+// newSyncProvider — which runs at Start — is what rejects them: a bad sync value surfaces at
+// Start, as in the reference.
 func TestConfigSyncSurvivesLoadConfigAndIsRejectedAtProviderParse(t *testing.T) {
 	withCleanEnv(t)
 	rejected := []struct{ name, value string }{

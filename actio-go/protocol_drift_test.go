@@ -304,7 +304,7 @@ func declaredTypes(node *schemaNode) []string {
 }
 
 // kindOk reports whether a Go type can hold the JSON type the schema declares for the property. This
-// is the check that catches the plan's integer trap: a 64-bit integer "ts" cannot live in a float64,
+// is the check that catches the integer trap: a 64-bit integer "ts" cannot live in a float64,
 // and no reference vector would ever show it. json.RawMessage and any hold whatever the schema says,
 // because the runtime validator decides for those.
 func kindOk(jsonType string, typ reflect.Type) bool {

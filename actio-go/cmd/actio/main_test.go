@@ -433,7 +433,7 @@ func TestRunValidate(t *testing.T) {
 			t.Errorf("got exit %d err %q, want 1 / a schema reason", code, errOut)
 		}
 	})
-	// The seven rows of the reference transcript (orchestra/tasks/FIX19-A-6.brief.md): the name
+	// Seven rows measured against the reference CLI on the same files: the name
 	// decides, the reference's rule (cli.ts kindOf). A bare <stem>.json is a request (cli.ts:312,
 	// the CLI's own UX rule, not a second protocol table); a non-.json name gets the reference's
 	// "no validator". Each row asserts the exit code AND the word the CLI prints, so a rename of

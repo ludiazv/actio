@@ -1,5 +1,5 @@
 // The pin of the protocol contract at the level of the validator: every embedded schema must compile
-// as it stands, with the dependency the plan approved. A schema that stopped parsing, or a dependency
+// as it stands, with the module's one validator dependency. A schema that stopped parsing, or a dependency
 // that changed under us, fails here rather than in a protocol test weeks later.
 package actio
 

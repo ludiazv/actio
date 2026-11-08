@@ -606,8 +606,8 @@ func TestRequestSelfValidationRefusesNonconformingFile(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("the refused request left files in the inbox: %v", entries)
 	}
-	// No outreq diarium line: the write (and its diarium line) never happened. The plan's order
-	// puts the self-validation before the write, so a refusal leaves no diarium trace.
+	// No outreq diarium line: the write (and its diarium line) never happened. The self-validation
+	// comes before the write, so a refusal leaves no diarium trace.
 	di, err2 := os.ReadFile(filepath.Join(x.agentDir, "diarium.jsonl"))
 	if err2 == nil && strings.Contains(string(di), "outreq") {
 		t.Errorf("the refused request wrote an outreq diarium line: %s", di)

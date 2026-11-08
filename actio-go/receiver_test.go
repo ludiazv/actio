@@ -482,7 +482,7 @@ func TestRecvCode106NamespaceMismatch(t *testing.T) {
 	}
 }
 
-// 7.7 (oracle verdict; design items I11 and D-7): code 106 is computed against the requestor's spec as DISCOVERED by the last
+// 7.7 (I-11, D-7): code 106 is computed against the requestor's spec as DISCOVERED by the last
 // scan — the unfiltered map the agent keeps for the setPeerSpec hook — and not against the
 // callable view. Both peers below fail callability rule 6 as seen from us (no usable capability:
 // its accepts_from excludes us; no commands for us), so both are absent from Agmen() while their
@@ -991,10 +991,10 @@ func TestRecvMalformedInboxFileIgnored(t *testing.T) {
 	}
 }
 
-// --- lost inbox: the loop stays, the stop settles (R2) -------------------------
+// --- lost inbox: the loop stays, the stop settles ---------------------------------
 
 // A lost empty inbox must not crash the loop: 60 runs, no panic, the loss is a LogEvent (D-22),
-// and the stop still settles. The probe this adopts is the oracle's TestR2InboxRemoved.
+// and the stop still settles.
 func TestRecvInboxRemovedEmptyNoCrash(t *testing.T) {
 	for i := 0; i < 60; i++ {
 		tt := newRecvTest(t, 5*time.Second)
@@ -1017,9 +1017,9 @@ func TestRecvInboxRemovedEmptyNoCrash(t *testing.T) {
 	}
 }
 
-// A lost inbox with files in it must not crash the loop. The oracle's probe panicked here (a nil
-// dereference in the loop after the loss); a bounded number of runs, a named bound, no dependence
-// on the scheduler. The probe this adopts is the oracle's TestR2InboxRemovedWithFiles.
+// A lost inbox with files in it must not crash the loop. The scan's failure can win the race with the
+// loss, which once ended in a nil dereference in the loop; a bounded number of runs, a named bound,
+// no dependence on the scheduler.
 const inboxLossFileRuns = 200
 
 func TestRecvInboxRemovedWithFilesNoCrash(t *testing.T) {
@@ -1048,8 +1048,7 @@ func TestRecvInboxRemovedWithFilesNoCrash(t *testing.T) {
 
 // After a loss, a Stop(Force) cancels the running handler and settles the exchange: the work is
 // cancelled, and the exchange is left unsettled (the 300 answer cannot be written to a lost inbox,
-// and the protocol has no `dropped` for a request). The probe this adopts is the oracle's
-// TestR2InboxLostHandlerNotCancelled, with the settle assertion added.
+// and the protocol has no `dropped` for a request).
 func TestRecvInboxLostStopForceSettles(t *testing.T) {
 	tt := newRecvTest(t, 5*time.Second)
 	tt.registerCap(echoCap(), func(ctx context.Context, params json.RawMessage, call *CallContext) (any, error) {
@@ -1102,7 +1101,7 @@ func TestRecvInboxLostStopForceSettles(t *testing.T) {
 }
 
 // A second stop that enters during the first stop's drain must not race and must not settle
-// anything twice. The race the oracle found: stop() read r.inbox while performStop() wrote
+// anything twice. The race: stop() read r.inbox while performStop() wrote
 // r.inbox = nil. The started flag removes the read; this pins that two concurrent stops settle the
 // exchange once. Run under -race.
 func TestRecvStopAfterLossSettlesOnce(t *testing.T) {

@@ -433,7 +433,7 @@ func TestMutagenCloseLetsPromisedFollowUpRun(t *testing.T) {
 // TestMutagenCloseBeatsCallbackInFireWindow: in the window between the timer firing and the
 // callback clearing p.timer, Close() lands and the run must not start — this test pins that the
 // process never started. The window itself is sub-microsecond and not deterministically
-// reproducible by a probe (RV1-A-1 P5 pins the adjacent boundary), so the test simulates the
+// reproducible by a probe, so the test simulates the
 // exact interleaving deterministically: Close first, then the callback. With the closed flag the
 // callback sees it and the run never starts; without it the callback would spawn the process and
 // this test fails.

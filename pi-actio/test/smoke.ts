@@ -1,4 +1,4 @@
-// End-to-end smoke run (master plan §8), run with `npm run smoke`.
+// End-to-end smoke run, run with `npm run smoke`.
 // One line per step, exit 0 when all steps pass, 1 otherwise. No LLM call: the faux model (§3.8).
 // Every directory is temporary, so nothing of the user's pi or actio root is touched.
 import { spawn } from "node:child_process";
