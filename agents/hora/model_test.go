@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/MichaelKinsy/PiG/ai"
@@ -300,6 +301,45 @@ func TestDecide(t *testing.T) {
 		}
 		if got.Hints.Capability != "echo" {
 			t.Fatalf("capability hint = %q, want echo", got.Hints.Capability)
+		}
+	})
+
+	t.Run("three capabilities: the capability question has one criterion per name", func(t *testing.T) {
+		rec := &recorded{}
+		srv := newSystemOneServer(t, rec, `{"valid":{"type":"noul","noul":0.92},"type":{"type":"choice","choice":"one-shot","probabilities":{"one-shot":0.9,"cron":0.05,"periodic":0.05},"confidence":0.9},"capability":{"type":"choice","choice":"scan","probabilities":{"backup":0.05,"echo":0.05,"scan":0.9},"confidence":0.9}}`)
+		defer srv.Close()
+		m := newModels(Config{
+			Model:         "chat-model",
+			URL:           "http://chat.invalid",
+			DecisionModel: "decision-model",
+			DecisionURL:   srv.URL,
+			DecisionGate:  "v1",
+		})
+		got, err := m.decide(context.Background(), "run the scan on 2026-12-01 at 09:30", "dest: ops; capabilities: backup, echo, scan", []string{"backup", "echo", "scan"})
+		if err != nil {
+			t.Fatalf("decide: %v", err)
+		}
+		questions, ok := rec.body["questions"].(map[string]any)
+		if !ok {
+			t.Fatalf("questions = %T, want an object", rec.body["questions"])
+		}
+		capQ, ok := questions["capability"].(map[string]any)
+		if !ok {
+			t.Fatalf("questions.capability = %v, want the capability question", questions["capability"])
+		}
+		crit, ok := capQ["criteria"].(map[string]any)
+		if !ok {
+			t.Fatalf("capability criteria = %v, want the criteria object", capQ["criteria"])
+		}
+		if got := capQ["type"]; got != "choice" {
+			t.Fatalf("capability question type = %v, want choice", got)
+		}
+		names := keys(crit)
+		if strings.Join(names, ",") != "backup,echo,scan" {
+			t.Fatalf("capability criteria keys = %v, want one per name: backup, echo, scan", names)
+		}
+		if got.Hints.Capability != "scan" {
+			t.Fatalf("capability hint = %q, want scan", got.Hints.Capability)
 		}
 	})
 }
