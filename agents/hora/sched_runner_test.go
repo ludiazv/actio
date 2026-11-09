@@ -56,7 +56,19 @@ func TestRunner(t *testing.T) {
 	t.Run("one-shot fires exactly once", func(t *testing.T) {
 		synctest.Test(t, func(bt *testing.T) {
 			c := &fireCounter{}
-			r := newRunner(c.fire)
+			var r *runner
+			r = newRunner(func(id string) {
+				c.fire(id)
+				if c.count() > 1 {
+					// A mutant whose one-shot keeps handing back the same time would spin
+					// the cron loop at one instant forever, so this row would time out
+					// instead of failing. End the runner here and fail with a message.
+					bt.Errorf("one-shot fired %d times", c.count())
+					if err := r.stop(context.Background()); err != nil {
+						bt.Errorf("stop after the extra firing: %v", err)
+					}
+				}
+			})
 			bt.Cleanup(func() { _ = r.stop(context.Background()) })
 			e := entry("SCH-00000001", "one-shot",
 				time.Now().Add(30*time.Second).UTC().Format("2006-01-02T15:04:05Z"))
