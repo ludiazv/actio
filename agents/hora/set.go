@@ -23,6 +23,7 @@ type hora struct {
 	run    *runner
 	models *models
 	now    func() time.Time
+	firing inFlight // D-11's skip and D-12's cancel of a running fire
 }
 
 // setParams is set's published parameters.
