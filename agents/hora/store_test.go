@@ -117,8 +117,7 @@ func TestLoadDuplicateIDFailsFileUnchanged(t *testing.T) {
 	assertUnchanged(t, path, before)
 }
 
-// TestLoadCronWithoutPrefixFailsAndFileUnchanged is one of the four rows of
-// oracle/Q2.md: a stored cron expression must carry its zone.
+// a stored cron expression must carry its zone: the loader has no config zone to fall back on.
 func TestLoadCronWithoutPrefixFailsAndFileUnchanged(t *testing.T) {
 	path := writeDB(t, "["+entryJSON("SCH-00000001", "cron", "0 0 9 * * *")+"]")
 	before := sha256sum(t, path)
@@ -134,7 +133,7 @@ func TestLoadCronWithoutPrefixFailsAndFileUnchanged(t *testing.T) {
 	t.Logf("sha256 before=%s after=%s", before, sha256sum(t, path))
 }
 
-// TestLoadCronWithPrefixesLoads is one of the four rows of oracle/Q2.md.
+// CRON_TZ= and TZ= entries load.
 func TestLoadCronWithPrefixesLoads(t *testing.T) {
 	for _, expr := range []string{"CRON_TZ=Europe/Madrid 0 0 13 * * 0", "TZ=UTC 0 0 9 * * *"} {
 		t.Run(expr, func(t *testing.T) {
@@ -151,8 +150,7 @@ func TestLoadCronWithPrefixesLoads(t *testing.T) {
 	}
 }
 
-// TestCleanPastOneShotSavesAndStarts is one of the four rows of oracle/Q2.md:
-// a past one-shot is removed, the DB is saved, and the start succeeds.
+// a past one-shot is cleaned, not rejected: the start succeeds and the DB is saved.
 func TestCleanPastOneShotSavesAndStarts(t *testing.T) {
 	body := "[" + entryJSON("SCH-aaaaaaaa", "one-shot", "2026-11-08T17:00:00Z") + "," +
 		entryJSON("SCH-bbbbbbbb", "one-shot", "2026-11-08T19:00:00Z") + "]"
@@ -180,7 +178,7 @@ func TestCleanPastOneShotSavesAndStarts(t *testing.T) {
 	}
 }
 
-// TestLoadNonRFC3339OneShotFails is one of the four rows of oracle/Q2.md.
+// a one-shot that is not RFC 3339 is a load error.
 func TestLoadNonRFC3339OneShotFails(t *testing.T) {
 	path := writeDB(t, "["+entryJSON("SCH-cccccccc", "one-shot", "tomorrow at nine")+"]")
 	before := sha256sum(t, path)
