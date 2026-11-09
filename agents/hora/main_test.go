@@ -750,3 +750,201 @@ func TestOneShotDueDuringStart(t *testing.T) {
 		t.Fatalf("the destination's handler ran %d times, want exactly 1", got)
 	}
 }
+
+// agentStatus is the part of status.json the stop row reads.
+type agentStatus struct {
+	Status   string `json:"status"`
+	Datetime string `json:"datetime"`
+}
+
+// writeTestFile writes one file, failing the test on error.
+func writeTestFile(t *testing.T, path, content string, mode os.FileMode) {
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRunStopBound is the stop-bounds row: a destination that ignores
+// cancellation, the bound shortened for the test. The stop's own design
+// abandons the in-flight exchange, so what outlasts the agent's fresh
+// bound is its sync flush: a stub mutagen on PATH that sleeps 5 s makes
+// the post-inactive flush run past the 3 s bound. run returns within two
+// bounds plus slack with the stop's error, the status is inactive, and
+// the in-flight fire's line is abandoned or absent — never after the
+// inactive.
+func TestRunStopBound(t *testing.T) {
+	t.Setenv("ACTIO_HEARTBEAT", "1")
+	t.Setenv("ACTIO_CONFIRM_TIMEOUT", "2")
+	// The cancel wait keeps its 60 s default: twice the bound.
+	oldBound := stopBound
+	stopBound = 3 * time.Second
+	defer func() { stopBound = oldBound }()
+	root := t.TempDir()
+	t.Setenv("ACTIO_DIR", root)
+	// The stub sleeps 5 s: past the 3 s bound, inside the test agents' 10 s.
+	writeTestFile(t, filepath.Join(root, "mutagen"), "#!/bin/sh\nsleep 5\n", 0700)
+	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ACTIO_SYNC", "mutagen:wp8a")
+	var held int32
+	newTestAgent(t, root, "dest", "the test destination", func(a *actio.Agent) {
+		cap := actio.Capability{
+			Name:       "hold",
+			Parameters: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+			Actio:      actio.CapabilityActio{Result: json.RawMessage(`{"type":"object"}`), MaxParallel: 1},
+		}
+		if err := a.Capability(cap, func(ctx context.Context, params json.RawMessage, call *actio.CallContext) (any, error) {
+			atomic.StoreInt32(&held, 1)
+			time.Sleep(90 * time.Second) // ignores ctx
+			return map[string]any{}, nil
+		}); err != nil {
+			t.Fatalf("the destination's hold: %v", err)
+		}
+	})
+	const id = "SCH-00000004"
+	writeTestFile(t, filepath.Join(root, "db.json"), `[{"datetime":"2026-11-01T00:00:00Z","sched_id":"`+id+`","sched_type":"periodic","sched_expression":"@every 2s","dest_id":"dest","dest_capability":"hold","capability_parameters":{}}]`, 0600)
+	cfgPath := filepath.Join(root, "config.json")
+	writeTestFile(t, cfgPath, validConfig, 0600)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfgPath) }()
+	t.Cleanup(cancel)
+	// The call is in flight: cancel run's context.
+	waitFor(t, "the call to be in flight", func() bool { return atomic.LoadInt32(&held) == 1 })
+	cancelAt := time.Now()
+	cancel()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(2*stopBound + 10*time.Second):
+		t.Fatalf("deadline: run did not return within two bounds plus slack of the cancel")
+	}
+	t.Logf("the stop took %v with a %v bound per phase", time.Since(cancelAt), stopBound)
+	// The stop failed: the agent could not be stopped within its bound.
+	if err == nil {
+		t.Fatal("run returned nil, want the stop's error")
+	}
+	if !strings.Contains(err.Error(), "stop") {
+		t.Fatalf("the error %q does not name the stop failure", err)
+	}
+	// The status is inactive: published before the stop failed.
+	var st agentStatus
+	data, rerr := os.ReadFile(filepath.Join(root, "hora-test", "status.json"))
+	if rerr != nil || json.Unmarshal(data, &st) != nil {
+		t.Fatalf("status.json: %v", rerr)
+	}
+	if st.Status != "inactive" {
+		t.Fatalf("the status is %q, want inactive", st.Status)
+	}
+	// The fire line, if it lands, is abandoned — and never after the
+	// inactive status.
+	read, rerr := actio.ReadDiarium(filepath.Join(root, "hora-test"))
+	if rerr != nil {
+		t.Fatalf("ReadDiarium(hora-test): %v", rerr)
+	}
+	for _, l := range read.Lines {
+		var msg string
+		if l.Event != "log" || json.Unmarshal(l.EventData, &msg) != nil || !strings.HasPrefix(msg, "fire "+id+" ") {
+			continue
+		}
+		if !strings.HasSuffix(msg, "abandoned") {
+			t.Fatalf("the fire line is %q, want abandoned", msg)
+		}
+		if l.Datetime > st.Datetime {
+			t.Fatalf("the fire line %s landed after the inactive status %s", l.Datetime, st.Datetime)
+		}
+	}
+}
+
+// wireTimeout reads the destination's diarium for the inreq line of a call
+// of the named capability and returns the timeout (seconds) on the wire:
+// event_data -> req -> request.timeout.
+func wireTimeout(root, id, capName string) (float64, bool) {
+	read, err := actio.ReadDiarium(filepath.Join(root, id))
+	if err != nil {
+		return 0, false
+	}
+	for _, l := range read.Lines {
+		if l.Event != "inreq" {
+			continue
+		}
+		var ex actio.ExchangeEnvelopes
+		if json.Unmarshal(l.EventData, &ex) != nil {
+			continue
+		}
+		var rf actio.RequestFile
+		if json.Unmarshal(ex.Req, &rf) != nil {
+			continue
+		}
+		var body actio.RequestBody
+		if json.Unmarshal(rf.Request, &body) != nil || body.Name != capName {
+			continue
+		}
+		return body.Timeout, true
+	}
+	return 0, false
+}
+
+// TestFireWireTimeout is D-11's timeout on the wire: the destination's
+// inreq line carries the timeout hora put on the request — the
+// capability's recommended_timeout when declared, 300 s when not.
+func TestFireWireTimeout(t *testing.T) {
+	t.Setenv("ACTIO_HEARTBEAT", "1")
+	t.Setenv("ACTIO_CONFIRM_TIMEOUT", "2")
+	root := t.TempDir()
+	newTestAgent(t, root, "dest", "the test destination", func(a *actio.Agent) {
+		ok := func(ctx context.Context, params json.RawMessage, call *actio.CallContext) (any, error) {
+			return map[string]any{}, nil
+		}
+		tick := func(name string, rt float64) {
+			cap := actio.Capability{
+				Name:       name,
+				Parameters: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+				Actio:      actio.CapabilityActio{Result: json.RawMessage(`{"type":"object"}`), RecommendedTimeout: rt},
+			}
+			if err := a.Capability(cap, ok); err != nil {
+				t.Fatalf("the destination's %s: %v", name, err)
+			}
+		}
+		tick("tick7", 7)
+		tick("ticknone", 0)
+	})
+	h := newFireHora(t, root)
+	see(t, h.agent, "dest")
+	t.Cleanup(func() { stopHora(t, h) })
+	add := func(capName string) string {
+		e, err := h.store.add(Entry{
+			Datetime:             time.Now().UTC().Format(time.RFC3339),
+			SchedType:            "periodic",
+			SchedExpression:      "@every 1h",
+			DestID:               "dest",
+			DestCapability:       capName,
+			CapabilityParameters: json.RawMessage(`{}`),
+		})
+		if err != nil {
+			t.Fatalf("store.add: %v", err)
+		}
+		return e.SchedID
+	}
+	rows := []struct {
+		capName string
+		want    float64
+	}{
+		{"tick7", 7},
+		{"ticknone", 300},
+	}
+	for _, row := range rows {
+		t.Run(row.capName, func(t *testing.T) {
+			id := add(row.capName)
+			h.fire(id)
+			var got float64
+			waitFor(t, "the inreq line for "+row.capName, func() bool {
+				v, ok := wireTimeout(root, "dest", row.capName)
+				got = v
+				return ok
+			})
+			if got != row.want {
+				t.Fatalf("the wire timeout is %v s, want %v", got, row.want)
+			}
+		})
+	}
+}

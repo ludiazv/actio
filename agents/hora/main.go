@@ -19,8 +19,9 @@ import (
 	_ "time/tzdata" // the IANA zone database, inside the binary (Hora.md, Implementation Constraints)
 )
 
-// stopBound bounds the stop phase (D-12).
-const stopBound = 30 * time.Second
+// stopBound bounds each phase of the stop (D-12); the stop rows shorten
+// it and restore it.
+var stopBound = 30 * time.Second
 
 // main starts the agent and blocks until it stops. A usage error exits 2;
 // a config or start error prints its reason, which names the key, and
@@ -93,13 +94,18 @@ func run(ctx context.Context, configPath string) error {
 	case <-ctx.Done():
 	}
 	h.cancelFiring()
+	// runner.stop and a.Stop each get their own bound: the runner's
+	// leftovers must not expire the agent's stop, and a stop that cannot
+	// stop the agent is a failed stop (D-12).
 	stopCtx, cancel := context.WithTimeout(context.Background(), stopBound)
-	defer cancel()
 	if err := h.run.stop(stopCtx); err != nil {
 		fmt.Fprintf(os.Stderr, "stop: %v\n", err)
 	}
+	cancel()
+	stopCtx, cancel = context.WithTimeout(context.Background(), stopBound)
+	defer cancel()
 	if err := a.Stop(stopCtx, actio.StopOptions{}); err != nil {
-		fmt.Fprintf(os.Stderr, "stop: %v\n", err)
+		return fmt.Errorf("stop: %w", err)
 	}
 	return nil
 }

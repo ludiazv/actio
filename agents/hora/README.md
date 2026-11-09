@@ -29,7 +29,8 @@ hora -config <file>
 - A missing `-config` (or any usage error) prints the usage to stderr and exits **2**.
 - A config file that breaks a rule, or a start that fails at any step, prints the
   reason — which names the offending key — to stderr and exits **1**.
-- SIGINT and SIGTERM stop the agent gracefully; Hora then exits **0**.
+- SIGINT and SIGTERM stop the agent gracefully; Hora then exits **0**,
+  unless the agent stop itself fails, which exits **1**.
 
 ## The configuration file
 
@@ -151,8 +152,12 @@ rapid triggering, use another solution.
 
 Two more edges, measured:
 
-- A call still running 30 s after the stop signal is left behind: Hora writes to
-  stderr, stops the agent anyway, and exits 0 unless the agent stop itself fails.
+- The stop is phased, and each phase gets its own 30 s bound: the runner
+  is stopped first, then the agent. A call still running 30 s after the
+  stop signal is left behind: Hora writes to stderr and goes on.
+- The runner's bound alone does not change the exit code: Hora exits **0**.
+  An agent that cannot be stopped within its own bound is a failed stop:
+  Hora prints the stop's error and exits **1**.
 - A signal that lands before the process reaches its own code cannot be caught: TERM
   the instant `exec` returns kills it with the default disposition, because no handler
   is installed yet.
