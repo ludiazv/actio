@@ -541,7 +541,13 @@ func TestE2EOneShotListedDuringSlowCall(t *testing.T) {
 		now, _ := e.ds.sleepStats()
 		return now > 0 && e.dbEntryIDs()[id] && !e.hasLine("fire "+id+" dest/sleep:")
 	})
-	await(e.t, "the fire line and the removal", func() bool { _, ok := e.dbEntryIDs()[id]; return e.hasLine("fire "+id+" dest/sleep: confirmed") && !ok })
+	await(e.t, "the removal of the one-shot", func() bool { _, ok := e.dbEntryIDs()[id]; return !ok })
+	// At the instant of the first absence the line must already be on
+	// disk: the fire is logged before its removal, so a removal that
+	// beats the line is the order violation.
+	if !e.hasLine("fire " + id + " dest/sleep:") {
+		t.Fatalf("the removal beat the line: %s is gone from the DB and the diarium has no fire line", id)
+	}
 }
 
 // TestE2ERestartKeepsEntriesAndCleansExpired: a second run on the same DB

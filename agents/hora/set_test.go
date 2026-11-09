@@ -293,6 +293,40 @@ func TestSetTwoRounds(t *testing.T) {
 			t.Fatalf("round 2 user lacks %q: %s", sub, user)
 		}
 	}
+
+	t.Run("the config zone's name and local time in the prompt", func(t *testing.T) {
+		loc, err := time.LoadLocation("Europe/Madrid")
+		if err != nil {
+			t.Fatalf("LoadLocation(Europe/Madrid): %v", err)
+		}
+		cfg := Config{
+			TZ:           "Europe/Madrid",
+			Loc:          loc,
+			Model:        "chat-model",
+			URL:          "http://chat.invalid",
+			DecisionGate: "v1",
+		}
+		s, _, err := openStore(filepath.Join(t.TempDir(), "db.json"), testNow)
+		if err != nil {
+			t.Fatalf("openStore: %v", err)
+		}
+		h := &hora{
+			cfg:   cfg,
+			store: s,
+			run:   newRunner(func(string) {}),
+			now:   func() time.Time { return testNow },
+		}
+		p := h.systemPrompt("destination dest: the test destination", hints{})
+		for _, sub := range []string{
+			"Europe/Madrid",
+			"2026-11-08T13:00:00 +0100 (CET)",
+			"a cron without a prefix is read in the config zone",
+		} {
+			if !strings.Contains(p, sub) {
+				t.Fatalf("the Madrid system prompt lacks %q: %s", sub, p)
+			}
+		}
+	})
 }
 
 // TestSetModelError: a model that fails on both rounds rejects with the
@@ -325,7 +359,7 @@ func TestSetGate(t *testing.T) {
 	view := testDestView("echo")
 
 	// canned is a scripted /v1/systemone server with the given answers.
-	run := func(t *testing.T, answersJSON string) (map[string]any, []string) {
+	run := func(t *testing.T, answersJSON string) (map[string]any, []string, *recorded) {
 		t.Helper()
 		var decisionSrv *httptest.Server
 		rec := &recorded{}
@@ -333,7 +367,8 @@ func TestSetGate(t *testing.T) {
 			decisionSrv = newSystemOneServer(t, rec, answersJSON)
 			defer decisionSrv.Close()
 		}
-		chatSrv := newChatServer(t, &recorded{}, "", goodReply(), "stop")
+		chatRec := &recorded{}
+		chatSrv := newChatServer(t, chatRec, "", goodReply(), "stop")
 		defer chatSrv.Close()
 		var lines []string
 		logf := func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
@@ -348,11 +383,11 @@ func TestSetGate(t *testing.T) {
 			t.Fatalf("scheduleFor: %v", err)
 		}
 		res, _ := out.(map[string]any)
-		return res, lines
+		return res, lines, chatRec
 	}
 
 	t.Run("an accepting verdict goes on with hints", func(t *testing.T) {
-		res, lines := run(t, `{"valid":{"type":"noul","noul":0.87},"type":{"type":"choice","choice":"periodic","probabilities":{"one-shot":0.05,"cron":0.05,"periodic":0.9},"confidence":0.9}}`)
+		res, lines, chat := run(t, `{"valid":{"type":"noul","noul":0.87},"type":{"type":"choice","choice":"periodic","probabilities":{"one-shot":0.05,"cron":0.05,"periodic":0.9},"confidence":0.9}}`)
 		if res["result"] != "scheduled" {
 			t.Fatalf("result = %v, want scheduled: %v", res["result"], res)
 		}
@@ -360,10 +395,17 @@ func TestSetGate(t *testing.T) {
 		if len(lines) != 1 || lines[0] != want {
 			t.Fatalf("lines = %v, want exactly [%q]", lines, want)
 		}
+		// The chat request's system prompt carries the decision's hints.
+		sys := messageContents(t, chat.body)[0]
+		for _, sub := range []string{"Decision hints: type periodic, capability echo"} {
+			if !strings.Contains(sys, sub) {
+				t.Fatalf("the system prompt's hints lack %q: %s", sub, sys)
+			}
+		}
 	})
 
 	t.Run("a rejecting verdict stops at step 4", func(t *testing.T) {
-		res, lines := run(t, `{"valid":{"type":"noul","noul":0.10},"type":{"type":"choice","choice":"periodic","probabilities":{"one-shot":0.05,"cron":0.05,"periodic":0.9},"confidence":0.9}}`)
+		res, lines, _ := run(t, `{"valid":{"type":"noul","noul":0.10},"type":{"type":"choice","choice":"periodic","probabilities":{"one-shot":0.05,"cron":0.05,"periodic":0.9},"confidence":0.9}}`)
 		if res["result"] != "rejected" || res["rejection"] != "not a scheduling request" {
 			t.Fatalf("res = %v, want rejected: not a scheduling request", res)
 		}
@@ -375,7 +417,7 @@ func TestSetGate(t *testing.T) {
 
 	t.Run("a failed decision call goes on without hints", func(t *testing.T) {
 		// An answer the gate does not have is an error, not a panic.
-		res, lines := run(t, `{}`)
+		res, lines, _ := run(t, `{}`)
 		if res["result"] != "scheduled" {
 			t.Fatalf("result = %v, want scheduled: %v", res["result"], res)
 		}
@@ -386,12 +428,17 @@ func TestSetGate(t *testing.T) {
 	})
 
 	t.Run("no decision model means no gate line", func(t *testing.T) {
-		res, lines := run(t, "")
+		res, lines, chat := run(t, "")
 		if res["result"] != "scheduled" {
 			t.Fatalf("result = %v, want scheduled: %v", res["result"], res)
 		}
 		if len(lines) != 0 {
 			t.Fatalf("lines = %v, want none", lines)
+		}
+		// Without a decision there are no hints: the prompt has no hints line.
+		sys := messageContents(t, chat.body)[0]
+		if strings.Contains(sys, "Decision hints") {
+			t.Fatalf("the system prompt has a hints line without a decision: %s", sys)
 		}
 	})
 }

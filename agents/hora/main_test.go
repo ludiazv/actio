@@ -764,14 +764,14 @@ func writeTestFile(t *testing.T, path, content string, mode os.FileMode) {
 	}
 }
 
-// TestRunStopBound is the stop-bounds row: a destination that ignores
-// cancellation, the bound shortened for the test. The stop's own design
-// abandons the in-flight exchange, so what outlasts the agent's fresh
-// bound is its sync flush: a stub mutagen on PATH that sleeps 5 s makes
-// the post-inactive flush run past the 3 s bound. run returns within two
-// bounds plus slack with the stop's error, the status is inactive, and
-// the in-flight fire's line is abandoned or absent — never after the
-// inactive.
+// TestRunStopBound is the stop-bounds table: a destination that ignores
+// cancellation, the bound shortened for the test. The rows share
+// everything but the stub mutagen: without it, the runner uses up its
+// bound and the agent stops on its fresh one, so run returns nil; with
+// it, the post-inactive sync flush (a 5 s sleep) outlasts the agent's
+// fresh bound, so run returns the stop's error. In both, the status is
+// inactive, and the in-flight fire's line, if it lands, is abandoned —
+// never after the inactive.
 func TestRunStopBound(t *testing.T) {
 	t.Setenv("ACTIO_HEARTBEAT", "1")
 	t.Setenv("ACTIO_CONFIRM_TIMEOUT", "2")
@@ -779,79 +779,96 @@ func TestRunStopBound(t *testing.T) {
 	oldBound := stopBound
 	stopBound = 3 * time.Second
 	defer func() { stopBound = oldBound }()
-	root := t.TempDir()
-	t.Setenv("ACTIO_DIR", root)
-	// The stub sleeps 5 s: past the 3 s bound, inside the test agents' 10 s.
-	writeTestFile(t, filepath.Join(root, "mutagen"), "#!/bin/sh\nsleep 5\n", 0700)
-	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("ACTIO_SYNC", "mutagen:wp8a")
-	var held int32
-	newTestAgent(t, root, "dest", "the test destination", func(a *actio.Agent) {
-		cap := actio.Capability{
-			Name:       "hold",
-			Parameters: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
-			Actio:      actio.CapabilityActio{Result: json.RawMessage(`{"type":"object"}`), MaxParallel: 1},
-		}
-		if err := a.Capability(cap, func(ctx context.Context, params json.RawMessage, call *actio.CallContext) (any, error) {
-			atomic.StoreInt32(&held, 1)
-			time.Sleep(90 * time.Second) // ignores ctx
-			return map[string]any{}, nil
-		}); err != nil {
-			t.Fatalf("the destination's hold: %v", err)
-		}
-	})
-	const id = "SCH-00000004"
-	writeTestFile(t, filepath.Join(root, "db.json"), `[{"datetime":"2026-11-01T00:00:00Z","sched_id":"`+id+`","sched_type":"periodic","sched_expression":"@every 2s","dest_id":"dest","dest_capability":"hold","capability_parameters":{}}]`, 0600)
-	cfgPath := filepath.Join(root, "config.json")
-	writeTestFile(t, cfgPath, validConfig, 0600)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- run(ctx, cfgPath) }()
-	t.Cleanup(cancel)
-	// The call is in flight: cancel run's context.
-	waitFor(t, "the call to be in flight", func() bool { return atomic.LoadInt32(&held) == 1 })
-	cancelAt := time.Now()
-	cancel()
-	var err error
-	select {
-	case err = <-done:
-	case <-time.After(2*stopBound + 10*time.Second):
-		t.Fatalf("deadline: run did not return within two bounds plus slack of the cancel")
-	}
-	t.Logf("the stop took %v with a %v bound per phase", time.Since(cancelAt), stopBound)
-	// The stop failed: the agent could not be stopped within its bound.
-	if err == nil {
-		t.Fatal("run returned nil, want the stop's error")
-	}
-	if !strings.Contains(err.Error(), "stop") {
-		t.Fatalf("the error %q does not name the stop failure", err)
-	}
-	// The status is inactive: published before the stop failed.
-	var st agentStatus
-	data, rerr := os.ReadFile(filepath.Join(root, "hora-test", "status.json"))
-	if rerr != nil || json.Unmarshal(data, &st) != nil {
-		t.Fatalf("status.json: %v", rerr)
-	}
-	if st.Status != "inactive" {
-		t.Fatalf("the status is %q, want inactive", st.Status)
-	}
-	// The fire line, if it lands, is abandoned — and never after the
-	// inactive status.
-	read, rerr := actio.ReadDiarium(filepath.Join(root, "hora-test"))
-	if rerr != nil {
-		t.Fatalf("ReadDiarium(hora-test): %v", rerr)
-	}
-	for _, l := range read.Lines {
-		var msg string
-		if l.Event != "log" || json.Unmarshal(l.EventData, &msg) != nil || !strings.HasPrefix(msg, "fire "+id+" ") {
-			continue
-		}
-		if !strings.HasSuffix(msg, "abandoned") {
-			t.Fatalf("the fire line is %q, want abandoned", msg)
-		}
-		if l.Datetime > st.Datetime {
-			t.Fatalf("the fire line %s landed after the inactive status %s", l.Datetime, st.Datetime)
-		}
+	for _, row := range []struct {
+		name    string
+		stub    bool // the stub mutagen stalls the post-inactive flush past the bound
+		wantErr bool
+	}{
+		{"the agent stops after the runner's bound", false, false},
+		{"a stop that cannot stop the agent fails", true, true},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("ACTIO_DIR", root)
+			if row.stub {
+				// The stub sleeps 5 s: past the 3 s bound, inside the test agents' 10 s.
+				writeTestFile(t, filepath.Join(root, "mutagen"), "#!/bin/sh\nsleep 5\n", 0700)
+				t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
+				t.Setenv("ACTIO_SYNC", "mutagen:wp8a")
+			}
+			var held int32
+			newTestAgent(t, root, "dest", "the test destination", func(a *actio.Agent) {
+				cap := actio.Capability{
+					Name:       "hold",
+					Parameters: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+					Actio:      actio.CapabilityActio{Result: json.RawMessage(`{"type":"object"}`), MaxParallel: 1},
+				}
+				if err := a.Capability(cap, func(ctx context.Context, params json.RawMessage, call *actio.CallContext) (any, error) {
+					atomic.StoreInt32(&held, 1)
+					time.Sleep(90 * time.Second) // ignores ctx
+					return map[string]any{}, nil
+				}); err != nil {
+					t.Fatalf("the destination's hold: %v", err)
+				}
+			})
+			const id = "SCH-00000004"
+			writeTestFile(t, filepath.Join(root, "db.json"), `[{"datetime":"2026-11-01T00:00:00Z","sched_id":"`+id+`","sched_type":"periodic","sched_expression":"@every 2s","dest_id":"dest","dest_capability":"hold","capability_parameters":{}}]`, 0600)
+			cfgPath := filepath.Join(root, "config.json")
+			writeTestFile(t, cfgPath, validConfig, 0600)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- run(ctx, cfgPath) }()
+			t.Cleanup(cancel)
+			// The call is in flight: cancel run's context.
+			waitFor(t, "the call to be in flight", func() bool { return atomic.LoadInt32(&held) == 1 })
+			cancelAt := time.Now()
+			cancel()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(2*stopBound + 10*time.Second):
+				t.Fatalf("deadline: run did not return within two bounds plus slack of the cancel")
+			}
+			t.Logf("the stop took %v with a %v bound per phase", time.Since(cancelAt), stopBound)
+			if row.wantErr {
+				// The stop failed: the agent could not be stopped within its bound.
+				if err == nil {
+					t.Fatal("run returned nil, want the stop's error")
+				}
+				if !strings.Contains(err.Error(), "stop") {
+					t.Fatalf("the error %q does not name the stop failure", err)
+				}
+			} else if err != nil {
+				t.Fatalf("run returned %v, want nil", err)
+			}
+			// The status is inactive: published before the stop failed.
+			var st agentStatus
+			data, rerr := os.ReadFile(filepath.Join(root, "hora-test", "status.json"))
+			if rerr != nil || json.Unmarshal(data, &st) != nil {
+				t.Fatalf("status.json: %v", rerr)
+			}
+			if st.Status != "inactive" {
+				t.Fatalf("the status is %q, want inactive", st.Status)
+			}
+			// The fire line, if it lands, is abandoned — and never after the
+			// inactive status.
+			read, rerr := actio.ReadDiarium(filepath.Join(root, "hora-test"))
+			if rerr != nil {
+				t.Fatalf("ReadDiarium(hora-test): %v", rerr)
+			}
+			for _, l := range read.Lines {
+				var msg string
+				if l.Event != "log" || json.Unmarshal(l.EventData, &msg) != nil || !strings.HasPrefix(msg, "fire "+id+" ") {
+					continue
+				}
+				if !strings.HasSuffix(msg, "abandoned") {
+					t.Fatalf("the fire line is %q, want abandoned", msg)
+				}
+				if l.Datetime > st.Datetime {
+					t.Fatalf("the fire line %s landed after the inactive status %s", l.Datetime, st.Datetime)
+				}
+			}
+		})
 	}
 }
 

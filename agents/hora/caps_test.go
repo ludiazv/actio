@@ -152,6 +152,11 @@ func TestUnset(t *testing.T) {
 
 	t.Run("the owner removes its entry", func(t *testing.T) {
 		h := listHora(t, seededStore(t))
+		// The entry is in the runner, so the unset's removal is what
+		// takes it out.
+		if err := h.run.add(Entry{SchedID: "SCH-00000002", SchedType: "periodic", SchedExpression: "@every 30m"}); err != nil {
+			t.Fatalf("run.add: %v", err)
+		}
 		out, err := h.unset(ctx, []byte(`{"sched_id":"SCH-00000002"}`), &actio.CallContext{Src: "own"})
 		if err != nil {
 			t.Fatalf("unset: %v", err)
@@ -162,6 +167,15 @@ func TestUnset(t *testing.T) {
 		}
 		if _, ok := h.store.get("SCH-00000002"); ok {
 			t.Fatalf("the entry is still in the store")
+		}
+		// fire reads the store first, so a job left in the runner would
+		// fire nothing and nothing observable would change: the removal
+		// is only visible from inside the hora.
+		h.run.mu.Lock()
+		_, inRunner := h.run.ids["SCH-00000002"]
+		h.run.mu.Unlock()
+		if inRunner {
+			t.Fatal("the entry is still in the runner")
 		}
 	})
 
