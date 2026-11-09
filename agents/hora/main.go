@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -71,28 +72,25 @@ func run(ctx context.Context, configPath string) error {
 	if err := h.publish(a); err != nil {
 		return err
 	}
+	// The entries load before a.Start: the runner isn't running, so nothing
+	// fires, and a one-shot due during the start isn't re-parsed as past.
+	for _, e := range st.all() {
+		if err := h.run.add(e); err != nil {
+			return err
+		}
+	}
 	if err := a.Start(ctx); err != nil {
 		return err
 	}
 	for _, e := range cleaned {
 		h.logLine("clean " + e.SchedID + ": one-shot time passed")
 	}
-	for _, e := range st.all() {
-		if err := h.run.add(e); err != nil {
-			// The start failed after the agent: stop it, undoing the start (D-12).
-			sctx, scancel := context.WithTimeout(context.Background(), stopBound)
-			if serr := a.Stop(sctx, actio.StopOptions{}); serr != nil {
-				fmt.Fprintf(os.Stderr, "stop: %v\n", serr)
-			}
-			scancel()
-			return err
-		}
-	}
 	h.run.start()
 
 	select {
 	case <-stop:
 	case <-a.Done():
+	case <-ctx.Done():
 	}
 	h.cancelFiring()
 	stopCtx, cancel := context.WithTimeout(context.Background(), stopBound)
@@ -100,7 +98,10 @@ func run(ctx context.Context, configPath string) error {
 	if err := h.run.stop(stopCtx); err != nil {
 		fmt.Fprintf(os.Stderr, "stop: %v\n", err)
 	}
-	return a.Stop(stopCtx, actio.StopOptions{})
+	if err := a.Stop(stopCtx, actio.StopOptions{}); err != nil {
+		fmt.Fprintf(os.Stderr, "stop: %v\n", err)
+	}
+	return nil
 }
 
 // inFlight is D-11's skip and D-12's cancel of a running fire: one mutex,
@@ -172,11 +173,11 @@ func (h *hora) fire(id string) {
 		if outcome.Response != nil && outcome.Response.Error {
 			var er actio.ErrorResult
 			if json.Unmarshal(outcome.Response.Result, &er) == nil {
-				code := 0
+				code := "-"
 				if er.Code != nil {
-					code = *er.Code
+					code = strconv.Itoa(*er.Code)
 				}
-				line += fmt.Sprintf(" error %d %s", code, er.Msg)
+				line += " error " + code + " " + er.Msg
 			}
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -343,17 +344,28 @@ func TestFireLines(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("the destination's fail: %v", err)
 		}
+		cap2 := actio.Capability{
+			Name:        "nocode",
+			Description: "fails with no code",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+			Actio:       actio.CapabilityActio{Result: json.RawMessage(`true`)},
+		}
+		if err := a.Capability(cap2, func(ctx context.Context, params json.RawMessage, call *actio.CallContext) (any, error) {
+			return nil, errors.New("no code here")
+		}); err != nil {
+			t.Fatalf("the destination's nocode: %v", err)
+		}
 	})
 	h := newFireHora(t, root)
 	see(t, h.agent, "dest")
-	add := func(destID string) string {
+	add := func(destID, capName string) string {
 		t.Helper()
 		e, err := h.store.add(Entry{
 			Datetime:             time.Now().UTC().Format(time.RFC3339),
 			SchedType:            "periodic",
 			SchedExpression:      "@every 1h",
 			DestID:               destID,
-			DestCapability:       "fail",
+			DestCapability:       capName,
 			CapabilityParameters: json.RawMessage(`{}`),
 		})
 		if err != nil {
@@ -363,14 +375,21 @@ func TestFireLines(t *testing.T) {
 	}
 
 	t.Run("an error answer", func(t *testing.T) {
-		id := add("dest")
+		id := add("dest", "fail")
 		h.fire(id)
 		waitLogLine(t, root, "hora", "the error line", func(s string) bool {
 			return s == "fire "+id+" dest/fail: confirmed error 1000 fail: requested failure"
 		})
 	})
+	t.Run("an error answer with no code", func(t *testing.T) {
+		id := add("dest", "nocode")
+		h.fire(id)
+		waitLogLine(t, root, "hora", "the no-code line", func(s string) bool {
+			return s == "fire "+id+" dest/nocode: confirmed error - no code here"
+		})
+	})
 	t.Run("a request failure", func(t *testing.T) {
-		id := add("ghost")
+		id := add("ghost", "fail")
 		h.fire(id)
 		waitLogLine(t, root, "hora", "the failed line", func(s string) bool {
 			return strings.HasPrefix(s, "fire "+id+" ghost/fail: failed: ")
@@ -564,5 +583,170 @@ func TestExitCodes(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "model") {
 		t.Fatalf("a bad config: stderr %q does not name the key", stderr.String())
+	}
+}
+
+// TestRunStopsOnContext cancels run's context while a slow call is in
+// flight: the full stop runs — the fire's diarium line included — and run
+// returns nil.
+func TestRunStopsOnContext(t *testing.T) {
+	t.Setenv("ACTIO_HEARTBEAT", "1")
+	t.Setenv("ACTIO_CONFIRM_TIMEOUT", "2")
+	t.Setenv("ACTIO_CANCEL_WAIT", "1")
+	root := t.TempDir()
+	t.Setenv("ACTIO_DIR", root)
+	running := make(chan struct{})
+	newTestAgent(t, root, "dest", "the test destination", func(a *actio.Agent) {
+		cap := actio.Capability{
+			Name:        "sleep",
+			Description: "waits the given seconds and reports them; honours cancellation",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"seconds":{"type":"number"}},"required":["seconds"],"additionalProperties":false}`),
+			Actio:       actio.CapabilityActio{Result: json.RawMessage(`{"type":"object","properties":{"slept":{"type":"number"}},"required":["slept"]}`), MaxParallel: 1},
+		}
+		if err := a.Capability(cap, func(ctx context.Context, params json.RawMessage, call *actio.CallContext) (any, error) {
+			var p struct {
+				Seconds float64 `json:"seconds"`
+			}
+			_ = json.Unmarshal(params, &p)
+			running <- struct{}{}
+			defer func() { <-running }()
+			select {
+			case <-time.After(time.Duration(p.Seconds) * time.Second):
+			case <-ctx.Done():
+			}
+			return map[string]any{"slept": p.Seconds}, nil
+		}); err != nil {
+			t.Fatalf("the destination's sleep: %v", err)
+		}
+	})
+	const id = "SCH-00000002"
+	db := `[{"datetime":"2026-11-01T00:00:00Z","sched_id":"` + id + `","sched_type":"periodic","sched_expression":"@every 1s","dest_id":"dest","dest_capability":"sleep","capability_parameters":{"seconds":30}}]`
+	if err := os.WriteFile(filepath.Join(root, "db.json"), []byte(db), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"agent_id":"hora","model":"m","url":"http://127.0.0.1:1","db":"` + filepath.Join(root, "db.json") + `","env_apikey":""}`
+	cfgPath := filepath.Join(root, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfgPath) }()
+	consumed := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-consumed:
+		case <-done:
+		case <-time.After(40 * time.Second):
+			t.Errorf("deadline: run did not return within 40 s of the cancel")
+		}
+	})
+	// The slow call is in flight: cancel run's context.
+	waitFor(t, "the call to be in flight", func() bool {
+		select {
+		case <-running:
+			return true
+		default:
+			return false
+		}
+	})
+	cancel()
+	running <- struct{}{} // release the handler's deferred <-running so its completion is sent
+	// The full stop ran: run returns nil, and the fire's line is in the diarium.
+	select {
+	case err := <-done:
+		close(consumed)
+		if err != nil {
+			t.Fatalf("run returned %v on the ctx stop, want nil", err)
+		}
+	case <-time.After(40 * time.Second):
+		t.Fatalf("deadline: run did not return within 40 s of the cancel")
+	}
+	waitFor(t, "the fire's line", func() bool {
+		for _, l := range logLines(t, root, "hora") {
+			if l == "fire "+id+" dest/sleep: cancelled" {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// TestOneShotDueDuringStart is the one-shot that falls due while the start
+// is running: the runner loads before the agent starts, so the entry is
+// not re-parsed as past — it fires once, late, and run does not fail.
+func TestOneShotDueDuringStart(t *testing.T) {
+	t.Setenv("ACTIO_HEARTBEAT", "1")
+	t.Setenv("ACTIO_CONFIRM_TIMEOUT", "2")
+	t.Setenv("ACTIO_CANCEL_WAIT", "1")
+	root := t.TempDir()
+	t.Setenv("ACTIO_DIR", root)
+	var calls int32
+	newTestAgent(t, root, "dest", "the test destination", func(a *actio.Agent) {
+		cap := actio.Capability{
+			Name:        "tick",
+			Description: "counts its calls",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+			Actio:       actio.CapabilityActio{Result: json.RawMessage(`{"type":"object"}`)},
+		}
+		if err := a.Capability(cap, func(ctx context.Context, params json.RawMessage, call *actio.CallContext) (any, error) {
+			atomic.AddInt32(&calls, 1)
+			return map[string]any{}, nil
+		}); err != nil {
+			t.Fatalf("the destination's tick: %v", err)
+		}
+	})
+	// The one-shot is due at the next whole second, inside the start.
+	for time.Now().Nanosecond() < 960e6 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	due := time.Now().Truncate(time.Second).Add(time.Second)
+	const id = "SCH-00000003"
+	db := `[{"datetime":"2026-11-01T00:00:00Z","sched_id":"` + id + `","sched_type":"one-shot","sched_expression":"` + due.UTC().Format("2006-01-02T15:04:05Z") + `","dest_id":"dest","dest_capability":"tick","capability_parameters":{}}]`
+	if err := os.WriteFile(filepath.Join(root, "db.json"), []byte(db), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"agent_id":"hora","model":"m","url":"http://127.0.0.1:1","db":"` + filepath.Join(root, "db.json") + `","env_apikey":""}`
+	cfgPath := filepath.Join(root, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfgPath) }()
+	consumed := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-consumed:
+		case <-done:
+		case <-time.After(40 * time.Second):
+			t.Errorf("deadline: run did not return within 40 s of the cancel")
+		}
+	})
+	// The one-shot fired: the destination saw it.
+	waitFor(t, "the one-shot to fire", func() bool {
+		return atomic.LoadInt32(&calls) >= 1
+	})
+	// run did not fail the start: it is still running.
+	select {
+	case err := <-done:
+		close(consumed)
+		t.Fatalf("run failed at the start: %v", err)
+	default:
+	}
+	cancel()
+	select {
+	case err := <-done:
+		close(consumed)
+		if err != nil {
+			t.Fatalf("run returned %v after the cancel, want nil", err)
+		}
+	case <-time.After(40 * time.Second):
+		t.Fatalf("deadline: run did not return within 40 s of the cancel")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("the destination's handler ran %d times, want exactly 1", got)
 	}
 }
