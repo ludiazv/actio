@@ -62,6 +62,7 @@ func openStore(path string, now time.Time) (*store, []Entry, error) {
 // loadEntries decodes the DB file, cleaning an expired one-shot before the
 // checks run on it (D-3). A load error names the entry's index.
 func loadEntries(data []byte, now time.Time) (entries, cleaned []Entry, err error) {
+	entries, cleaned = []Entry{}, []Entry{}
 	if !strings.HasPrefix(strings.TrimSpace(string(data)), "[") {
 		return nil, nil, fmt.Errorf("db: not a JSON array")
 	}
@@ -113,6 +114,12 @@ func checkEntry(e Entry, now time.Time) error {
 	if p := e.CapabilityParameters; !json.Valid(p) || p[0] != '{' {
 		return fmt.Errorf("capability_parameters: not an object")
 	}
+	if e.DestID == "" {
+		return fmt.Errorf("dest_id: empty")
+	}
+	if e.DestCapability == "" {
+		return fmt.Errorf("dest_capability: empty")
+	}
 	if e.SchedType == "cron" && !strings.HasPrefix(e.SchedExpression, "CRON_TZ=") && !strings.HasPrefix(e.SchedExpression, "TZ=") {
 		return fmt.Errorf("cron expression %s: without a CRON_TZ= or TZ= prefix: add CRON_TZ=<zone> ", e.SchedExpression)
 	}
@@ -139,6 +146,9 @@ func (s *store) add(e Entry) (Entry, error) {
 		return Entry{}, fmt.Errorf("sched_id %s: the id is taken", id)
 	}
 	e.SchedID = id
+	if err = checkEntry(e, time.Now()); err != nil {
+		return Entry{}, err
+	}
 	next := append(append([]Entry{}, s.entries...), e)
 	if err = s.saveLocked(next); err != nil {
 		return Entry{}, err
@@ -193,13 +203,6 @@ func (s *store) all() []Entry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]Entry{}, s.entries...)
-}
-
-// save writes the current entries to the DB file.
-func (s *store) save() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.saveLocked(s.entries)
 }
 
 // saveLocked writes entries as the DB file: a temp file in the same

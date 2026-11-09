@@ -82,6 +82,11 @@ func TestLoadConfigStrictDecoding(t *testing.T) {
 	if _, err := loadWith(t, minConfig+` {"b":2}`); err == nil || !strings.Contains(err.Error(), "second JSON value") {
 		t.Fatalf("second value: %v", err)
 	}
+	for name, frag := range map[string]string{"apikey": `"apikey":"s"`, "Loc": `"Loc":{}`, "decisionapikey": `"decisionapikey":"s"`} {
+		if _, err := loadWith(t, `{`+frag+`,`+minConfig[1:]); err == nil || !strings.Contains(err.Error(), name) {
+			t.Fatalf("resolved key %s loaded: %v", name, err)
+		}
+	}
 }
 
 func TestLoadConfigAgentIDRequired(t *testing.T) {
@@ -187,6 +192,17 @@ func TestLoadConfigDecisionTriple(t *testing.T) {
 	}
 	if _, err := loadWith(t, minConfig); err != nil {
 		t.Fatalf("none: %v", err)
+	}
+	// a keyless decision model: all three keys present, decision_env_apikey ""
+	c, err = loadWith(t, minBody+`,"decision_model":"d1-2b","decision_url":"http://x","decision_env_apikey":""}`)
+	if err != nil || c.DecisionModel != "d1-2b" || c.DecisionURL != "http://x" || c.DecisionAPIKey != "" {
+		t.Fatalf("keyless triple: %+v %v", c, err)
+	}
+	if _, err := loadWith(t, minBody+`,"decision_model":"d1-2b","decision_url":"","decision_env_apikey":""}`); err == nil || !strings.Contains(err.Error(), "decision_url") {
+		t.Fatalf("empty decision_url: %v", err)
+	}
+	if _, err := loadWith(t, minBody+`,"decision_model":"","decision_url":"http://x","decision_env_apikey":""}`); err == nil || !strings.Contains(err.Error(), "decision_model") {
+		t.Fatalf("empty decision_model: %v", err)
 	}
 	for _, frag := range []string{
 		`,"decision_model":"dm"`,

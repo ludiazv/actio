@@ -91,6 +91,8 @@ func TestLoadBadFieldFailsFileUnchanged(t *testing.T) {
 		{"unknown sched_type", entryJSON("SCH-00000001", "hourly", "@every 30s"), "unknown schedule type"},
 		{"expression not for its type", entryJSON("SCH-00000001", "periodic", "0 0 1 * * *"), "periodic"},
 		{"params not an object", `{"datetime":"2026-11-08T17:00:00Z","sched_id":"SCH-00000001","sched_type":"periodic","sched_expression":"@every 30s","dest_id":"d","dest_capability":"c","capability_parameters":[1]}`, "capability_parameters"},
+		{"empty dest_id", `{"datetime":"2026-11-08T17:00:00Z","sched_id":"SCH-00000001","sched_type":"periodic","sched_expression":"@every 30s","dest_id":"","dest_capability":"c","capability_parameters":{}}`, "dest_id"},
+		{"empty dest_capability", `{"datetime":"2026-11-08T17:00:00Z","sched_id":"SCH-00000001","sched_type":"periodic","sched_expression":"@every 30s","dest_id":"d","dest_capability":"","capability_parameters":{}}`, "dest_capability"},
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
@@ -230,7 +232,7 @@ func TestAddGeneratesIDAndSaves(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := s.add(Entry{Datetime: "2026-07-22T00:00:00Z", SchedType: "cron", SchedExpression: "CRON_TZ=UTC 0 0 * * *", DestID: "d", DestCapability: "c"})
+	e, err := s.add(Entry{Datetime: "2026-07-22T00:00:00Z", SchedType: "cron", SchedExpression: "CRON_TZ=UTC 0 0 1 * * *", DestID: "d", DestCapability: "c"})
 	if err != nil {
 		t.Fatalf("add: %v", err)
 	}
@@ -257,7 +259,7 @@ func TestAddKeepsAPresetID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := s.add(Entry{SchedID: "SCH-12345678", SchedType: "periodic", SchedExpression: "@every 30s", DestID: "d", DestCapability: "c"})
+	e, err := s.add(Entry{Datetime: "2026-07-22T00:00:00Z", SchedID: "SCH-12345678", SchedType: "periodic", SchedExpression: "@every 30s", DestID: "d", DestCapability: "c"})
 	if err != nil {
 		t.Fatalf("add: %v", err)
 	}
@@ -276,7 +278,7 @@ func TestAddTakenIDConflicts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.add(Entry{SchedID: "SCH-12345678", SchedType: "periodic", SchedExpression: "@every 60s", DestID: "d", DestCapability: "c"})
+	_, err = s.add(Entry{Datetime: "2026-07-22T00:00:00Z", SchedID: "SCH-12345678", SchedType: "periodic", SchedExpression: "@every 60s", DestID: "d", DestCapability: "c"})
 	if err == nil || !strings.Contains(err.Error(), "taken") {
 		t.Fatalf("conflict: %v", err)
 	}
@@ -341,7 +343,7 @@ func TestSaveModeAndFieldOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.add(Entry{SchedID: "SCH-00000001", SchedType: "periodic", SchedExpression: "@every 30s", DestID: "d", DestCapability: "c", CapabilityParameters: json.RawMessage(`{"k":"v"}`)}); err != nil {
+	if _, err := s.add(Entry{Datetime: "2026-07-22T00:00:00Z", SchedID: "SCH-00000001", SchedType: "periodic", SchedExpression: "@every 30s", DestID: "d", DestCapability: "c", CapabilityParameters: json.RawMessage(`{"k":"v"}`)}); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	st, err := os.Stat(path)
@@ -374,7 +376,7 @@ func TestSaveFailsOnReadOnlyDB(t *testing.T) {
 	if err := os.Chmod(path, 0400); err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.add(Entry{SchedType: "periodic", SchedExpression: "@every 30s", DestID: "d", DestCapability: "c"})
+	_, err = s.add(Entry{Datetime: "2026-07-22T00:00:00Z", SchedType: "periodic", SchedExpression: "@every 30s", DestID: "d", DestCapability: "c"})
 	if err == nil {
 		t.Fatal("the save succeeded into a read-only DB")
 	}
@@ -397,11 +399,108 @@ func TestSaveWritesEmptyArray(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.save(); err != nil {
-		t.Fatalf("save: %v", err)
+	e, err := s.add(Entry{Datetime: "2026-07-22T00:00:00Z", SchedType: "periodic", SchedExpression: "@every 30s", DestID: "d", DestCapability: "c"})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, ok, err := s.remove(e.SchedID); err != nil || !ok {
+		t.Fatalf("remove: %v %v", ok, err)
 	}
 	b, _ := os.ReadFile(path)
 	if !bytes.Equal(bytes.TrimSpace(b), []byte("[]")) {
 		t.Fatalf("file: %s", b)
+	}
+}
+
+// A fully cleaned DB is written as [] and loads again on the next start.
+func TestFullCleanWritesEmptyArrayAndReloads(t *testing.T) {
+	path := writeDB(t, "["+entryJSON("SCH-aaaaaaaa", "one-shot", "2026-11-08T17:00:00Z")+"]")
+	s, cleaned, err := openStore(path, storeNow)
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	if len(cleaned) != 1 || len(s.all()) != 0 {
+		t.Fatalf("cleaned %v entries %v", cleaned, s.all())
+	}
+	b, _ := os.ReadFile(path)
+	if string(bytes.TrimSpace(b)) != "[]" {
+		t.Fatalf("the saved file is not []: %s", b)
+	}
+	s2, _, err := openStore(path, storeNow)
+	if err != nil {
+		t.Fatalf("second openStore: %v", err)
+	}
+	if len(s2.all()) != 0 {
+		t.Fatalf("entries after the reload: %v", s2.all())
+	}
+}
+
+// An [] file plus an add plus a remove of that entry gives [].
+func TestEmptyFileAddRemoveLeavesEmptyArray(t *testing.T) {
+	path := writeDB(t, "[]")
+	s, _, err := openStore(path, storeNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := s.add(Entry{Datetime: "2026-07-22T00:00:00Z", SchedType: "periodic", SchedExpression: "@every 30s", DestID: "d", DestCapability: "c"})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if _, ok, err := s.remove(e.SchedID); err != nil || !ok {
+		t.Fatalf("remove: %v %v", ok, err)
+	}
+	b, _ := os.ReadFile(path)
+	if string(bytes.TrimSpace(b)) != "[]" {
+		t.Fatalf("file after add+remove: %s", b)
+	}
+}
+
+// What the store writes, the store can load: add runs the load's entry check.
+func TestAddRefusesAnEntryTheLoadRefuses(t *testing.T) {
+	path := writeDB(t, "[]")
+	s, _, err := openStore(path, storeNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := sha256sum(t, path)
+	_, err = s.add(Entry{SchedType: "periodic", SchedExpression: "@every 30s", DestID: "d", DestCapability: "c"})
+	if err == nil || !strings.Contains(err.Error(), "datetime") {
+		t.Fatalf("add of an entry the load refuses: %v", err)
+	}
+	assertUnchanged(t, path, before)
+	if len(s.all()) != 0 {
+		t.Fatalf("all() changed: %v", s.all())
+	}
+}
+
+// The save is a rename: the DB file gets a new inode and no temp file is left.
+func TestSaveIsARename(t *testing.T) {
+	path := writeDB(t, "[]")
+	dir := filepath.Dir(path)
+	s, _, err := openStore(path, storeNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := s.add(Entry{Datetime: "2026-07-22T00:00:00Z", SchedType: "periodic", SchedExpression: "@every 30s", DestID: "d", DestCapability: "c"})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	st1, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.remove(e.SchedID); err != nil || !ok {
+		t.Fatalf("remove: %v %v", ok, err)
+	}
+	st2, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(st1, st2) {
+		t.Fatal("the DB file was written in place, not renamed")
+	}
+	left, _ := filepath.Glob(filepath.Join(dir, "*.tmp"))
+	if len(left) != 0 {
+		t.Fatalf("temp files left: %v", left)
 	}
 }

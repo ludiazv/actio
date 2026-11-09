@@ -15,21 +15,21 @@ import (
 // Config is the decoded configuration file. The last three fields are
 // resolved by loadConfig from the file's values.
 type Config struct {
-	AgentID           string    `json:"agent_id"`
-	Namespaces        []*string `json:"namespaces"`
-	TZ                string    `json:"TZ"`
-	Coordinators      []string  `json:"coordinators"`
-	DB                string    `json:"db"`
-	Model             string    `json:"model"`
-	URL               string    `json:"url"`
-	EnvAPIKey         string    `json:"env_apikey"`
-	DecisionModel     string    `json:"decision_model"`
-	DecisionURL       string    `json:"decision_url"`
-	DecisionEnvAPIKey string    `json:"decision_env_apikey"`
-	DecisionGate      string    `json:"decision_gate"` // default v1
-	Loc               *time.Location
-	APIKey            string
-	DecisionAPIKey    string
+	AgentID           string         `json:"agent_id"`
+	Namespaces        []*string      `json:"namespaces"`
+	TZ                string         `json:"TZ"`
+	Coordinators      []string       `json:"coordinators"`
+	DB                string         `json:"db"`
+	Model             string         `json:"model"`
+	URL               string         `json:"url"`
+	EnvAPIKey         string         `json:"env_apikey"`
+	DecisionModel     string         `json:"decision_model"`
+	DecisionURL       string         `json:"decision_url"`
+	DecisionEnvAPIKey string         `json:"decision_env_apikey"`
+	DecisionGate      string         `json:"decision_gate"` // default v1
+	Loc               *time.Location `json:"-"`
+	APIKey            string         `json:"-"`
+	DecisionAPIKey    string         `json:"-"`
 }
 
 // loadConfig reads the config file at path, checks every rule of Hora.md's
@@ -89,15 +89,26 @@ func loadConfig(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	triple := c.DecisionModel != "" && c.DecisionURL != "" && c.DecisionEnvAPIKey != ""
-	if (c.DecisionModel == "") != (c.DecisionURL == "") || (c.DecisionModel == "") != (c.DecisionEnvAPIKey == "") {
-		return Config{}, fmt.Errorf("config: decision_model, decision_url and decision_env_apikey: all three or none")
+	nDecision := 0
+	for _, key := range []string{"decision_model", "decision_url", "decision_env_apikey"} {
+		if _, ok := present[key]; ok {
+			nDecision++
+		}
+	}
+	if nDecision != 0 && nDecision != 3 {
+		return Config{}, fmt.Errorf("config: decision_model, decision_url and decision_env_apikey: all three keys present, or none")
+	}
+	if nDecision == 3 && c.DecisionModel == "" {
+		return Config{}, fmt.Errorf("config: decision_model: must be non-empty when present")
+	}
+	if nDecision == 3 && c.DecisionURL == "" {
+		return Config{}, fmt.Errorf("config: decision_url: must be non-empty when present")
 	}
 	c.DecisionAPIKey, err = resolveKey(c.DecisionEnvAPIKey, "decision_env_apikey")
 	if err != nil {
 		return Config{}, err
 	}
-	if _, ok := present["decision_gate"]; ok && !triple {
+	if _, ok := present["decision_gate"]; ok && nDecision != 3 {
 		return Config{}, fmt.Errorf("config: decision_gate: requires the decision_model, decision_url and decision_env_apikey keys")
 	}
 	if c.DecisionGate == "" {
