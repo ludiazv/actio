@@ -603,8 +603,8 @@ func TestSetWritesDBBeforeAnswer(t *testing.T) {
 // TestRunnerAddFailsOnPastOneShot is the runner.add failure row: a parse
 // that fails in runner.add leaves no entry. The pipeline's own rollback
 // branch is a defensive line: store.add runs the same parse with the real
-// clock (R1-5), so a past one-shot reaches the DB save as a 1002 first,
-// which TestSetPastOneShotLeavesNoEntry covers.
+// clock, so a past one-shot reaches the DB save as a 1002 first, which
+// TestSetPastOneShotLeavesNoEntry covers.
 func TestRunnerAddFailsOnPastOneShot(t *testing.T) {
 	r := newRunner(func(string) {})
 	e := Entry{SchedID: "SCH-00000001", Datetime: "2026-11-08T12:00:00Z", SchedType: "one-shot", SchedExpression: "2020-01-01T00:00:00Z", DestID: "own", DestCapability: "echo", CapabilityParameters: json.RawMessage(`{}`)}
