@@ -400,6 +400,50 @@ func TestE2ESetRejections(t *testing.T) {
 	}
 }
 
+// TestE2EDBBeforeAnswer is the write order: the entry is on disk when set
+// answers. With no wait and no poll, the DB file is read at the instant of
+// the answer, and the new sched_id is in it.
+func TestE2EDBBeforeAnswer(t *testing.T) {
+	e := newE2E(t, []string{replyEchoPeriodic60s}, acceptAnswers)
+	res, _ := e.call(e.caller, "set", map[string]any{"prompt": "a slow tick", "dest_id": "dest"})
+	m := map[string]any{}
+	_ = json.Unmarshal(res, &m)
+	if m["result"] != "scheduled" {
+		t.Fatalf("the set: %v", m)
+	}
+	id, _ := m["sched_id"].(string)
+	if ids := e.dbEntryIDs(); !ids[id] {
+		t.Fatalf("the DB has no %s when the scheduled answer arrives: %v", id, ids)
+	}
+}
+
+// TestE2EStartCancelledBeforeItCompletes: a start cancelled before a.Start
+// returns is a failed start (D-12): run returns an error, and no call ever
+// reached the destination. The context is cancelled before run is called,
+// so the row is deterministic: a racy cancel during the start would
+// sometimes land after a.Start returned and take the nil stop path, passing
+// for the wrong reason.
+func TestE2EStartCancelledBeforeItCompletes(t *testing.T) {
+	e := newE2EBase(t, []string{replyEchoPeriodic60s}, acceptAnswers)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, e.cfgPath) }()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("deadline: run did not return for a cancelled start")
+	}
+	if err == nil {
+		t.Fatal("a cancelled start returned nil, want an error")
+	}
+	t.Logf("the cancelled start returned: %v", err)
+	if n := e.ds.echoCount(); n != 0 {
+		t.Fatalf("the destination saw %d calls, want 0", n)
+	}
+}
+
 // TestE2EOneShotFires schedules a one-shot: the DB carries the entry when
 // the answer arrives (the write order), it fires once in the handler and
 // in Hora's diarium, and it is gone after.
