@@ -379,6 +379,63 @@ func TestDecide(t *testing.T) {
 			t.Fatalf("valid criteria false = %q, want the fixed text", got)
 		}
 	})
+
+	t.Run("with a key: the systemone request carries Bearer <key>", func(t *testing.T) {
+		const keyVal = "sk-decision-test"
+		t.Setenv("HORA_TEST_KEY", keyVal)
+		rec := &recorded{}
+		srv := newSystemOneServer(t, rec, v1AnswersJSON)
+		defer srv.Close()
+		cfg := Config{
+			Model:             "chat-model",
+			URL:               "http://chat.invalid",
+			DecisionModel:     "d1-2b",
+			DecisionURL:       srv.URL,
+			DecisionEnvAPIKey: "HORA_TEST_KEY",
+			DecisionGate:      "v1",
+		}
+		var err error
+		cfg.DecisionAPIKey, err = resolveKey(cfg.DecisionEnvAPIKey, "decision_env_apikey")
+		if err != nil {
+			t.Fatalf("resolveKey: %v", err)
+		}
+		m := newModels(cfg)
+		if _, err := m.decide(context.Background(), "call backup every day at 13:00", "dest: backup-agent; capabilities: backup, echo", []string{"backup", "echo"}); err != nil {
+			t.Fatalf("decide: %v", err)
+		}
+		if rec.path != "/v1/systemone" {
+			t.Fatalf("path = %q, want /v1/systemone", rec.path)
+		}
+		if got := rec.headers.Get("Authorization"); got != "Bearer "+keyVal {
+			t.Fatalf("Authorization = %q, want %q", got, "Bearer "+keyVal)
+		}
+	})
+
+	t.Run("without a key: the systemone request carries no Authorization header", func(t *testing.T) {
+		rec := &recorded{}
+		srv := newSystemOneServer(t, rec, v1AnswersJSON)
+		defer srv.Close()
+		cfg := Config{
+			Model:             "chat-model",
+			URL:               "http://chat.invalid",
+			DecisionModel:     "d1-2b",
+			DecisionURL:       srv.URL,
+			DecisionEnvAPIKey: "",
+			DecisionGate:      "v1",
+		}
+		cfg.DecisionAPIKey, _ = resolveKey(cfg.DecisionEnvAPIKey, "decision_env_apikey")
+		m := newModels(cfg)
+		if _, err := m.decide(context.Background(), "call backup every day at 13:00", "dest: backup-agent; capabilities: backup, echo", []string{"backup", "echo"}); err != nil {
+			t.Fatalf("decide: %v", err)
+		}
+		if rec.path != "/v1/systemone" {
+			t.Fatalf("path = %q, want /v1/systemone", rec.path)
+		}
+		got := rec.headers.Get("Authorization")
+		if got != "" {
+			t.Fatalf("Authorization = %q, want no header at all (the surviving Bearer-none mutant sends %q)", got, "Bearer none")
+		}
+	})
 }
 
 func TestV1Verdict(t *testing.T) {

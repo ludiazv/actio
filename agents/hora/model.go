@@ -219,7 +219,7 @@ func v1Verdict(a ai.ClassifierAnswers, capNames []string) (gateVerdict, error) {
 	if !ok {
 		return gateVerdict{}, fmt.Errorf("gate v1: missing choice answer %q", "type")
 	}
-	capHint := typ
+	var capHint string
 	if len(capNames) == 1 {
 		capHint = capNames[0]
 	} else {
