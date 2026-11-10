@@ -117,39 +117,48 @@ CLI's rule (`actio-ts/src/cli.ts:225`), not a Go invention.
 
 ## The API
 
-`doc.go` carries the same text; `go doc actio-go` prints it. The surface is the reference's surface — every
-export of `../actio-ts/src/index.ts` has a Go counterpart and a named test.
+`doc.go` carries the package overview and a two-agent example; `go doc actio-go` prints it. The surface is the
+reference's surface — every export of `../actio-ts/src/index.ts` has a Go counterpart and a named test.
 
 Constructing and starting:
 
 ```go
-cfg := actio.LoadConfig()                 // defaults < ACTIO_* < overrides
-cfg.Root = "/tmp/actio-demo"
-a, err := actio.New("alpha", cfg, actio.WithCommands(true), actio.WithRequestors("*"))
-a.Capability("echo", paramsSchema, resultSchema, echoHandler)
-a.OnCommand("noop", noopHandler)
+cfg, err := actio.LoadConfig(actio.Config{Root: "/tmp/actio-demo"}) // defaults < ACTIO_* < overrides
+a, err := actio.New(actio.Options{
+    ID: "alpha", Description: "echoes text",
+    AcceptsCommandsFrom: []string{"ops"}, // empty: nobody may command us
+    Config: cfg,
+})
+err = a.Capability(actio.Capability{
+    Name:        "echo",
+    Description: "echoes the text it gets",
+    Parameters:  json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`),
+    Actio:       actio.CapabilityActio{Result: json.RawMessage(`{"type":"object"}`)}, // AcceptsFrom empty: every agent may call it
+}, echoHandler)
+err = a.OnCommand("noop", noopHandler)
 a.OnEvent(func(e actio.Event) { ... })     // log, ignored, status, watch, failure
 err = a.Start(ctx)
 <-a.Done()
 ```
 
-Serving is a handler: `func(ctx, params json.RawMessage, cap *actio.CapabilityContext) (any, error)`. The
-`ctx` is the exchange's: it is cancelled when a cancellation arrives, when the requestor's timer expires, and
-when the agent stops. A returned error becomes an ordinary error answer; a panicking handler is caught and
-answered as a failure, never a crash.
+Serving is a `CapabilityHandler`: `func(ctx context.Context, params json.RawMessage, call *actio.CallContext)
+(any, error)`, where `call.Src` is the caller. The `ctx` is the exchange's: it is cancelled when a cancellation
+arrives, when the requestor's timer expires, and when the agent stops. Returning an `*actio.Error` answers with
+its code and message; any other error answers with its message and no code; a panicking handler is caught and
+answered the same way, never a crash.
 
 Calling is `Request`, which builds and sends the envelope itself:
 
 ```go
-out, err := a.Request(ctx, actio.RequestOptions{
-    To: "beta", Capability: "echo", Params: json.RawMessage(`{"text":"hi"}`),
-    Timeout: 30 * time.Second, Force: false,
-})
+out, err := a.Request(ctx, "beta", "echo", map[string]any{"text": "hi"},
+    actio.RequestOptions{Timeout: 30 * time.Second}) // Timeout 0 waits until ctx is done
 ```
 
 `err` is non-nil only when the protocol exchange could not run (an uncallable peer, a bad capability name, the
-local gate). A peer's error answer comes back inside `out` — `out.Response.Error`, `out.FinalStatus`
-(`confirmed`, `cancelled`, `completed`, `failed`, `timed_out`, `dropped`) — and is never a Go error.
+agent not started): a `*actio.CallError`. A peer's error answer comes back inside `out` — `out.Response.Error`
+— and is never a Go error. `out.FinalStatus` is `confirmed`, `cancelled` or `abandoned`. Cancelling `ctx` does
+not return at once: the cancellation is written and the response waited for, up to `CancelWaitTimeout`, then
+the exchange ends `cancelled` or `abandoned`.
 
 The rest: `Agmen()` and `Refresh()` for the discovery view, `Fail()` and `Stop()`, `Diarium()` and
 `ReadDiarium()`, `HealthOf()`, `Scan()` and the eight callability rules, `CheckParams()`, `Call` and
