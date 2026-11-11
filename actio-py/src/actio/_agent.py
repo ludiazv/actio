@@ -438,11 +438,12 @@ class ActioAgent:
     async def _stop_impl(self, force: bool) -> None:
         # D-9, in order; after it nothing of ours is armed.
         run = self._run
-        if run is None or run.stopped.is_set():
-            return  # not running, or a second stop: it only waited for the first
         restart = self._restart_task
         if restart is not None and not self._stopping_restart:
-            # D-10: a `stop` during the delay cancels the restart and ends `wait_stopped()`.
+            # D-10: a `stop` during the delay cancels the restart and ends `wait_stopped()`. This comes
+            # before the "already stopped" return below, which is about the *run*: during the delay the
+            # restart's own `stop()` has run, so its run is stopped and returning first would leave the
+            # restart sleeping and the agent coming back to life behind the caller's back.
             restart.cancel()
             if (
                 self._lifecycle_task is not None
@@ -450,8 +451,10 @@ class ActioAgent:
             ):
                 self._lifecycle_task.cancel()  # the restart's in-flight start goes with it
             with contextlib.suppress(BaseException):
-                await asyncio.shield(restart)
+                await asyncio.shield(restart)  # its handler ends `wait_stopped()` on the way out
             self._restart_task = None
+        if run is None or run.stopped.is_set():
+            return  # not running, or a second stop: it only waited for the first
         # (1) The heartbeat and any pending discovery scan.
         run.stopped.set()
         if run.scan_task is not None:
