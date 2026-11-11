@@ -3,7 +3,7 @@ usable — it parses, it passes the metaschema, and every `$ref` in it resolves.
 
 The schemas are authoritative at run time, so a copy that drifts from the source is a protocol bug
 waiting to happen; the drift test reads this copy, so the two tests together tie the code to
-`../doc/schemas/`. Only `jsonschema` is used here (D-21): cross-file `$ref` resolution is checked as JSON,
+`../doc/schemas/`. Only `jsonschema` is used here: cross-file `$ref` resolution is checked as JSON,
 not through a resolver, so no second dependency sneaks in.
 """
 
@@ -103,7 +103,7 @@ class CommonDefsTest(unittest.TestCase):
 
     `datetime` has **no** fractional second: the pattern says so, and every example in the protocol is
     whole seconds. `ts` is an epoch **integer** in seconds, not a string. The schemas are the authority at
-    run time (D-16), and `format_iso` must emit exactly what these accept."""
+    run time (D-20), and `format_iso` must emit exactly what these accept."""
 
     def setUp(self) -> None:
         self.defs = installed()["common.schema.json"]["$defs"]
