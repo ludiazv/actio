@@ -6,6 +6,9 @@ repeating interval, or a calendar (cron) schedule — by calling Hora's `set` ca
 with a plain-language prompt. Hora translates the prompt into a schedule with a small
 LLM, stores it in a JSON database, and fires the capability call when the time comes.
 
+**Reading or changing the code?** `doc/internals.md` covers the structure, the
+lifecycle, time-zone handling, the prompts and the database format.
+
 ## Building
 
 Hora is one static Go binary, built with the Go toolchain 1.26 or newer (the module pins
@@ -27,10 +30,15 @@ hora -config <file>
 ```
 
 - A missing `-config` (or any usage error) prints the usage to stderr and exits **2**.
-- A config file that breaks a rule, or a start that fails at any step, prints the
-  reason — which names the offending key — to stderr and exits **1**.
-- SIGINT and SIGTERM stop the agent gracefully; Hora then exits **0**,
-  unless the agent stop itself fails, which exits **1**.
+- A config file that breaks a rule, or a start that fails at any step — including a
+  database the loader refuses — prints the reason, naming the offending key or entry,
+  to stderr and exits **1**.
+- SIGINT and SIGTERM stop the agent gracefully, and Hora then exits **0**. A call still
+  running 30 s after the signal is left behind (a line on stderr) and Hora still exits
+  **0**; an agent that cannot be stopped within its own 30 s is a failed stop: Hora
+  prints the stop's error and exits **1**.
+- A signal that lands before the process reaches its own code cannot be caught: TERM
+  the instant `exec` returns kills it with the default disposition.
 
 ## The configuration file
 
@@ -52,54 +60,21 @@ object.
 
 The resolved values (the loaded zone, the two API keys) are never read from the file.
 
-## The database
-
-A JSON array of entries, in this field order:
-
-```json
-{"datetime":"2026-11-08T18:00:00Z","sched_id":"SCH-1a2b3c4d","sched_type":"cron",
- "sched_expression":"CRON_TZ=Europe/Madrid 0 0 13 * * 0","dest_id":"backup-agent",
- "dest_capability":"backup","capability_parameters":{"kind":"full"}}
-```
-
-- `datetime` is the creation time, in UTC, RFC 3339 with whole seconds.
-- `sched_id` is `SCH-` plus 8 lowercase hex digits, generated from `crypto/rand`.
-- `sched_type` is `one-shot`, `periodic` or `cron`, and `sched_expression` is in its
-  stored form: an RFC 3339 UTC time, `@every <duration>` of whole seconds of at least
-  1s, or six cron fields — a `cron` expression must carry a `CRON_TZ=<zone> ` or
-  `TZ=<zone> ` prefix, because the database file has no zone of its own.
-- `dest_id` and `dest_capability` are non-empty.
-- `capability_parameters` is an object; a `null` read from the file is taken as `{}`.
-
-The file is never written in place: a save writes the whole array to a temp file in
-the same directory, fsyncs it, and renames it over the DB, with mode `0600`. An empty
-database is written as `[]`, never `null`.
-
-At start, a missing file is an empty database. A file that is not a JSON array, or any
-entry that breaks a rule above, fails the start, naming the entry's index and the
-reason; the file is left byte-for-byte as it was. Before that check, every `one-shot`
-entry whose time is not after now is removed (and the DB is saved if anything was
-removed): a past one-shot must not fail the start, and it is not fired.
-
-An entry belongs to its `dest_id`: only that agent, or a coordinator, may see it in
-`list` or remove it with `unset`.
-
 ## The capabilities
 
-Hora publishes three capabilities.
+Hora publishes three capabilities. A caller's own timeout must allow for Hora's: `set`
+publishes `recommended_timeout: 180` seconds, because a `set` can spend two chat
+rounds plus a decision round.
 
 ### `set`
 
 Parameters: `{"prompt": string (required), "dest_id": string (optional)}` — nothing
 else is accepted.
 
-It resolves the destination (the `dest_id`, or the caller when it is absent), refuses
-with `unauthorized` when a non-coordinator schedules for another agent, reads the
-destination's view, and, when a decision model is configured, asks it through the
-configured gate. The chat model then extracts the schedule (one round, and a second
-round carrying the previous reply and the failure reasons when the first reply fails
-validation). A valid answer becomes an entry: saved to the DB, then added to the
-runner, then answered.
+The destination is `dest_id`, or the caller when it is absent; a non-coordinator may
+only schedule for itself. Hora asks the decision model (when configured) and then the
+chat model, and validates the answer against the destination's visible capabilities.
+If the first answer fails validation, one more round runs, carrying the reasons.
 
 Results:
 
@@ -108,8 +83,8 @@ Results:
   found or no visible capabilities for the scheduler`, `not a scheduling request`, or
   `invalid answer: <reasons>`.
 
-`set` publishes `recommended_timeout: 180` seconds: a chat round ran up to 18.6 s on
-the measured server, a decision 2.3 s, and a set can take two rounds.
+When `set` answers `scheduled`, the entry is already in the database file and already
+in the scheduler.
 
 ### `list`
 
@@ -123,24 +98,62 @@ sorted by `datetime` then `sched_id`. Each item carries `sched_id`, `dest_id`,
 
 Parameters: `{"sched_id": string (required, matching the id format)}` — nothing else.
 
-It removes the entry when the caller is its owner or a coordinator — first the DB
-save, then the removal from the runner, then the answer `{"result":"unset","sched_id"}`.
-For a missing entry and a not-yours entry alike it answers the capability error with
-code **1001**, `unknown sched_id: <id>`: one answer for both, so `unset` reveals no
-more than `list` does. A call that is already running when its entry is unset is not
-cancelled.
+It removes the entry when the caller is its owner or a coordinator, and answers
+`{"result":"unset","sched_id"}`. A missing entry and a not-yours entry get the same
+capability error, code **1001**, `unknown sched_id: <id>`: `unset` reveals no more than
+`list` does. A call that is already running when its entry is unset is not cancelled.
 
-## Firing
+## What Hora writes in the log
 
-When a schedule comes due, Hora calls the destination's capability with the stored
-parameters. The call's own timeout is the capability's `recommended_timeout` when it
-is greater than 0, and 300 s otherwise. One line goes to Hora's diarium per firing:
-`fire <sched_id> <dest>/<cap>: <final status>`, with ` error <code> <msg>` on an error
-answer (a `-` where the answer carries no code) and ` failed: <err>` when the call
-itself failed. While one call for a schedule is still running, its later firings are
-skipped, and each skip gets one line: `skip <sched_id>: previous call still running`.
-A `one-shot` is removed from the DB and the runner only after it has been executed and
-logged.
+Every line below is a Hora diarium line, so a running agent can be followed — and
+schedules audited — from the tree's log alone.
+
+```
+gate <name>: ok=<true|false> score=<0.000> type=<t> capability=<c>   # one per decision
+gate <name>: failed: <err>                                          # a decision call that failed
+fire <sched_id> <dest>/<cap>: <final status>                         # one per firing
+     … error <code> <msg>   … failed: <err>                          # appended when it went wrong
+skip <sched_id>: previous call still running                        # one per skipped firing
+clean <sched_id>: one-shot time passed                              # at start, for expired entries
+```
+
+## When a schedule comes due
+
+Hora calls the destination's capability with the stored parameters. The call's own
+timeout is the **destination** capability's `recommended_timeout` when it is greater
+than 0, and 300 s otherwise. While one call for a schedule is still running, its later
+firings are skipped, and each skip gets a line. A `one-shot` is removed only after it
+has run and been logged, so it is still listed during a slow call.
+
+## The database file
+
+A JSON array of entries, written as one compact line (the example below is
+wrapped to fit), with the fields in this order:
+
+```json
+{"datetime":"2026-11-08T18:00:00Z","sched_id":"SCH-1a2b3c4d","sched_type":"cron",
+ "sched_expression":"CRON_TZ=Europe/Madrid 0 0 13 * * 0","dest_id":"backup-agent",
+ "dest_capability":"backup","capability_parameters":{"kind":"full"}}
+```
+
+- `datetime` is the creation time, in UTC, RFC 3339 with whole seconds.
+- `sched_id` is `SCH-` plus 8 lowercase hex digits.
+- `sched_type` is `one-shot`, `periodic` or `cron`, and `sched_expression` is in its
+  stored form: an RFC 3339 **UTC** time, `@every <duration>` of whole seconds of at
+  least 1s, or six cron fields that **must** carry a `CRON_TZ=<zone> ` or `TZ=<zone> `
+  prefix — the file has no zone of its own, so a stored cron names its own.
+- `dest_id` and `dest_capability` are non-empty. `capability_parameters` is an object;
+  a `null` read from the file is taken as `{}`.
+
+You may edit the file by hand. Saves are atomic — a whole new file is written and
+renamed into place with mode `0600` — so a crash leaves the previous file, never a
+partial one. At start, a missing file is an empty database, every `one-shot` whose time
+has already passed is dropped (and logged), and any entry that breaks a rule above
+**stops the start**, naming the entry's index and the reason, with the file left
+untouched: Hora never silently discards what you wrote.
+
+An entry belongs to its `dest_id`: only that agent, or a coordinator, sees it in `list`
+or can remove it with `unset`.
 
 ## Limits
 
@@ -149,15 +162,3 @@ scheduling, and while it can express second-level precision, the Actio protocol 
 internal latency mean a call can arrive with some delay — use Hora for scheduling in
 long-running workflows, not for time-critical tasks. If you need precise timing or
 rapid triggering, use another solution.
-
-Two more edges, measured:
-
-- The stop is phased, and each phase gets its own 30 s bound: the runner
-  is stopped first, then the agent. A call still running 30 s after the
-  stop signal is left behind: Hora writes to stderr and goes on.
-- The runner's bound alone does not change the exit code: Hora exits **0**.
-  An agent that cannot be stopped within its own bound is a failed stop:
-  Hora prints the stop's error and exits **1**.
-- A signal that lands before the process reaches its own code cannot be caught: TERM
-  the instant `exec` returns kills it with the default disposition, because no handler
-  is installed yet.
