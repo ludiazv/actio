@@ -5,6 +5,11 @@ no module state: the sync provider of the agent is passed in, and its hooks are 
 than in the callers. JSON is written compact (`separators=(",", ":")`, `ensure_ascii=False`,
 `allow_nan=False`) and read with a `parse_constant` that raises, so `NaN` and `Infinity` from a peer
 are an unparsable file, not a value.
+
+The `delay` provider's pause is awaited **on the loop after the thread returns**, never slept inside
+the thread: a `delay:10000` write would otherwise hold an executor thread for ten seconds, and a
+burst of writes would starve every other disk operation (§9: no `time.sleep`, a worker thread
+included).
 """
 
 from __future__ import annotations
@@ -14,11 +19,12 @@ import contextlib
 import json
 import os
 import shutil
-import time
+from collections.abc import Callable
 from typing import Any
 
 from ._types import SyncProvider
 from ._util import nonce
+from ._validate import LIMIT
 
 
 def _reject_constant(name: str) -> Any:
@@ -84,11 +90,24 @@ def _fsync_dir(folder: str) -> None:
 
 
 def _post_write(target: str, provider: SyncProvider) -> None:
+    """The synchronous half of a write's aftermath, in the same thread as the write."""
     if provider.fsync:
         _fsync_dir(os.path.dirname(target))
     provider.notify()
+
+
+async def _after_write(op: Callable[[], None], provider: SyncProvider) -> None:
+    """One disk operation in a thread, then the provider's pause awaited on the loop, not in the thread."""
+    await asyncio.to_thread(op)
     if provider.delay_ms > 0:
-        time.sleep(provider.delay_ms / 1000)
+        await asyncio.sleep(provider.delay_ms / 1000)
+
+
+def unreadable_reason(err: OSError) -> str:
+    """The one wording of a file that exists but cannot be read (I-7): one line, at most `LIMIT`, and
+    never a value of the peer's. A schema rejection is worded by `_validate.reason`; this is the only
+    place an I/O rejection is worded, because the reader is the thing that knows."""
+    return f"unreadable: {err}".replace("\n", " ")[:LIMIT]
 
 
 def _temp_in(tmp_dir: str, base: str) -> str:
@@ -131,7 +150,47 @@ async def write_json_atomic(path: str, obj: Any, tmp_dir: str, provider: SyncPro
         _replace(tmp, path)
         _post_write(path, provider)
 
-    await asyncio.to_thread(_write)
+    await _after_write(_write, provider)
+
+
+async def write_bytes_atomic(path: str, data: bytes, tmp_dir: str, provider: SyncProvider) -> None:
+    """An attachment's bytes, written once: temp file in `tmp_dir`, then `os.replace`.
+
+    One operation, not a temp write plus a copy plus a remove: a half-taken attachment is what a peer
+    reads back as a truncated file.
+    """
+
+    def _write() -> None:
+        tmp = _temp_in(tmp_dir, os.path.basename(path))
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+            if provider.fsync:
+                fh.flush()
+                os.fsync(fh.fileno())
+        _replace(tmp, path)
+        _post_write(path, provider)
+
+    await _after_write(_write, provider)
+
+
+async def read_text_with_mtime(path: str) -> tuple[int, str] | None:
+    """`(mtime_ns, text)` of one file in a single thread hop.
+
+    None when the file (or a parent folder) is missing; it **raises** when the file is there but cannot
+    be read or decoded, because a caller must report that as an ignored file with a reason (I-7) rather
+    than lose it as a missing one. The dedup of D-11 needs the mtime and the text from one hop: a file
+    read and then stat'ed can be a different file.
+    """
+
+    def _read() -> tuple[int, str] | None:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            return os.stat(path).st_mtime_ns, text
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+
+    return await asyncio.to_thread(_read)
 
 
 async def append_jsonl(path: str, obj: Any, provider: SyncProvider) -> None:
@@ -147,7 +206,7 @@ async def append_jsonl(path: str, obj: Any, provider: SyncProvider) -> None:
             os.close(fd)
         _post_write(path, provider)
 
-    await asyncio.to_thread(_append)
+    await _after_write(_append, provider)
 
 
 async def copy_file(src: str, dst: str, tmp_dir: str, provider: SyncProvider) -> None:
@@ -167,7 +226,7 @@ async def copy_file(src: str, dst: str, tmp_dir: str, provider: SyncProvider) ->
         _replace(tmp, dst)
         _post_write(dst, provider)
 
-    await asyncio.to_thread(_copy)
+    await _after_write(_copy, provider)
 
 
 async def read_bytes(path: str) -> bytes:

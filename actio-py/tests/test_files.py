@@ -6,10 +6,13 @@ unparsable, not values; an atomic write leaves no temp behind; the JSONL append 
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import os
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 from actio._files import (
@@ -21,7 +24,10 @@ from actio._files import (
     make_dirs,
     read_bytes,
     read_json,
+    read_text_with_mtime,
     remove,
+    unreadable_reason,
+    write_bytes_atomic,
     write_json_atomic,
 )
 from actio._sync import create_sync_provider
@@ -161,3 +167,67 @@ class SmallHelpersTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SyncHooksTest(unittest.IsolatedAsyncioTestCase):
+    """The provider's hooks: `fsync` in the thread, the `delay` pause on the loop after it."""
+
+    async def test_the_delay_pause_does_not_hold_the_executor_thread(self) -> None:
+        # One worker thread, and two writes with a 1.5 s pause each. A pause slept inside the thread
+        # would serialise them: 3.0 s. A pause awaited on the loop: 1.5 s, and the thread is free.
+        with actio_tree() as root:
+            loop = asyncio.get_running_loop()
+            provider = create_sync_provider("delay:1500")
+            pool = ThreadPoolExecutor(max_workers=1)
+            loop.set_default_executor(pool)
+            try:
+                start = time.monotonic()
+                await asyncio.gather(
+                    write_json_atomic(os.path.join(root, "a.json"), {"n": 1}, root, provider),
+                    write_json_atomic(os.path.join(root, "b.json"), {"n": 2}, root, provider),
+                )
+                elapsed = time.monotonic() - start
+            finally:
+                pool.shutdown()  # its one worker is joined here, before any leftover check
+                fresh = ThreadPoolExecutor()
+                loop.set_default_executor(fresh)
+                fresh.shutdown()  # nothing was submitted, so it created no thread
+            self.assertLess(elapsed, 2.5, f"the pause held the thread: {elapsed:.2f}s")
+            self.assertGreaterEqual(elapsed, 1.4, "the pause must still slow the write down")
+
+    async def test_write_bytes_atomic_replaces_once_and_leaves_no_temp(self) -> None:
+        with actio_tree() as root:
+            target = os.path.join(root, "inbox", "part.dat")
+            await make_dirs(os.path.dirname(target))
+            await write_bytes_atomic(target, b"\x00\xff bytes", root, create_sync_provider("none"))
+            with open(target, "rb") as fh:
+                self.assertEqual(fh.read(), b"\x00\xff bytes")
+            self.assertEqual([n for n in os.listdir(root) if n.endswith(".tmp")], [])
+
+    async def test_read_text_with_mtime_tells_missing_from_unreadable(self) -> None:
+        with actio_tree() as root:
+            path = os.path.join(root, "inbox", "x.json")
+            self.assertIsNone(await read_text_with_mtime(path))  # missing is not an error
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"a": 1}')
+            mtime_ns, text = await read_text_with_mtime(path)
+            self.assertEqual(text, '{"a": 1}')
+            self.assertGreater(mtime_ns, 0)
+            os.chmod(path, 0o000)
+            try:
+                await read_text_with_mtime(path)
+            except OSError as err:
+                reason = unreadable_reason(err)
+                self.assertLessEqual(len(reason), 200)
+                self.assertNotIn("\n", reason)
+            else:
+                self.fail("an unreadable file must raise, not read as missing")
+            finally:
+                os.chmod(path, 0o600)
+
+    def test_the_unreadable_reason_is_one_line_and_bounded(self) -> None:
+        reason = unreadable_reason(OSError("boom\nwith a newline and " + "x" * 400))
+        self.assertLessEqual(len(reason), 200)
+        self.assertNotIn("\n", reason)
+        self.assertTrue(reason.startswith("unreadable: "))
