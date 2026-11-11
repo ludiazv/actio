@@ -1,0 +1,18 @@
+{
+  "rid": "01JB7Q3W8K2M4N6P8R0S2T4V6X",
+  "src": "planner",
+  "dst": "summarizer",
+  "datetime": "2026-10-24T10:00:05Z",
+  "type": "req",
+  "actio_version": "0.1",
+  "response": {
+    "ts": 1792836070,
+    "nonce": "a688e91bc1a01ba05c68c4ec37aa9dfe",
+    "signature": null,
+    "error": true,
+    "cancellation": false,
+    "result": "failed",
+    "attachments": [],
+    "work_time": 62
+  }
+}

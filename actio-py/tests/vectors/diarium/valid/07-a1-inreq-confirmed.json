@@ -1,0 +1,60 @@
+{
+  "id": "summarizer",
+  "datetime": "2026-10-24T10:01:13Z",
+  "event": "inreq",
+  "event_data": {
+    "final_status": "confirmed",
+    "req": {
+      "rid": "01JB7Q3W8K2M4N6P8R0S2T4V6X",
+      "src": "planner",
+      "dst": "summarizer",
+      "datetime": "2026-10-24T10:00:00Z",
+      "type": "req",
+      "actio_version": "0.1",
+      "request": {
+        "ts": 1792836000,
+        "nonce": "52ffe97b3a5e6e2f00a69edb27551465",
+        "signature": null,
+        "name": "summarize",
+        "parameters": {
+          "text": "Actio is a simple file/object-based agent coordination protocol ...",
+          "instructions": "one sentence"
+        },
+        "timeout": 300,
+        "attachments": []
+      }
+    },
+    "can": null,
+    "res": {
+      "rid": "01JB7Q3W8K2M4N6P8R0S2T4V6X",
+      "src": "planner",
+      "dst": "summarizer",
+      "datetime": "2026-10-24T10:01:10Z",
+      "type": "req",
+      "actio_version": "0.1",
+      "response": {
+        "ts": 1792836070,
+        "nonce": "a688e91bc1a01ba05c68c4ec37aa9dfe",
+        "signature": null,
+        "error": false,
+        "cancellation": false,
+        "result": "Actio lets agents coordinate through files in one shared folder.",
+        "attachments": [],
+        "work_time": 62
+      }
+    },
+    "con": {
+      "rid": "01JB7Q3W8K2M4N6P8R0S2T4V6X",
+      "src": "planner",
+      "dst": "summarizer",
+      "datetime": "2026-10-24T10:01:12Z",
+      "type": "req",
+      "actio_version": "0.1",
+      "confirmation": {
+        "ts": 1792836072,
+        "nonce": "050dd73f1237d5aea4583c515a3fe777",
+        "signature": null
+      }
+    }
+  }
+}

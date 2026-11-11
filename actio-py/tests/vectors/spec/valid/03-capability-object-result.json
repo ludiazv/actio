@@ -1,0 +1,44 @@
+{
+  "id": "summarizer",
+  "actio_version": "0.1",
+  "datetime": "2026-10-24T09:00:00Z",
+  "description": "Summarizes texts",
+  "accepts_commands_from": [],
+  "capabilities": [
+    {
+      "name": "summarize",
+      "description": "Summarizes a text",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "instructions": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ]
+      },
+      "actio": {
+        "result": {
+          "type": "string"
+        },
+        "skill": "summarize",
+        "tool": true,
+        "tool_name": "summarize_text",
+        "sync": false,
+        "accepts_from": [
+          "planner"
+        ],
+        "max_parallel": 2,
+        "recommended_timeout": 300,
+        "disabled": false
+      }
+    }
+  ],
+  "security_support": [],
+  "security_posture": "trusted"
+}
