@@ -1148,7 +1148,7 @@ class TwoSidedTest(ReceiverTest):
             self.addAsyncCleanup(receiver.stop)
             self.addAsyncCleanup(settle_tasks, receiver)
             await receiver.start()
-            requestor = Requestor(qctx, hooks, qwatch)
+            requestor = Requestor(qctx, hooks, qwatch, spawn)
             self.addAsyncCleanup(requestor.stop)
             cancel = asyncio.Event()
             t = asyncio.create_task(
