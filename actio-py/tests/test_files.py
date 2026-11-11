@@ -22,8 +22,10 @@ from actio._files import (
     list_dir,
     loads,
     make_dirs,
+    mtime_ns,
     read_bytes,
     read_json,
+    read_text,
     read_text_with_mtime,
     remove,
     unreadable_reason,
@@ -241,3 +243,34 @@ class SyncHooksTest(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(reason), 200)
         self.assertNotIn("\n", reason)
         self.assertTrue(reason.startswith("unreadable: "))
+
+
+class TextAndStatTest(unittest.IsolatedAsyncioTestCase):
+    """The helpers a reader outside `_files.py` is allowed to call: text, and a file's mtime."""
+
+    async def test_read_text_raises_for_missing_and_unreadable(self) -> None:
+        with actio_tree() as root:
+            here = str(root)
+            path = os.path.join(here, "x.json")
+            with self.assertRaises(OSError):
+                await read_text(path)
+            (root / "dir.json").mkdir()
+            with self.assertRaises(OSError):
+                await read_text(os.path.join(here, "dir.json"))
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("hello")
+            self.assertEqual(await read_text(path), "hello")
+
+    async def test_mtime_ns_keys_a_file_and_raises_when_it_is_gone(self) -> None:
+        with actio_tree() as root:
+            here = str(root)
+            path = os.path.join(here, "x.json")
+            with self.assertRaises(OSError):
+                await mtime_ns(path)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("a")
+            first = await mtime_ns(path)
+            self.assertGreaterEqual(first, 0)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("bb")
+            self.assertGreaterEqual(await mtime_ns(path), first)

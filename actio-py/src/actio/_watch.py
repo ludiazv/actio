@@ -153,6 +153,12 @@ class Watcher:
                     self._wake(folder)
 
 
+async def scan(folder: str, prev: Markers) -> tuple[list[str], Markers]:
+    """`scan_folder` in a thread: the only place outside `_files.py` allowed to take one, because the
+    scan is a folder read. It raises `OSError` when the folder is gone (D-22's loss)."""
+    return await asyncio.to_thread(scan_folder, folder, prev)
+
+
 def scan_folder(folder: str, prev: Markers) -> tuple[list[str], Markers]:
     """Which names changed since `prev`, and the new markers (mtime_ns, size, inode). Blocking."""
     markers: Markers = {}

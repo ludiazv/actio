@@ -173,6 +173,23 @@ async def write_bytes_atomic(path: str, data: bytes, tmp_dir: str, provider: Syn
     await _after_write(_write, provider)
 
 
+async def read_text(path: str) -> str:
+    """The whole file as text, in one thread hop; raises `OSError` when it is missing or unreadable and
+    `UnicodeDecodeError` when it is not UTF-8 (a caller that ignores files decides which it reports)."""
+
+    def _read() -> str:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    return await asyncio.to_thread(_read)
+
+
+async def mtime_ns(path: str) -> int:
+    """A file's mtime in nanoseconds: the dedup key of D-11's once-per-file line. Raises `OSError` when
+    the file is gone or unreadable, which is the caller's signal that there is nothing to key."""
+    return (await asyncio.to_thread(os.stat, path)).st_mtime_ns
+
+
 async def read_text_with_mtime(path: str) -> tuple[int, str] | None:
     """`(mtime_ns, text)` of one file in a single thread hop.
 
