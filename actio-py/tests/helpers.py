@@ -33,12 +33,17 @@ def task_names() -> set[str]:
 
 @contextlib.contextmanager
 def no_leftovers() -> Iterator[None]:
-    """Fail if a task or a thread of ours is still armed when the block ends."""
+    """Fail if a task or a thread of ours is still armed when the block ends.
+
+    Both sides are compared as objects, never by `id()` or by name: once the old object is freed, a new
+    one can land on the same address, and then a leftover hides behind the baseline. Keeping the objects
+    in the set is what makes identity sound.
+    """
     before_threads = our_threads()
     loop = asyncio.get_running_loop()
-    before_tasks = {id(t) for t in asyncio.all_tasks(loop)}
+    before_tasks = set(asyncio.all_tasks(loop))
     yield
-    left_tasks = sorted(t.get_name() for t in asyncio.all_tasks(loop) if id(t) not in before_tasks)
+    left_tasks = sorted(t.get_name() for t in asyncio.all_tasks(loop) if t not in before_tasks)
     left_threads = sorted(t.name for t in our_threads() - before_threads)
     if left_tasks or left_threads:
         raise AssertionError(f"still armed after stop: tasks={left_tasks} threads={left_threads}")
@@ -58,12 +63,13 @@ class ActioTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._threads_before = our_threads()
-        self._tasks_before = {id(t) for t in asyncio.all_tasks(self._loop)}
+        # Objects, not `id()`s: see `no_leftovers`.
+        self._tasks_before = set(asyncio.all_tasks(self._loop))
         self.addCleanup(self._assert_nothing_armed)  # added first, so it runs last
 
     def _assert_nothing_armed(self) -> None:
         left_tasks = sorted(
-            t.get_name() for t in asyncio.all_tasks(self._loop) if id(t) not in self._tasks_before
+            t.get_name() for t in asyncio.all_tasks(self._loop) if t not in self._tasks_before
         )
         left_threads = sorted(t.name for t in our_threads() - self._threads_before)
         if left_tasks or left_threads:

@@ -36,7 +36,7 @@ CommandHandler = Callable[[Any, "CommandContext"], Awaitable[None]]
 # The one task helper, and the only way a long-lived task starts. It keeps a strong reference to the
 # task and reports an unexpected exception as a `LogEvent`. `ActioAgent._spawn` has exactly this shape,
 # which is why the watcher and the status publisher take a `Spawn` instead of importing the agent: it
-# also lets a test pass a small local one (*Agent Lifecycle*, D-9, D-23).
+# also lets a test pass a small local one (*Workflow*, D-9, D-23).
 type Spawn = Callable[[Coroutine[Any, Any, Any], str], asyncio.Task[Any]]
 
 

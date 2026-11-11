@@ -1,4 +1,4 @@
-"""Time and identity primitives (`../actio-ts/src/util.ts`, the *File Format* rules). WP1.
+"""Time and identity primitives, as `../actio-ts/src/util.ts` has them (*Conventions*, *Envelope lifecycle*).
 
 `format_iso` writes the protocol's timestamp at **whole-second** resolution: UTC,
 `YYYY-MM-DDTHH:MM:SSZ`, the floor of the seconds, because that is what `common.schema.json`'s
@@ -7,7 +7,7 @@
 exact pattern or `None`, and a date that does not survive the round trip (`2026-02-30T00:00:00Z`) is
 `None` too. Neither raises: reading a peer's file must not crash the agent (D-15).
 
-Seconds, not milliseconds: every duration in this package is a float of seconds (D-21, §5.3), so these
+Seconds, not milliseconds: every duration in this package is a float of seconds (*Timers and thresholds*), so these
 two take and return seconds where `util.ts` takes and returns milliseconds.
 """
 

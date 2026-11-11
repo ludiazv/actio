@@ -1,8 +1,8 @@
 """`ActioAgent`: the lifecycle, lane C (its own capability registrations), the commands, and the public
-API (*Agent Lifecycle*, *Agent's status*, *Namespaces*, D-8, D-9, D-10).
+API (*Workflow*, *Agent's status*, *Callability rules*, D-8, D-9, D-10).
 
 The signature below is the frozen one: keyword-only, and `namespaces=None` means the field is **absent**
-from `spec.json`, not `null` inside it (*Namespaces*). Nothing of the environment is read until `start()`,
+from `spec.json`, not `null` inside it (*Callability rules*). Nothing of the environment is read until `start()`,
 so a bad `ACTIO_SYNC` surfaces there (D-21).
 
 An agent belongs to one event loop and is not thread-safe. It installs no signal handler and starts no

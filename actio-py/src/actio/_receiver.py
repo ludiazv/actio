@@ -1,5 +1,5 @@
-"""Lane A (inbound requests) and lane D (commands): the receiver of one agent (*Workflows A and D*,
-*Acceptance errors*, D-3, D-4, D-5, D-7, D-8, D-11, D-15). WP5.
+"""Lane A (inbound requests) and lane D (commands): the receiver of one agent (*Workflow*,
+*Acceptance errors*, D-3, D-4, D-5, D-7, D-8, D-11, D-15).
 
 The receiver owns the inbox watch and the per-`rid` state of the exchanges it has accepted. Nothing here
 runs a thread: it watches one folder through the agent's `Watcher` (D-23) and looks again when woken.
@@ -7,9 +7,12 @@ runs a thread: it watches one folder through the agent's `Watcher` (D-23) and lo
 - Startup recovery (D-4) re-arms exchanges from the files that are still in the inbox.
 - A `rid` already archived in this run is ignored, not re-served (D-5).
 - Every later file of an exchange must carry the same header, `datetime` aside (D-11).
-- A handler never crashes the agent: an `Exception` becomes an error response with `msg` and no `code`
-  (plan §4 semantics 3), and `ActioError` keeps its code.
-- Archive is two steps in this order (D-11…D-16, v1.8): the `inreq` line, then the deletions.
+- A handler never crashes the agent: an `Exception` becomes an error response with `msg` and no `code`,
+  and `ActioError` keeps its code.
+- Archive is two steps in this order (D-11…D-16): the `inreq` line, then the deletions.
+- A file taken from a folder is classified by its **body key** with `_validate.envelope_kind`, never by
+  its name: to a receiver `<id>.announce.json` can be a perfectly good `nuntium`, and the name says nothing
+  about the body. `file_kind` is the command's rule, not this one.
 - Commands: `stop`, `enable`, `restart`, `ping` are mandatory and never advertised (D0).
 """
 

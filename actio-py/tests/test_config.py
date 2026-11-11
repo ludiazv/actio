@@ -1,4 +1,4 @@
-"""`_config.py` (WP0 owns it): defaults, the environment, precedence, and the clock seam (D-14).
+"""`_config.py`: defaults, the environment, precedence, and the clock seam (D-14).
 
 Durations are **seconds** here, as everywhere in asyncio; the three protocol timers read from the
 environment are given in seconds too, as the spec's *Timers and thresholds* says. A bad value is an

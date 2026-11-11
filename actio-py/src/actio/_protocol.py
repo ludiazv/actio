@@ -3,12 +3,12 @@
 No generator and no marshalling layer: an envelope is a plain `dict`, and `json.load` of one *is* a value
 of these types. `tests/test_protocol_drift.py` compares every one of them against the schema node it
 mirrors — key sets, required keys, types, and every `enum` in the 11 schemas — and its mutation controls
-prove that comparison bites, so a type here cannot drift from a schema unnoticed (plan §14's gate 3).
+prove that comparison bites, so a type here cannot drift from a schema unnoticed.
 
 `from __future__ import annotations` is deliberately **not** used here: stringified annotations would
 break the `NotRequired` bookkeeping the drift test reads (`__required_keys__` and `__annotations__`).
 
-The names follow the schemas' snake_case, not the reference's camelCase (§11). Durations are seconds,
+The names follow the schemas' snake_case, not the reference's camelCase (*Schemas*). Durations are seconds,
 `ts` is a Unix epoch second (`common.schema.json#/$defs/ts`), and `datetime` is the UTC pattern of
 `common.schema.json#/$defs/datetime`, which has **no** milliseconds field.
 """
@@ -16,7 +16,7 @@ The names follow the schemas' snake_case, not the reference's camelCase (§11). 
 from typing import Literal, NotRequired, TypedDict
 
 # Leaf scalars. The schemas constrain them with patterns, not types; the pattern is in the comment, and
-# the validator enforces it (G-5), so here they are strings.
+# the validator enforces the patterns, so here they are only strings.
 Ts = int  # Unix epoch seconds, 64-bit, >= 0
 IsoDateTime = str  # YYYY-MM-DDThh:mm:ssZ
 Rid = str  # ULID, Crockford base32: ^[0-7][0-9A-HJKMNP-TV-Z]{25}$
@@ -40,7 +40,7 @@ AnyValue = object  # `parameters` and `result` have no schema type: any JSON val
 
 
 class ActioMeta(TypedDict, total=False):
-    """`.actio/actio.json`: team metadata, read-only for agents (§3.1). All fields optional."""
+    """`.actio/actio.json`: team metadata, read-only for agents (*Team metadata*). All fields optional."""
 
     actio_version: ProtocolVersion
     description: str
@@ -48,11 +48,12 @@ class ActioMeta(TypedDict, total=False):
 
 
 class Header(TypedDict):
-    """The six public fields at the top of every envelope file — no nested `header` key (§3.1).
+    """The six public fields at the top of every envelope file — no nested `header` key (*Envelope lifecycle*).
 
-    Every file of an exchange repeats these values, and only `datetime` changes (D-15). `type` is `cmd`
-    for a command and `req` for a request and everything that belongs to one; which envelope a file is
-    comes from its *name*, never from `type` (D-18).
+    Every file of an exchange repeats these values, and only `datetime` changes (D-11). `type` is `cmd`
+    for a command and `req` for a request and everything that belongs to one — a `cancellation`, a
+    `response` and a `confirmation` are all `req`, so `type` does not say which envelope a file is: the
+    **body key** does (*Requests*). A file name is a recommendation; only the `actio` command reads it.
     """
 
     rid: Rid
@@ -76,13 +77,13 @@ class RequestBody(TypedDict):
 
 
 class RequestFile(Header):
-    """`<rid>.json` in the inbox of the receiver. `request` is a base64 string when encrypted (§7)."""
+    """`<rid>.json` in the inbox of the receiver. `request` is a base64 string when encrypted (*Security*)."""
 
     request: RequestBody | str
 
 
 class CancellationBody(TypedDict):
-    """The `cancellation` of a cancellation file; commands cannot be cancelled (§4.5)."""
+    """The `cancellation` of a cancellation file; commands cannot be cancelled (*Cancellation*)."""
 
     ts: Ts
     nonce: Nonce
@@ -103,7 +104,7 @@ class CancellationFile(Header):
 
 
 class ResponseBody(TypedDict):
-    """The `response` of a response file (§4.3).
+    """The `response` of a response file (*Response*).
 
     A cancellation response has `cancellation: true`, `error: false`, `result: null` and no attachments;
     `error: true` makes `result` an `ErrorResult`. Both are `if`/`then` in the schema, and the receiver
@@ -121,13 +122,13 @@ class ResponseBody(TypedDict):
 
 
 class ResponseFile(Header):
-    """`<rid>.res.json` in the inbox of the *writer of the request* — the receiver's own inbox (§4.3)."""
+    """`<rid>.res.json` in the inbox of the *writer of the request* — the receiver's own inbox (*Response*)."""
 
     response: ResponseBody | str
 
 
 class ConfirmationBody(TypedDict):
-    """The `confirmation` of a confirmation file: receipt of a response that has been captured (§4.4)."""
+    """The `confirmation` of a confirmation file: receipt of a response that has been captured (*Response Confirmation*)."""
 
     ts: Ts
     nonce: Nonce
@@ -141,7 +142,7 @@ class ConfirmationFile(Header):
 
 
 class ErrorResult(TypedDict):
-    """The `result` of an error response; the acceptance codes come from the spec (§4.3.1)."""
+    """The `result` of an error response; the acceptance codes come from the protocol (*Acceptance errors*)."""
 
     msg: str
     code: NotRequired[int]
@@ -149,14 +150,14 @@ class ErrorResult(TypedDict):
 
 
 class SecurityAttribute(TypedDict):
-    """One `security` entry of a spec: a key and its value, e.g. a public key (§3.1)."""
+    """One `security` entry of a spec: a key and its value, e.g. a public key (*Security features*)."""
 
     key: str
     value: str
 
 
 class CapabilityActio(TypedDict):
-    """The `actio` part of a capability: `result` is required; the rest has defaults (§3.1).
+    """The `actio` part of a capability: `result` is required; the rest has defaults (*Agent Spec*).
 
     `skill`, `tool`, `tool_name` and `sync` are harness hints: the protocol never reads them, and
     `_spec_builder` passes them through.
@@ -174,7 +175,7 @@ class CapabilityActio(TypedDict):
 
 
 class Capability(TypedDict):
-    """An OpenAI tool definition plus `actio`; all four keys are required (§3.1)."""
+    """An OpenAI tool definition plus `actio`; all four keys are required (*Agent Spec*)."""
 
     name: CapabilityName
     description: str
@@ -183,7 +184,7 @@ class Capability(TypedDict):
 
 
 class Spec(TypedDict):
-    """`spec.json`: identity, capabilities and security features of an agent (§3.1)."""
+    """`spec.json`: identity, capabilities and security features of an agent (*Agent Spec*)."""
 
     id: AgentId
     actio_version: ProtocolVersion
@@ -202,7 +203,7 @@ class Spec(TypedDict):
 
 
 class CapabilityStatusEntry(TypedDict):
-    """One entry of `capability_status`: how many requests run and how many wait (D-7)."""
+    """One entry of `capability_status`: how many requests run and how many wait (*Agent's status*)."""
 
     name: CapabilityName
     running: int
@@ -221,7 +222,7 @@ class StatusTask(TypedDict):
 
 
 class Status(TypedDict):
-    """`status.json`: written on every change and at least every 90 s (§3.1, G-2)."""
+    """`status.json`: written on every change and at least every heartbeat period (*Agent's status*, *Timers and thresholds*)."""
 
     id: AgentId
     status: StatusState
@@ -234,7 +235,7 @@ class Status(TypedDict):
 
 
 class Announce(TypedDict):
-    """`nuntium/<id>.n.json` (and `nuntium/nuntium.json` for a broadcast): signal only (§3.1, §4.5.1)."""
+    """`nuntium/<id>.n.json` (and `nuntium/nuntium.json` for a broadcast): signal only (*Announcement and Discovery*)."""
 
     id: AgentId
     datetime: IsoDateTime
@@ -243,7 +244,7 @@ class Announce(TypedDict):
 
 
 class ExchangeRecord(TypedDict):
-    """The `event_data` of an `inreq` or `outreq` line: the envelopes, encrypted as they were (§8).
+    """The `event_data` of an `inreq` or `outreq` line: the envelopes, encrypted as they were (*Diarium*).
 
     `final_status` is `cancelled|completed|confirmed|dropped` for `inreq` and
     `confirmed|cancelled|abandoned|sent` for `outreq` — two `Literal`s, not one, because the sets differ.
@@ -257,7 +258,7 @@ class ExchangeRecord(TypedDict):
 
 
 class DiariumEntry(TypedDict):
-    """One line of `diarium.jsonl` (§8). `event_data` depends on `event`, and can be null."""
+    """One line of `diarium.jsonl` (*Diarium*). `event_data` depends on `event`, and can be null."""
 
     id: AgentId
     datetime: IsoDateTime

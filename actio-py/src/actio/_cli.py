@@ -1,5 +1,5 @@
-"""The `actio` command: the same subcommands, flags, output and exit codes as the reference CLI (§6,
-`../actio-ts/src/cli.ts`). WP8.
+"""The `actio` command: the same subcommands, flags, output and exit codes as the reference CLI,
+`../actio-ts/src/cli.ts`.
 
 `ls`, `diarium <agent> [-n N]`, `call <src-id> <dst> <capability> <json-params> [--timeout s]` (default
 60, never 0), `cmd <src-id> <dst> <name> [json-params]`, `broadcast "<text>"`, `validate <file>
@@ -7,7 +7,7 @@
 
 Two Python traps: `argparse` exits with code 2 on a usage error, which must be overridden to match the
 reference's codes, and `validate` decides the kind through `_validate.file_kind` — never a second copy
-of the name rule, which is how `actio-go` came to reject every real announce file (§6, v1.8).
+of the name rule, which is how `actio-go` came to reject every real announce file (*Announcement and Discovery*).
 """
 
 from __future__ import annotations

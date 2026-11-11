@@ -1,10 +1,9 @@
-"""Protocol validators, the one rejection reason, `check_params`, and capability schemas (D-15, D-19). WP2.
+"""Protocol validators, the one rejection reason, `check_params`, and capability schemas (D-15, D-19).
 
-The schemas in `schemas/` are authoritative at run time (G-5): every protocol document is validated
-before it is written and after it is read. A rejection is reported as **one line** built from the path
-and the schema, never from the peer's value (D-15), because the reason reaches `IgnoredEvent`,
-`IgnoredFile`, `IgnoredLine` and the diarium. Start from the oracle's sketch at
-`orchestra/oracle/sketches/lessons_fmt.py.txt`, which is probed over all 111 vectors and hostile values.
+The schemas in `schemas/` are authoritative at run time: every protocol document is validated before it
+is written and after it is read. A rejection is reported as **one line** built from the path and the
+schema, never from the peer's value (D-15), because the reason reaches `IgnoredEvent`, `IgnoredFile`,
+`IgnoredLine` and the diarium.
 
 Capability schemas are per capability, on an empty `referencing.Registry()`: a peer's `$ref` can reach
 out otherwise (D-19). A peer schema that will not run here skips the check and logs once; a schema that
@@ -42,9 +41,15 @@ def schema(kind: SchemaKind) -> dict[str, Any]:
 
 
 def file_kind(name: str) -> SchemaKind | None:
-    """The one name inference of the protocol files, including announces (plan §6): `spec.json`,
-    `status.json`, `actio.json`, `diarium.jsonl`, `<id>.n.json` and `nuntium.json` as announces,
-    `.can`/`.res`/`.con`, and any other `.json` as a request."""
+    """The one name inference, and it exists for the `actio validate` command (D-15).
+
+    A loose file being validated has no body key of its own to go by, so the CLI reads the name:
+    `spec.json`, `status.json`, `actio.json`, `diarium.jsonl`, `<id>.n.json` and `nuntium.json` are
+    announces, `.can`/`.res`/`.con` mark the rest of an exchange, and any other `.json` is a request.
+    The *receiver* classifies an envelope by its **body key** with `envelope_kind` and never by this
+    function: to a receiver `<id>.announce.json` can be a perfectly good `nuntium`, and a name says
+    nothing about a body. A name is never authority to accept a document; `None` says the name tells us
+    nothing."""
     raise NotImplementedError("WP2")
 
 
@@ -55,17 +60,20 @@ def reason(error: Any) -> str:
 
 
 def malformed_reason(error: BaseException) -> str:
-    """An inbox file that is not JSON: `malformed JSON: <the parser's error>` (D-15, v1.7)."""
+    """An inbox file that is not JSON: `malformed JSON: <the parser's error>` (D-15)."""
     raise NotImplementedError("WP2")
 
 
 def validate(kind: SchemaKind, value: Any) -> str | None:
-    """None when the document is valid; the one-line reason when it is not (G-5)."""
+    """None when the document is valid; the one-line reason when it is not."""
     raise NotImplementedError("WP2")
 
 
 def envelope_kind(value: Any) -> EnvelopeKind | None:
-    """Which envelope a decoded object is, by its single body key (*Files* rule 2)."""
+    """Which envelope a decoded object is, by its single **body key** (*Requests*) — never its name.
+
+    This is how a receiver classifies what it finds in a folder: `<id>.announce.json` can be a perfectly
+    good `nuntium`. `None` means it is not an envelope at all: ignore it, and say why."""
     raise NotImplementedError("WP2")
 
 

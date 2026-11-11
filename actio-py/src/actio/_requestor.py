@@ -1,4 +1,4 @@
-"""Lane B: requests and commands to other agents (*Workflows B and C*, D-6, D-12, D-18, D-22). WP6.
+"""Lane B: requests and commands to other agents (*Workflow*, D-6, D-12, D-18, D-22).
 
 An exchange subscribes to the destination inbox on the agent's one watcher **before** it writes the
 request, then loops: clear `changed`, look for its own `<rid>.res.json`, then wait on `changed`, the
@@ -6,8 +6,8 @@ timeout, the cancel flag and stop (D-18). It unsubscribes when the exchange ends
 special case.
 
 - `timeout > 0`: at expiry, `B4` (write the cancellation), wait up to `cancel_wait_timeout`, then
-  abandon. `timeout == 0`: wait forever unless `cancel` is set or the caller's task is cancelled (§4
-  semantics 1) — and then the exchange still ends correctly in the background.
+  abandon. `timeout == 0`: wait forever unless `cancel` is set or the caller's task is cancelled — and
+  then the exchange still ends correctly in the background.
 - A peer's error answer is not an exception: the outcome carries `response["error"] is True`.
 - A response whose `result` fails the capability's `result` schema raises `ActioResultError` (D-12).
 """

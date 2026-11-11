@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import threading
 import unittest
+import weakref
 
 import helpers
 
@@ -65,7 +67,7 @@ class NoLeftoversTest(unittest.IsolatedAsyncioTestCase):
 
 class _FakeAgent:
     """What an agent looks like to the base class: `start` arms a task and a watcher thread; `stop`
-    takes both away. The real agent is WP7's; the check cannot tell them apart."""
+    takes both away. The base class cannot tell this apart from the real agent, which is the point."""
 
     def __init__(self) -> None:
         self._hold = asyncio.Event()
@@ -116,11 +118,39 @@ class BaseClassTest(unittest.TestCase):
     def test_the_base_class_fails_a_test_that_leaves_its_agent_running(self) -> None:
         class LeavesIt(helpers.ActioTestCase):
             async def test_one_agent(self) -> None:
-                agent = _FakeAgent()
-                await agent.start()
+                # On `self`, not a local: a real agent is kept alive by the cleanup that stops it, and a
+                # task with no strong reference can vanish before the check sees it (that is the trap the
+                # plan's hygiene grep exists for, and it showed up as a difference between 3.13 and 3.14).
+                self.agent = _FakeAgent()
+                await self.agent.start()
 
         result = run_one(LeavesIt, "test_one_agent")
         self.assertEqual(len(result.failures), 1, "a running agent must fail the base class")
         self.assertIn("left something armed", result.failures[0][1])
         self.assertIn("fake-agent-receiver", result.failures[0][1])
         self.assertIn("fake-watcher", result.failures[0][1])
+
+    def test_the_baseline_keeps_its_tasks_alive(self) -> None:
+        """Identity is only sound if the compared objects stay alive.
+
+        A set of `id()`s lets a finished baseline task be freed and its address reused by a leftover,
+        which then matches the baseline and hides — found on 3.13 under `-X dev`, where the reuse happened
+        and the same test that passed on 3.14 reported no tasks at all. The helper therefore holds the
+        tasks themselves, so this weak reference must survive the test.
+        """
+        held: list[bool] = []
+
+        class HoldsBaseline(helpers.ActioTestCase):
+            async def asyncSetUp(self) -> None:
+                self.decoy = asyncio.create_task(asyncio.Event().wait(), name="baseline-task")
+                await asyncio.sleep(0)
+                await super().asyncSetUp()  # the decoy is in the baseline from here on
+                self.ref = weakref.ref(self.decoy)
+                del self.decoy
+
+            async def test_nothing(self) -> None:
+                gc.collect()
+                held.append(self.ref() is not None)
+
+        run_one(HoldsBaseline, "test_nothing")
+        self.assertEqual(held, [True], "the baseline must hold its tasks, not their ids")

@@ -1,5 +1,5 @@
 """The sync providers (D-21), parsed from `ACTIO_SYNC`: `none`, `delay[:<ms>]`, `fsync+delay[:<ms>]`,
-`mutagen:<session>`. WP1.
+`mutagen:<session>`.
 
 The value's unit is **milliseconds** (it is the protocol's own storage knob, not an asyncio timer).
 A delay must be an integer in 1-10 000; omitted means 50. A mutagen run never throws into protocol

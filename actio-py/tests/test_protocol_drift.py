@@ -1,5 +1,5 @@
 """D-20's drift test: `schemas/` and `_protocol.py` must say the same thing, and D-20's mutations prove
-that the test is sharp (plan §9, §14's gate 3).
+that the comparison is sharp.
 
 Three rules, per pinned pair of schema node and `TypedDict`: every schema property has a key with that
 name and vice versa; `__required_keys__` matches `required`; and the property's type matches its
@@ -367,7 +367,7 @@ class DriftTest(unittest.TestCase):
 
 
 class MutationTest(unittest.TestCase):
-    """D-20's negative controls: each one must make the drift test fail (plan §14, gate 3)."""
+    """D-20's negative controls: each one must make the drift test fail."""
 
     def setUp(self) -> None:
         self.schemas = load_schemas()

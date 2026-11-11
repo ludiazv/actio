@@ -1,7 +1,7 @@
 """D-20: `src/actio/schemas/` is a byte-identical committed copy of `../doc/schemas/`, and the copy is
 usable — it parses, it passes the metaschema, and every `$ref` in it resolves.
 
-The schemas are authoritative at run time (G-5), so a copy that drifts from the source is a protocol bug
+The schemas are authoritative at run time, so a copy that drifts from the source is a protocol bug
 waiting to happen; the drift test reads this copy, so the two tests together tie the code to
 `../doc/schemas/`. Only `jsonschema` is used here (D-21): cross-file `$ref` resolution is checked as JSON,
 not through a resolver, so no second dependency sneaks in.
@@ -99,9 +99,11 @@ class UsableSchemasTest(unittest.TestCase):
 
 
 class CommonDefsTest(unittest.TestCase):
-    """The leaf constraints of `common.schema.json`, pinned here because the plan's prose describes two
-    of them wrongly: `datetime` has **no** milliseconds, and `ts` is an epoch **integer** (§11, D-8).
-    The schemas win (D-16), and `_util.format_iso` must emit what these accept."""
+    """The leaf constraints of `common.schema.json`, pinned because they are easy to read wrongly.
+
+    `datetime` has **no** fractional second: the pattern says so, and every example in the protocol is
+    whole seconds. `ts` is an epoch **integer** in seconds, not a string. The schemas are the authority at
+    run time (D-16), and `format_iso` must emit exactly what these accept."""
 
     def setUp(self) -> None:
         self.defs = installed()["common.schema.json"]["$defs"]

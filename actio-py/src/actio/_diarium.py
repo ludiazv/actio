@@ -1,9 +1,8 @@
-"""The diarium: the agent's own event log, one JSON object per line (Diarium, WP3).
+"""The diarium: the agent's own event log, one JSON object per line (*Diarium*).
 
 Five protocol events: `status`, `announce`, `inreq`, `outreq`, `log`. An implementation may define its
-own; the builders here produce only the protocol's, and `append` validates before writing (G-5), so an
-invalid line means a bug in this package, not a peer. Archive is two steps in one order (D-11…D-16,
-v1.8): the `inreq` line first, then the deletion of the exchange's files.
+own; the builders here produce only the protocol's, and `append` validates the line before writing it, so an
+invalid line means a bug in this package, not a peer. Archive is two steps in one order (D-11…D-16): the `inreq` line first, then the deletion of the exchange's files.
 """
 
 from __future__ import annotations
@@ -49,7 +48,7 @@ def outreq_event(
 
 
 async def append(folder: str, entry: DiariumEntry, provider: SyncProvider) -> None:
-    """Append one validated line to `<folder>/diarium.jsonl`; raises on an invalid entry (G-5)."""
+    """Append one validated line to `<folder>/diarium.jsonl`; raises on an invalid entry."""
     raise NotImplementedError("WP3")
 
 

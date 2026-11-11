@@ -1,4 +1,4 @@
-"""The file layer: the only module in `src` that touches the filesystem (§5.3). WP1.
+"""The file layer: the only module in `src` that touches the filesystem.
 
 Every whole operation runs in `asyncio.to_thread`, so the loop never blocks on a disk write. There is
 no module state: the sync provider of the agent is passed in, and its hooks are applied here rather
@@ -20,7 +20,7 @@ def dumps(obj: Any) -> str:
 
 
 def loads(text: str) -> Any:
-    """The one JSON reader: raises on NaN, Infinity and nesting too deep (D-15, the traps table)."""
+    """The one JSON reader: raises on NaN, Infinity and nesting too deep (D-15)."""
     raise NotImplementedError("WP1")
 
 

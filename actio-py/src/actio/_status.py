@@ -1,7 +1,7 @@
 """Self-publication: `spec.json`, `status.json`, the announce file, the heartbeat, and health
-(*Agent's status*, *Timers and thresholds*, *Version*, D-8, D-9).
+(*Agent's status*, *Timers and thresholds*, *Conventions*, D-8, D-9).
 
-Every write here is validated first (G-5): we produced the document, so a rejection is our bug and
+Every write here is validated first: we produced the document, so a rejection is our bug and
 raises. The health thresholds are protocol constants, not configuration. `StatusPublisher` is the only
 place in the package that takes an `asyncio.Lock`: two `to_thread` writes to one file can finish in
 either order, and a write must survive its awaiter being cancelled (D-9) — so the locked section is its
