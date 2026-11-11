@@ -11,7 +11,9 @@ import json
 import unittest
 from pathlib import Path
 from typing import Any, cast
+from unittest import mock
 
+from actio import _discovery, _files
 from actio._discovery import agent_view, scan
 from actio._protocol import Capability, CapabilityActio, Spec, Status
 from actio._types import DiscoveredAgent
@@ -374,6 +376,30 @@ class AgentViewTest(unittest.TestCase):
                 self.assertIsNotNone(view, f"a {expected} peer must stay in the view")
                 assert view is not None
                 self.assertEqual(view.health, expected)
+
+
+class ScanShapeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_a_scan_of_the_tree_is_one_thread_hop(self) -> None:
+        """A scan of the tree is one call into the file layer, not one per file. The measure is the
+        entries, not the clock: a scan that read one file per hop passes every other test in this file
+        and switches 1 + 2N + 1 times, which is what a slow disk or a network mount would show."""
+        with actio_tree() as tree:
+            for name in ("alpha", "beta", "gamma", "delta"):
+                agent_folder(tree, name, name)
+            hops = 0
+            real = _files.scan_tree
+
+            async def counting(*args: Any) -> Any:
+                nonlocal hops
+                hops += 1
+                return await real(*args)
+
+            with mock.patch.object(_discovery, "scan_tree", counting):
+                result = await scan(str(tree))
+            self.assertEqual(
+                [a.spec["id"] for a in result.agents], ["alpha", "beta", "delta", "gamma"]
+            )
+            self.assertEqual(hops, 1, f"the scan took {hops} calls into the file layer")
 
 
 if __name__ == "__main__":

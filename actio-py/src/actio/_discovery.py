@@ -1,11 +1,13 @@
 """Discovery: the scan of the tree, and the callability rules (*Announcement and Discovery*, *Callability rules* 1-8).
 
-`scan` reads through `_files.py` and nothing else: one folder listing, then one read per publication
-file (`actio.json`, each `spec.json`, each `status.json`) — a scan of N agents is 1 + 2N + 1 hops, each
-one a folder or file read. It returns what it found, the duplicate ids and the ignored files with a
-reason. The callability rules then decide what the caller may use: `agent.agmen()` is the view after those rules,
-never the raw scan. Rule 4's namespace reading treats absent, `null` and `[]` as the null namespace, and
-`"*"` shares with everyone (*Callability rules*).
+`scan` reads through `_files.py` and nothing else, in **one** thread hop: Python has no async file
+API, so every file call is a hop, and `_files.scan_tree` makes a scan of the tree (*Announcement and
+Discovery* step 4 reads every folder's `spec.json` and `status.json`) one hop rather than one per file.
+Everything after that hop is parsing and deciding. It returns what it
+found, the duplicate ids and the ignored files with a reason. The callability rules then decide what the
+caller may use: `agent.agmen()` is the view after those rules, never the raw scan. Rule 4's namespace
+reading treats absent, `null` and `[]` as the null namespace, and `"*"` shares with everyone
+(*Callability rules*).
 
 `DiscoveredAgent.status` is typed `Status | None` in the frozen `_types.py`, but the scan never produces
 `None`: a folder without a `status.json` is not an agent (*Announcement and Discovery* step 2) and is
@@ -17,7 +19,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from ._files import list_dir, loads, read_text, unreadable_reason
+from ._files import Publication, loads, scan_tree
 from ._protocol import AgentId, Capability, Spec
 from ._status import health
 from ._types import AgentView, DiscoveredAgent, IgnoredFile, ScanResult
@@ -26,69 +28,61 @@ from ._validate import malformed_reason, unique_capability_names, validate
 # *Announcement and Discovery* step 1: the reserved folders are never agents.
 _RESERVED: frozenset[str] = frozenset({"tools", "forum", "nuntium"})
 
+# The files a scan reads: the team metadata at the root, the two publications in every agent folder.
+_PUBLICATIONS: tuple[str, ...] = ("actio.json", "spec.json", "status.json")
 
-async def _read_publication(path: str) -> tuple[str, Any, str]:
-    """One publication file as `(kind, value, reason)`: `kind` is `missing`, `unreadable`,
-    `unparsable` or `json`. A file that exists but cannot be read or parsed is reported, never
-    raised and never silent (D-15)."""
+
+def _document(pub: Publication) -> tuple[Any, str]:
+    """The document a publication holds, or `None` with the reason it holds none: missing, unreadable or
+    unparsable are all reported, never raised and never silent (D-15)."""
+    if pub[0] != "text":
+        return None, pub[1]
     try:
-        text = await read_text(path)
-    except FileNotFoundError:
-        return "missing", None, ""
-    except UnicodeDecodeError as err:
-        return "unparsable", None, malformed_reason(err)
-    except OSError as err:
-        # D-15: one line, with the error's text and never a value of the peer's; `_files` words it,
-        # because only the reader knows what failed.
-        return "unreadable", None, unreadable_reason(err)
-    try:
-        return "json", loads(text), ""
+        return loads(pub[1]), ""
     except ValueError as err:
-        return "unparsable", None, malformed_reason(err)
+        return None, malformed_reason(err)
 
 
 async def _scan(root: str) -> ScanResult:
-    """The whole tree read: the one thing `scan` hands to the thread (*Files*: one switch)."""
+    """The tree read in one hop, then decided: the agents, the duplicate ids, the ignored files."""
     agents: list[DiscoveredAgent] = []
     duplicates: list[str] = []
     ignored: list[IgnoredFile] = []
     seen: set[AgentId] = set()
 
+    # One hop for the whole tree: the listing and every publication, in one thread.
+    rows = await scan_tree(root, _PUBLICATIONS, _RESERVED)
+
     # *Team metadata*: `actio.json` is optional and read-only for agents. The protocol asks that a
     # non-conforming one be ignored (*Strict format*); a conforming one has no place in the result.
     team_path = os.path.join(root, "actio.json")
-    kind, team, reason = await _read_publication(team_path)
-    if kind in ("unreadable", "unparsable"):
-        ignored.append(IgnoredFile(path=team_path, reason=reason))
-    elif kind == "json":
+    team, team_reason = _document(rows[""]["actio.json"])
+    if team is not None:
         team_err = validate("actio", team)
         if team_err is not None:
             ignored.append(IgnoredFile(path=team_path, reason=team_err))
+    elif team_reason:
+        ignored.append(IgnoredFile(path=team_path, reason=team_reason))
 
-    for name in sorted(
-        await list_dir(root)
-    ):  # a folder listing is a file call: it goes through _files
-        if name.startswith(".") or name in _RESERVED:
-            continue
+    for name in sorted(k for k in rows if k):  # `""` is the root: its row is the team metadata
         folder = os.path.join(root, name)
-        if not os.path.isdir(folder):
-            continue  # a file at the root (actio.json and the like) is not an agent folder
         spec_path = os.path.join(folder, "spec.json")
         status_path = os.path.join(folder, "status.json")
-        spec_kind, spec_doc, spec_reason = await _read_publication(spec_path)
-        status_kind, status_doc, status_reason = await _read_publication(status_path)
-        if spec_kind == "missing" or status_kind == "missing":
+        spec_pub, status_pub = rows[name]["spec.json"], rows[name]["status.json"]
+        if spec_pub[0] == "missing" or status_pub[0] == "missing":
             # step 2: a folder that has not published both files is not an agent
-            for file, file_kind in ((spec_path, spec_kind), (status_path, status_kind)):
-                if file_kind == "missing":
+            for path, pub in ((spec_path, spec_pub), (status_path, status_pub)):
+                if pub[0] == "missing":
                     ignored.append(
-                        IgnoredFile(path=file, reason=f"missing {os.path.basename(file)}")
+                        IgnoredFile(path=path, reason=f"missing {os.path.basename(path)}")
                     )
             continue
-        if spec_kind != "json":
+        spec_doc, spec_reason = _document(spec_pub)
+        if spec_doc is None:
             ignored.append(IgnoredFile(path=spec_path, reason=spec_reason))
             continue
-        if status_kind != "json":
+        status_doc, status_reason = _document(status_pub)
+        if status_doc is None:
             ignored.append(IgnoredFile(path=status_path, reason=status_reason))
             continue
         spec_err = validate("spec", spec_doc)

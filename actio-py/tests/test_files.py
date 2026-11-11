@@ -27,7 +27,9 @@ from actio._files import (
     read_json,
     read_text,
     read_text_with_mtime,
+    read_tree,
     remove,
+    scan_tree,
     unreadable_reason,
     write_bytes_atomic,
     write_json_atomic,
@@ -274,3 +276,37 @@ class TextAndStatTest(unittest.IsolatedAsyncioTestCase):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("bb")
             self.assertGreaterEqual(await mtime_ns(path), first)
+
+
+class ReadTreeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_read_tree_reads_a_whole_scan_in_one_call(self) -> None:
+        """One call holds a whole scan of the tree, so the file layer is entered once. One entry for the
+        root (`""`), one per real folder
+        that is neither hidden nor reserved, and every file of it reported as it came back: `text`,
+        `missing`, `unreadable` or `unparsable` (D-15: a scan says what it skipped)."""
+        with actio_tree() as tree:
+            (tree / "actio.json").write_text('{"description": "the team"}', encoding="utf-8")
+            (tree / "alpha").mkdir()
+            (tree / "alpha/spec.json").write_text("{}", encoding="utf-8")
+            (tree / "alpha/status.json").write_text('{"id": "alpha"}', encoding="utf-8")
+            (tree / "broken").mkdir()
+            (tree / "broken/spec.json").mkdir()  # a directory where a file should be
+            (tree / "broken/status.json").write_bytes(b'{"id": "caf\xe9"}')  # not UTF-8: unparsable
+            (tree / "nuntium").mkdir()  # reserved: never read
+            (tree / ".hidden").mkdir()
+            (tree / "stray.txt").write_text("not a folder", encoding="utf-8")
+            files = ("actio.json", "spec.json", "status.json")
+            reserved = ("tools", "forum", "nuntium")
+            rows = await scan_tree(str(tree), files, reserved)
+            # the async call is only the hop: `read_tree` is the whole thing, run here on this thread
+            self.assertEqual(read_tree(str(tree), files, reserved), rows)
+
+        self.assertEqual(sorted(rows), ["", "alpha", "broken"])
+        self.assertEqual(rows[""]["actio.json"], ("text", '{"description": "the team"}'))
+        self.assertEqual(rows[""]["spec.json"], ("missing", ""))  # the root is a row like any other
+        self.assertEqual(rows["alpha"]["spec.json"][0], "text")
+        self.assertEqual(rows["alpha"]["status.json"][0], "text")
+        self.assertEqual(rows["broken"]["spec.json"][0], "unreadable")
+        self.assertTrue(rows["broken"]["spec.json"][1].startswith("unreadable: "))
+        self.assertEqual(rows["broken"]["status.json"][0], "unparsable")
+        self.assertTrue(rows["broken"]["status.json"][1].startswith("malformed JSON:"))

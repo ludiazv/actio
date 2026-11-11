@@ -19,12 +19,12 @@ import contextlib
 import json
 import os
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Container, Sequence
 from typing import Any
 
 from ._types import SyncProvider
 from ._util import nonce
-from ._validate import LIMIT
+from ._validate import LIMIT, malformed_reason
 
 
 def _reject_constant(name: str) -> Any:
@@ -259,6 +259,54 @@ async def read_bytes(path: str) -> bytes:
 async def list_dir(path: str) -> list[str]:
     """The entry names of a folder; raises `OSError` when it is gone (the caller decides)."""
     return await asyncio.to_thread(os.listdir, path)
+
+
+# What one publication file came back as: `("text", the text)`, `("missing", "")`, `("unreadable",
+# the reason)` or `("unparsable", the reason)`. A reason is one line and never a value of the peer's
+# (D-15); a file that is readable but not UTF-8 is unparsable, which is the parser's message, not this
+# module's, because the read itself succeeded.
+Publication = tuple[str, str]
+
+
+def read_publication(path: str) -> Publication:
+    """One file, reported rather than raised: the caller of a scan has to say what it skipped (D-15)."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except FileNotFoundError:
+        return "missing", ""
+    except OSError as err:
+        return "unreadable", unreadable_reason(err)
+    try:
+        return "text", data.decode()
+    except UnicodeDecodeError as err:
+        return "unparsable", malformed_reason(err)
+
+
+def read_tree(
+    root: str, files: Sequence[str], reserved: Container[str]
+) -> dict[str, dict[str, Publication]]:
+    """A whole discovery scan's reads in one call, so the scan is one thread hop: Python has no async
+    file API, and a hop per file would be one per agent on a network mount. The listing of `root`, then
+    `files` inside every entry that is a real folder, neither hidden nor
+    `reserved`. The row keyed `""` is the root's own, where the team metadata lives; a missing file is a
+    row too, so the caller never asks for it twice. A `root` that is gone raises `OSError`."""
+    rows: dict[str, dict[str, Publication]] = {
+        "": {name: read_publication(os.path.join(root, name)) for name in files}
+    }
+    for entry in sorted(os.listdir(root)):
+        folder = os.path.join(root, entry)
+        if entry.startswith(".") or entry in reserved or not os.path.isdir(folder):
+            continue
+        rows[entry] = {name: read_publication(os.path.join(folder, name)) for name in files}
+    return rows
+
+
+async def scan_tree(
+    root: str, files: Sequence[str], reserved: Container[str]
+) -> dict[str, dict[str, Publication]]:
+    """`read_tree` in a thread: the file layer's one hop for a scan of the whole tree."""
+    return await asyncio.to_thread(read_tree, root, files, reserved)
 
 
 async def make_dirs(path: str) -> None:
