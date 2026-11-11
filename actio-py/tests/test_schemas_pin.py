@@ -44,10 +44,18 @@ class InstalledSchemasTest(unittest.TestCase):
         )
 
 
-@unittest.skipUnless(
-    REFERENCE.is_dir(), f"the reference tree is not next to this checkout: {REFERENCE}"
-)
 class ByteIdenticalCopyTest(unittest.TestCase):
+    """The copy is byte-identical to `../doc/schemas/`.
+
+    A missing reference is a **failure**, not a skip (§9: no skip decorator, and a test whose input is
+    missing fails with a message). A validation copy that is cut from git alone must copy the reference
+    in beside it — the layout this test expects is `../doc/schemas` next to `actio-py`.
+    """
+
+    def setUp(self) -> None:
+        if not REFERENCE.is_dir():
+            self.fail(f"the reference tree is not next to this checkout: {REFERENCE}")
+
     def test_the_names_match_the_reference(self) -> None:
         self.assertEqual(
             sorted(p.name for p in COPY.glob("*.json")),
