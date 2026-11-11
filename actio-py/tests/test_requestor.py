@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import importlib
 import json
 import os
 import shutil
@@ -20,14 +22,15 @@ from pathlib import Path
 from typing import Any, cast
 
 from actio._config import load_config
+from actio._diarium import append, read_diarium
 from actio._protocol import DiariumEntry, ResponseBody, Spec, StatusState
 from actio._requestor import Requestor
 from actio._sync import create_sync_provider
-from actio._types import ActioEvent, AgentFolders, LogEvent
+from actio._types import ActioEvent, AgentFolders, LogEvent, OutreqEvent
 from actio._util import format_iso, nonce
 from actio._validate import SchemaKind, validate
 from actio._watch import Watcher
-from helpers import ActioTestCase, actio_tree, no_leftovers
+from helpers import ActioTestCase, actio_tree, no_leftovers, task_names
 
 AUDIT = 0.1  # watcher audit interval: generous on purpose, as in test_watch.py
 CANCEL_WAIT = 0.3  # config cancel_wait_timeout for the tests
@@ -141,7 +144,7 @@ class RequestorTestCase(ActioTestCase):
         self.hooks = FakeHooks()
         self.watcher = await Watcher.open(spawn, AUDIT)
         self.addAsyncCleanup(self.watcher.close)
-        self.requestor = Requestor(self.ctx, self.hooks, self.watcher)
+        self.requestor = Requestor(self.ctx, self.hooks, self.watcher, spawn)
 
     async def _wait_for_files(self, folder: Path, count: int, ceiling: float = WAKE) -> list[Path]:
         async with asyncio.timeout(ceiling):
@@ -427,10 +430,139 @@ class CommandTest(RequestorTestCase):
         self.assertEqual(cmd["type"], "cmd")
         self.assertEqual(cmd["request"]["name"], "stop")
         self.assertEqual(cmd["request"]["timeout"], 0)
-        # a command is not tracked: no exchange, no diarium line, no watcher left behind
+        # B1: for `type="cmd"` the lane appends an `outreq` event with `final_status="sent"` and only
+        # `req`. A command is never answered, so that line is the only record of it there will ever be.
+        lines = self._outreq_lines()
+        self.assertEqual([line["final_status"] for line in lines], ["sent"])
+        self.assertEqual(lines[0]["req"]["rid"], rid)
+        self.assertEqual(lines[0]["req"]["request"]["name"], "stop")
+        for key in ("can", "res", "con"):
+            self.assertIsNone(lines[0][key])
+        events = [e for e in self.ctx.events if isinstance(e, OutreqEvent)]
+        self.assertEqual([(e.rid, e.final_status) for e in events], [(rid, "sent")])
+        # and it is still not tracked: no exchange, no watcher folder, nothing armed
         self.assertEqual(self.requestor._exchanges, {})
-        self.assertEqual(self.ctx.diarium, [])
         self.assertEqual(self.watcher._folders, {})
+
+
+class OrderTest(RequestorTestCase):
+    """B3 and B5 in the protocol's order: the `outreq` line, the event, the confirmation, then the
+    attachments, which are deleted *after* the confirmation (*Envelope lifecycle*, B5)."""
+
+    async def test_the_line_the_event_the_confirmation_then_the_attachments(self) -> None:
+        order: list[str] = []
+        forum = str(self.ctx.folders.forum)
+        module = importlib.import_module("actio._requestor")
+        real_write, real_remove = module.write_json_atomic, module.remove
+
+        async def write(path: str, obj: Any, tmp_dir: str, provider: Any) -> None:
+            if path.endswith(".con.json"):
+                order.append("con")
+            await real_write(path, obj, tmp_dir, provider)
+
+        async def remove(path: str) -> None:
+            if path.startswith(forum):
+                order.append("delete")
+            await real_remove(path)
+
+        class Ordered(FakeContext):
+            async def append_diarium(self, entry: DiariumEntry) -> None:
+                order.append(f"line:{cast('dict[str, Any]', entry['event_data'])['final_status']}")
+
+            def emit(self, event: ActioEvent) -> None:
+                if isinstance(event, OutreqEvent):
+                    order.append("event")
+                super().emit(event)
+
+        self.ctx.__class__ = Ordered
+        attachment = self.root / "in.txt"
+        attachment.write_text("body", encoding="utf-8")
+        with (
+            mock.patch.object(module, "write_json_atomic", write),
+            mock.patch.object(module, "remove", remove),
+        ):
+            task = asyncio.create_task(
+                self.requestor.request(
+                    "summarizer",
+                    "summarize",
+                    {"t": "x"},
+                    timeout=TIMEOUT,
+                    attachments=[str(attachment)],
+                )
+            )
+            req = (await self._wait_for_files(self.peer_inbox, 1))[0]
+            await write_response(self.peer_inbox, json.loads(req.read_text(encoding="utf-8")))
+            outcome = await asyncio.wait_for(task, WAKE)
+        self.assertEqual(outcome.final_status, "confirmed")
+        self.assertEqual(order, ["line:confirmed", "event", "con", "delete"])
+
+
+class DiskContext(FakeContext):
+    """The diarium on the real disk, through a `delay` provider.
+
+    The append yields the loop after its thread has returned, which is the window a settlement can be
+    raced in; `appending` says when it has begun, so the test needs no timing assumption."""
+
+    appending: asyncio.Event
+
+    async def append_diarium(self, entry: DiariumEntry) -> None:
+        self.appending.set()  # the settlement is inside its append: the line is not on disk yet
+        await asyncio.to_thread(time.sleep, 0.4)  # a slow disk: the thread is what takes the time
+        await append(self.folders.agent, entry, self.sync)
+
+
+class SettlementTest(RequestorTestCase):
+    """A `stop` during a settlement (D-9): the `outreq` line the lane owes is on disk when `stop()`
+    returns, and nothing is armed afterwards."""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.ctx.__class__ = DiskContext
+        ctx = cast("DiskContext", self.ctx)
+        ctx.appending = asyncio.Event()
+        self.disk = ctx
+        self.agent_folder = str(self.root / "planner")
+
+    async def _statuses_on_disk(self) -> list[str]:
+        read = await read_diarium(self.agent_folder)
+        return [
+            cast("dict[str, Any]", entry["event_data"])["final_status"]
+            for entry in read.lines
+            if entry["event"] == "outreq"
+        ]
+
+    def _armed(self) -> set[str]:
+        # the lane's own tasks: the finisher and the settlement. The watcher's audit task is the
+        # watcher's, and the test closes it.
+        return {n for n in task_names() if n.startswith(("actio.out.", "actio.settle."))}
+
+    async def test_a_stop_during_a_cancelled_callers_settlement_still_writes_the_line(self) -> None:
+        caller = asyncio.create_task(self.requestor.request("summarizer", "summarize", timeout=0))
+        await self._wait_for_files(self.peer_inbox, 1)
+        await asyncio.sleep(0.05)  # B1's write has landed and the lane has entered B2
+        caller.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await caller
+        # The background finisher does B4, waits out the cancel, and is inside the append by now.
+        await asyncio.wait_for(self.disk.appending.wait(), WAKE)
+        await self.requestor.stop()
+        self.assertEqual(await self._statuses_on_disk(), ["abandoned"])
+        self.assertEqual(self.requestor._exchanges, {})
+        self.assertEqual(self._armed(), set())
+
+    async def test_a_stop_during_a_live_callers_settlement_still_writes_the_line(self) -> None:
+        caller = asyncio.create_task(
+            self.requestor.request("summarizer", "summarize", timeout=TIMEOUT)
+        )
+        await self._wait_for_files(self.peer_inbox, 1)
+        await asyncio.sleep(0.05)  # B1's write has landed and the lane has entered B2
+        # The timeout fires, B4 runs, the cancel wait expires: the live caller is mid-append.
+        await asyncio.wait_for(self.disk.appending.wait(), WAKE)
+        await self.requestor.stop()
+        self.assertEqual(await self._statuses_on_disk(), ["abandoned"])
+        self.assertEqual(self._armed(), set())
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(caller, WAKE)
 
 
 class StopTest(RequestorTestCase):

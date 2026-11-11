@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast
 
 from ._diarium import log_event, outreq_event
-from ._files import copy_file, loads, remove, write_json_atomic
+from ._files import copy_file, loads, read_text_with_mtime, remove, write_json_atomic
 from ._protocol import (
     AgentId,
     CancellationFile,
@@ -27,7 +27,7 @@ from ._protocol import (
     Rid,
 )
 from ._status import ACTIO_VERSION
-from ._types import AgentContext, LogEvent, OutreqEvent, RequestOutcome
+from ._types import AgentContext, LogEvent, OutreqEvent, RequestOutcome, Spawn
 from ._util import format_iso, nonce, ulid
 from ._validate import same_header, validate
 from ._watch import FolderWatch, Watcher
@@ -59,15 +59,21 @@ class _Outbound:
     done: bool = False
     outcome: RequestOutcome | None = None
     task: asyncio.Task[RequestOutcome] | None = None
+    # The one settlement, created with the agent's `Spawn` and awaited through `shield` by everyone who
+    # wants the outcome: the caller, the background finisher, and `stop()`.
+    settling: asyncio.Task[RequestOutcome] | None = None
     # D-11 dedup, bounded: one entry per distinct (path, mtime) this exchange saw; it dies with it.
     ignored: set[tuple[str, int]] = field(default_factory=set)
 
 
-def _peek(path: str) -> tuple[int, str] | None:
-    """(mtime_ns, text) of one file, or None when it is not there or unreadable (a thread hop)."""
+async def _peek(path: str) -> tuple[int, str] | None:
+    """`(mtime_ns, text)` of one file, or None when it is not there or cannot be read.
+
+    A response file this lane can't read stays silent: the exchange stays alive and looks again on the
+    next wake (*Sync and Race Conditions*, D-11's dedup of an ignored file).
+    """
     try:
-        with open(path, encoding="utf-8") as fh:
-            return os.stat(path).st_mtime_ns, fh.read()
+        return await read_text_with_mtime(path)
     except (OSError, UnicodeDecodeError):
         return None
 
@@ -75,11 +81,15 @@ def _peek(path: str) -> tuple[int, str] | None:
 class Requestor:
     """Issues requests and commands for one agent, and ends every exchange it starts."""
 
-    def __init__(self, ctx: AgentContext, hooks: RequestorHooks, watch: Watcher) -> None:
+    def __init__(
+        self, ctx: AgentContext, hooks: RequestorHooks, watch: Watcher, spawn: Spawn
+    ) -> None:
         self._ctx = ctx
         self._hooks = hooks
         self._watch = watch
+        self._spawn = spawn  # every task this lane starts, including a settlement, is the agent's
         self._exchanges: dict[Rid, _Outbound] = {}
+        self._settling: set[asyncio.Task[RequestOutcome]] = set()
 
     async def request(
         self,
@@ -107,8 +117,8 @@ class Requestor:
         except (asyncio.CancelledError, TimeoutError):
             # The caller is gone; the exchange still ends correctly in the background (semantics 1).
             # The exchange holds the task, so the finisher stays referenced while it is live.
-            ex.task = asyncio.create_task(
-                self._drive(ex, sub, timeout, cancel, give_up=True), name=f"actio.out.{ex.rid}"
+            ex.task = self._spawn(
+                self._drive(ex, sub, timeout, cancel, give_up=True), f"actio.out.{ex.rid}"
             )
             raise
 
@@ -122,6 +132,17 @@ class Requestor:
             raise ValueError(f"requestor: built an invalid command for {dst}/{name}: {reason}")
         path = os.path.join(self._dst_inbox(dst), f"{rid}.json")
         await write_json_atomic(path, req, self._ctx.folders.agent, self._ctx.sync)
+        # B1: for a command, "append an `outreq` event (`final_status="sent"`, only `req`)". A command
+        # is never answered, so this line is the only record of it there will ever be.
+        rec: ExchangeRecord = {
+            "final_status": "sent",
+            "req": req,
+            "can": None,
+            "res": None,
+            "con": None,
+        }
+        await self._ctx.append_diarium(outreq_event(self._ctx.id, self._ctx.now(), "sent", rec))
+        self._ctx.emit(OutreqEvent(rid=rid, final_status="sent"))
         return rid
 
     async def stop(self, *, force: bool = False) -> None:
@@ -134,7 +155,9 @@ class Requestor:
                 with contextlib.suppress(BaseException):
                     await ex.task
         for ex in live:
-            await self._settle(ex, "abandoned", None)
+            await self._settle(ex, "abandoned", None)  # waits for a settlement already in flight
+        while self._settling:  # one already out of `_exchanges` can't be: they leave when settled
+            await asyncio.gather(*self._settling, return_exceptions=True)
 
     # -- the envelopes ----------------------------------------------------
 
@@ -237,9 +260,8 @@ class Requestor:
         clock = self._ctx.config.clock
         deadline = clock() + timeout if timeout > 0 else None
         while True:
-            if ex.done:  # stop() (or a race) settled it
-                assert ex.outcome is not None
-                return ex.outcome
+            if ex.settling is not None:  # stop() (or a race) settled it
+                return await asyncio.shield(ex.settling)
             sub.changed.clear()
             await self._capture(ex)
             if ex.res is not None:
@@ -265,11 +287,12 @@ class Requestor:
         self, sub: FolderWatch, cancel: asyncio.Event | None, stop_at: float | None
     ) -> None:
         """Sleep until the folder changed, `cancel` is set, or `stop_at` passes — then look again."""
-        tasks: list[asyncio.Task[Any]] = [asyncio.create_task(sub.changed.wait())]
+        tasks: list[asyncio.Task[Any]] = [asyncio.create_task(sub.changed.wait())]  # fan-out
         if cancel is not None:
-            tasks.append(asyncio.create_task(cancel.wait()))
+            tasks.append(asyncio.create_task(cancel.wait()))  # fan-out
         if stop_at is not None:
-            tasks.append(asyncio.create_task(asyncio.sleep(max(0.0, stop_at - self._ctx.now()))))
+            wake = asyncio.sleep(max(0.0, stop_at - self._ctx.now()))
+            tasks.append(asyncio.create_task(wake))  # fan-out
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
@@ -281,7 +304,7 @@ class Requestor:
         """One look for `<rid>.res.json` (a thread hop): broken files stay silent; mismatches log once."""
         assert ex.req is not None
         path = os.path.join(ex.inbox, f"{ex.rid}.res.json")
-        if (peeked := await asyncio.to_thread(_peek, path)) is None:
+        if (peeked := await _peek(path)) is None:
             return
         mtime_ns, raw = peeked
         try:
@@ -331,7 +354,7 @@ class Requestor:
         """B3 (+ the D-13 guard) and B5: the `outreq` line, the con (if due), the B5 deletions."""
         con: ConfirmationFile | None = None
         try:
-            if await asyncio.to_thread(_peek, os.path.join(ex.inbox, f"{ex.rid}.json")) is not None:
+            if await _peek(os.path.join(ex.inbox, f"{ex.rid}.json")) is not None:
                 # the request is still there: confirm it (the protocol's SHOULD)
                 now = self._ctx.config.clock()
                 con = cast("ConfirmationFile", self._header(ex.rid, ex.dst, now))
@@ -342,41 +365,46 @@ class Requestor:
         except Exception as err:
             self._ctx.emit(LogEvent(message=f"confirmation of {ex.rid} failed: {err}"))
             con = None
-        outcome = await self._settle(ex, "cancelled" if ex.cancelled else "confirmed", con)
-        if con is not None:
-            con_path = os.path.join(ex.inbox, f"{ex.rid}.con.json")
-            try:
-                await write_json_atomic(con_path, con, self._ctx.folders.agent, self._ctx.sync)
-            except Exception as err:
-                self._ctx.emit(LogEvent(message=f"confirmation of {ex.rid} failed: {err}"))
-        return outcome
+        return await self._settle(ex, "cancelled" if ex.cancelled else "confirmed", con)
 
     async def _settle(
         self, ex: _Outbound, final: SettleStatus, con: ConfirmationFile | None
     ) -> RequestOutcome:
-        """Settle an exchange once: the `outreq` line, the event, the deletions; failures only log."""
-        if (prev := self._claim(ex)) is not None:
-            return prev
-        outcome = RequestOutcome(final_status=final, response=ex.response_body)
-        ex.outcome = outcome
+        """Settle an exchange once. The settlement is its own task, awaited through `shield`, so a
+        cancelled waiter can't orphan its writes; `stop()` awaits it like any other (D-9)."""
+        if ex.settling is None:
+            ex.done = True
+            ex.outcome = RequestOutcome(final_status=final, response=ex.response_body)
+            task = self._spawn(self._settle_now(ex, final, con), f"actio.settle.{ex.rid}")
+            self._settling.add(task)
+            task.add_done_callback(self._settling.discard)
+            ex.settling = task
+        return await asyncio.shield(ex.settling)
+
+    async def _settle_now(
+        self, ex: _Outbound, final: SettleStatus, con: ConfirmationFile | None
+    ) -> RequestOutcome:
+        """B3/B5 in the protocol's order: the `outreq` line, the event, the confirmation, the attachments."""
+        assert ex.outcome is not None
         try:
             rec: ExchangeRecord
             rec = {"final_status": final, "req": ex.req, "can": ex.can, "res": ex.res, "con": con}
             await self._ctx.append_diarium(outreq_event(self._ctx.id, self._ctx.now(), final, rec))
             self._ctx.emit(OutreqEvent(rid=ex.rid, final_status=final))
+            if con is not None:
+                con_path = os.path.join(ex.inbox, f"{ex.rid}.con.json")
+                try:
+                    await write_json_atomic(con_path, con, self._ctx.folders.agent, self._ctx.sync)
+                except Exception as err:
+                    self._ctx.emit(LogEvent(message=f"confirmation of {ex.rid} failed: {err}"))
             await self._remove_from_forum(ex.attachments)
             ex.attachments.clear()
         except Exception as err:
             self._ctx.emit(LogEvent(message=f"requestor: settlement of {ex.rid} failed: {err}"))
-        return outcome
-
-    def _claim(self, ex: _Outbound) -> RequestOutcome | None:
-        if ex.done:
-            return ex.outcome
-        ex.done = True
-        self._exchanges.pop(ex.rid, None)
-        self._hooks.on_state_change()
-        return None
+        finally:
+            self._exchanges.pop(ex.rid, None)
+            self._hooks.on_state_change()
+        return ex.outcome
 
     def _dst_inbox(self, dst: AgentId) -> str:
         return os.path.join(self._ctx.folders.root, dst, "inbox")
