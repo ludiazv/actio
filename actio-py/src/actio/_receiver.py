@@ -11,8 +11,9 @@ runs a thread: it watches one folder through the agent's `Watcher` (D-23) and lo
   and `ActioError` keeps its code.
 - Archive is two steps in this order (D-11…D-16): the `inreq` line, then the deletions.
 - A file taken from a folder is classified by its **body key** with `_validate.envelope_kind`, never by
-  its name: to a receiver `<id>.announce.json` can be a perfectly good `nuntium`, and the name says nothing
-  about the body. `file_kind` is the command's rule, not this one.
+  its name: the protocol recommends names and enforces body keys, so a name is never authority, and a body
+  that is not one of the four exchange kinds is ignored with a reason. `file_kind` is the command's rule,
+  not this one.
 - Commands: `stop`, `enable`, `restart`, `ping` are mandatory and never advertised (D0).
 """
 

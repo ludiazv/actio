@@ -46,10 +46,10 @@ def file_kind(name: str) -> SchemaKind | None:
     A loose file being validated has no body key of its own to go by, so the CLI reads the name:
     `spec.json`, `status.json`, `actio.json`, `diarium.jsonl`, `<id>.n.json` and `nuntium.json` are
     announces, `.can`/`.res`/`.con` mark the rest of an exchange, and any other `.json` is a request.
-    The *receiver* classifies an envelope by its **body key** with `envelope_kind` and never by this
-    function: to a receiver `<id>.announce.json` can be a perfectly good `nuntium`, and a name says
-    nothing about a body. A name is never authority to accept a document; `None` says the name tells us
-    nothing."""
+    The *receiver* classifies what it finds in a folder by its **body key** with `envelope_kind` and never
+    by this function. A name is never authority to accept a document, and one inference of a kind from a
+    name exists in this package so that a second copy cannot disagree with the first; `None` says the name
+    tells us nothing."""
     raise NotImplementedError("WP2")
 
 
@@ -70,10 +70,12 @@ def validate(kind: SchemaKind, value: Any) -> str | None:
 
 
 def envelope_kind(value: Any) -> EnvelopeKind | None:
-    """Which envelope a decoded object is, by its single **body key** (*Requests*) — never its name.
+    """Which exchange envelope a decoded object is, by its single **body key** (*Requests*) — never its name.
 
-    This is how a receiver classifies what it finds in a folder: `<id>.announce.json` can be a perfectly
-    good `nuntium`. `None` means it is not an envelope at all: ignore it, and say why."""
+    The four kinds that travel through an inbox: `request`, `cancellation`, `response`, `confirmation`.
+    This is how a receiver classifies what it finds in a folder, and it is the protocol's own rule: names
+    are "recommended but not enforced", the kind of a file comes from its body key, and the exchange is
+    identified by `rid`. `None` means the document is not one of the four — ignore it, and say why."""
     raise NotImplementedError("WP2")
 
 
