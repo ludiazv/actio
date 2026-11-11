@@ -7,10 +7,9 @@ invalid line means a bug in this package, not a peer. Archive is two steps in on
 
 from __future__ import annotations
 
-import asyncio
 import os
 
-from ._files import append_jsonl, loads, read_bytes
+from ._files import append_jsonl, loads, read_text
 from ._protocol import (
     AgentId,
     DiariumEntry,
@@ -104,7 +103,7 @@ async def read_diarium(folder: str) -> DiariumRead:
     """Public: the valid lines in file order, and the ignored ones with their number and reason."""
     path = os.path.join(folder, "diarium.jsonl")
     try:
-        data = await read_bytes(path)
+        raw = await read_text(path)
     except FileNotFoundError:
         return DiariumRead(lines=[], ignored=[])  # a missing file reads as empty, not an error
-    return await asyncio.to_thread(_read_lines, data.decode("utf-8"))
+    return _read_lines(raw)  # the split is parsing, not disk: it stays here
