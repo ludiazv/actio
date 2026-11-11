@@ -1,0 +1,506 @@
+"""`_requestor.py`: the outbound lane — B1 through B5, D-6, D-11, D-13, D-18, D-22, and the two kinds
+of cancellation.
+
+The peer is the test: it writes responses, cancellations and archives into the real destination inbox,
+and the watcher is the real one, so the timing that matters is the one the lane is built on.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import shutil
+import time
+import unittest
+import unittest.mock as mock
+from collections.abc import Coroutine
+from pathlib import Path
+from typing import Any, cast
+
+from actio._config import load_config
+from actio._protocol import DiariumEntry, ResponseBody, Spec, StatusState
+from actio._requestor import Requestor
+from actio._sync import create_sync_provider
+from actio._types import ActioEvent, AgentFolders, LogEvent
+from actio._util import format_iso, nonce
+from actio._validate import SchemaKind, validate
+from actio._watch import Watcher
+from helpers import ActioTestCase, actio_tree, no_leftovers
+
+AUDIT = 0.1  # watcher audit interval: generous on purpose, as in test_watch.py
+CANCEL_WAIT = 0.3  # config cancel_wait_timeout for the tests
+TIMEOUT = 0.25  # the call timeouts
+WAKE = 5.0  # ceilings for waiting on outcomes: a failure, not a timing expectation
+
+
+def spawn(coro: Coroutine[Any, Any, Any], name: str) -> asyncio.Task[Any]:
+    return asyncio.get_running_loop().create_task(coro, name=name)
+
+
+class FakeContext:
+    """A structural `AgentContext` with an in-memory diarium; the forum is the real disk."""
+
+    def __init__(self, root: Path, agent: str = "planner") -> None:
+        self.config = load_config(
+            root=str(root), cancel_wait_timeout=CANCEL_WAIT, confirm_timeout=1.0, sync="none"
+        )
+        self.id = agent
+        self.folders = AgentFolders(
+            root=str(root),
+            agent=str(root / agent),
+            inbox=str(root / agent / "inbox"),
+            forum=str(root / "forum"),
+            nuntium=str(root / "nuntium"),
+        )
+        self.sync = create_sync_provider("none")
+        self.events: list[ActioEvent] = []
+        # (entry, names in forum at the moment the entry was appended): pins ordering against B5
+        self.diarium: list[tuple[DiariumEntry, list[str]]] = []
+
+    def now(self) -> float:
+        return time.time()
+
+    def spec(self) -> Spec:
+        raise AssertionError("the requestor does not read the spec")
+
+    def state(self) -> StatusState:
+        return "idle"
+
+    def emit(self, event: ActioEvent) -> None:
+        self.events.append(event)
+
+    async def append_diarium(self, entry: DiariumEntry) -> None:
+        forum = self.folders.forum
+        self.diarium.append((entry, sorted(os.listdir(forum)) if os.path.isdir(forum) else []))
+
+
+class FakeHooks:
+    def __init__(self) -> None:
+        self.watch_errors: list[tuple[str, BaseException]] = []
+        self.state_changes = 0
+
+    def on_watch_error(self, folder: str, error: BaseException) -> None:
+        self.watch_errors.append((folder, error))
+
+    def on_state_change(self) -> None:
+        self.state_changes += 1
+
+
+def make_response(req: dict[str, Any], **body_over: Any) -> dict[str, Any]:
+    """A valid peer response whose header copies the request's (D-11)."""
+    now = time.time()
+    body: dict[str, Any] = {
+        "ts": int(now),
+        "nonce": nonce(),
+        "signature": None,
+        "error": False,
+        "cancellation": False,
+        "result": "done",
+        "attachments": [],
+        "work_time": 1,
+    }
+    body.update(body_over)
+    return {
+        "rid": req["rid"],
+        "src": req["src"],
+        "dst": req["dst"],
+        "datetime": format_iso(now),
+        "type": req["type"],
+        "actio_version": req["actio_version"],
+        "response": body,
+    }
+
+
+def read_envelope(folder: Path, rid: str, suffix: str = ".json") -> dict[str, Any]:
+    return cast(
+        "dict[str, Any]", json.loads((folder / f"{rid}{suffix}").read_text(encoding="utf-8"))
+    )
+
+
+async def write_response(inbox: Path, req: dict[str, Any], **body_over: Any) -> None:
+    (inbox / f"{req['rid']}.res.json").write_text(
+        json.dumps(make_response(req, **body_over)), encoding="utf-8"
+    )
+
+
+class RequestorTestCase(ActioTestCase):
+    """The tree: our agent `planner`, a peer `summarizer`, the shared `forum`."""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        tree = actio_tree()
+        self.root = tree.__enter__()
+        self.addCleanup(tree.__exit__, None, None, None)
+        (self.root / "forum").mkdir()
+        (self.root / "planner" / "inbox").mkdir(parents=True)
+        self.peer_inbox = self.root / "summarizer" / "inbox"
+        self.peer_inbox.mkdir(parents=True)
+        self.ctx = FakeContext(self.root)
+        self.hooks = FakeHooks()
+        self.watcher = await Watcher.open(spawn, AUDIT)
+        self.addAsyncCleanup(self.watcher.close)
+        self.requestor = Requestor(self.ctx, self.hooks, self.watcher)
+
+    async def _wait_for_files(self, folder: Path, count: int, ceiling: float = WAKE) -> list[Path]:
+        async with asyncio.timeout(ceiling):
+            while True:
+                files = sorted(folder.glob("*.json"))
+                if len(files) >= count:
+                    return files
+                await asyncio.sleep(0.01)
+
+    async def _one_request_rid(self) -> str:
+        (path,) = await self._wait_for_files(self.peer_inbox, 1)
+        return path.name[: -len(".json")]
+
+    def _outreq_lines(self) -> list[dict[str, Any]]:
+        return [
+            cast("dict[str, Any]", entry["event_data"])
+            for entry, _ in self.ctx.diarium
+            if entry["event"] == "outreq"
+        ]
+
+
+class B1Test(RequestorTestCase):
+    async def test_b1_writes_the_request_file_and_copies_the_attachments(self) -> None:
+        a = self.root / "a.txt"
+        a.write_text("alpha", encoding="utf-8")
+        b = self.root / "b.txt"
+        b.write_text("beta", encoding="utf-8")
+        t = asyncio.create_task(
+            self.requestor.request(
+                "summarizer", "summarize", {"text": "x"}, timeout=0, attachments=[str(a), str(b)]
+            )
+        )
+        rid = await self._one_request_rid()
+        req = read_envelope(self.peer_inbox, rid)
+        self.assertIsNone(validate("request", req))
+        self.assertEqual(req["dst"], "summarizer")
+        self.assertEqual(req["src"], "planner")
+        self.assertEqual(req["request"]["name"], "summarize")
+        self.assertEqual(req["request"]["attachments"], ["a.txt", "b.txt"])
+        # the attachments sit in forum under their names, with the peer's content
+        self.assertEqual((self.root / "forum" / "a.txt").read_text(encoding="utf-8"), "alpha")
+        self.assertEqual((self.root / "forum" / "b.txt").read_text(encoding="utf-8"), "beta")
+        await write_response(self.peer_inbox, req)
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "confirmed")
+
+    async def test_b1_peer_named_paths_land_inside_the_forum_under_their_basename(self) -> None:
+        deep = self.root / "deep" / "deeper"
+        deep.mkdir(parents=True)
+        paper = deep / "paper.pdf"
+        paper.write_bytes(b"%PDF-1.4")
+        t = asyncio.create_task(
+            self.requestor.request("summarizer", "summarize", timeout=0, attachments=[str(paper)])
+        )
+        rid = await self._one_request_rid()
+        req = read_envelope(self.peer_inbox, rid)
+        self.assertEqual(req["request"]["attachments"], ["paper.pdf"])
+        await write_response(self.peer_inbox, req)
+        await asyncio.wait_for(t, WAKE)
+        (_, forum_at_line) = next(e for e in self.ctx.diarium if e[0]["event"] == "outreq")
+        self.assertIn("paper.pdf", forum_at_line)  # the copy sat in forum under its bare name
+        self.assertFalse((self.root / "forum" / "deep").exists())  # no peer-named path inside forum
+        self.assertFalse((self.root / "forum" / "paper.pdf").exists())  # B5 took it out again
+
+    async def test_b1_refuses_a_basename_collision_locally(self) -> None:
+        a = self.root / "x" / "same.txt"
+        a.parent.mkdir()
+        a.write_text("one", encoding="utf-8")
+        b = self.root / "y" / "same.txt"
+        b.parent.mkdir()
+        b.write_text("two", encoding="utf-8")
+        with self.assertRaises(ValueError) as cm:
+            await self.requestor.request("summarizer", "summarize", attachments=[str(a), str(b)])
+        message = str(cm.exception)
+        self.assertIn(str(a), message)
+        self.assertIn(str(b), message)
+        self.assertEqual(list(self.peer_inbox.glob("*.json")), [])  # no request went out
+        self.assertFalse((self.root / "forum" / "same.txt").exists())  # nothing was copied
+
+
+class B2Test(RequestorTestCase):
+    async def test_b2_wakes_on_the_response_file_and_confirms(self) -> None:
+        t = asyncio.create_task(self.requestor.request("summarizer", "summarize", timeout=0))
+        rid = await self._one_request_rid()
+        await asyncio.sleep(0.1)  # let the exchange settle into the watch
+        req = read_envelope(self.peer_inbox, rid)
+        await write_response(self.peer_inbox, req)
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "confirmed")
+        body = cast("ResponseBody", outcome.response)
+        self.assertIsNotNone(body)
+        self.assertEqual(body["result"], "done")
+
+    async def test_a_mismatched_header_is_ignored_with_a_log_and_the_exchange_times_out(
+        self,
+    ) -> None:
+        t = asyncio.create_task(self.requestor.request("summarizer", "summarize", timeout=TIMEOUT))
+        rid = await self._one_request_rid()
+        req = read_envelope(self.peer_inbox, rid)
+        bad = make_response(req)
+        bad["src"] = "imposter"  # the header differs from the request's
+        (self.peer_inbox / f"{rid}.res.json").write_text(json.dumps(bad), encoding="utf-8")
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "abandoned")
+        # exactly one `log`, in the events and in the diarium, naming the file and the rule (D-11)
+        logs = [
+            e for e in self.ctx.events if isinstance(e, LogEvent) and "header mismatch" in e.message
+        ]
+        self.assertEqual(len(logs), 1)
+        diarium_logs = [
+            entry
+            for entry, _ in self.ctx.diarium
+            if entry["event"] == "log" and "header mismatch" in str(entry["event_data"])
+        ]
+        self.assertEqual(len(diarium_logs), 1)
+        # the exchange ran to its timer: B4, then the give-up
+        self.assertTrue((self.peer_inbox / f"{rid}.can.json").exists())
+
+    async def test_a_broken_peer_file_is_a_stay_until_the_timer(self) -> None:
+        t = asyncio.create_task(self.requestor.request("summarizer", "summarize", timeout=TIMEOUT))
+        rid = await self._one_request_rid()
+        (self.peer_inbox / f"{rid}.res.json").write_text("not json at all", encoding="utf-8")
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "abandoned")
+        # only the final outreq line: the broken file left no trace
+        self.assertEqual([entry["event"] for entry, _ in self.ctx.diarium], ["outreq"])
+
+
+class B3Test(RequestorTestCase):
+    async def test_b3_the_confirmation_follows_the_response_and_b5_cleans_our_attachments(
+        self,
+    ) -> None:
+        att = self.root / "att.txt"
+        att.write_text("ours", encoding="utf-8")
+        peer_att = self.root / "forum" / "res-att.txt"  # the peer's own response attachment
+        peer_att.write_text("theirs", encoding="utf-8")
+        t = asyncio.create_task(
+            self.requestor.request("summarizer", "summarize", timeout=0, attachments=[str(att)])
+        )
+        rid = await self._one_request_rid()
+        req = read_envelope(self.peer_inbox, rid)
+        await write_response(self.peer_inbox, req, attachments=["res-att.txt"])
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "confirmed")
+        # B3: the confirmation is in the peer's inbox, valid, same rid
+        con = read_envelope(self.peer_inbox, rid, ".con.json")
+        self.assertIsNone(validate("confirmation", con))
+        self.assertEqual(con["rid"], rid)
+        # the diarium line carries the con, and it went out before B5 deleted our attachment
+        lines = self._outreq_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["final_status"], "confirmed")
+        self.assertIsNotNone(lines[0]["con"])
+        (entry, forum_at_line) = next(e for e in self.ctx.diarium if e[0]["event"] == "outreq")
+        self.assertIn("att.txt", forum_at_line)
+        # B5: our request attachment is gone; the peer's response attachment is not ours to delete
+        self.assertFalse((self.root / "forum" / "att.txt").exists())
+        self.assertTrue(peer_att.is_file())
+
+    async def test_a_peer_that_archived_first_is_recorded_without_a_con(self) -> None:
+        t = asyncio.create_task(self.requestor.request("summarizer", "summarize", timeout=0))
+        rid = await self._one_request_rid()
+        req = read_envelope(self.peer_inbox, rid)
+        (self.peer_inbox / f"{rid}.json").unlink()  # the receiver archived the request first
+        await write_response(self.peer_inbox, req)  # ... and its response is what we find
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "confirmed")
+        self.assertFalse((self.peer_inbox / f"{rid}.con.json").exists())
+        lines = self._outreq_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["final_status"], "confirmed")
+        self.assertIsNone(lines[0]["con"])
+
+
+class B4Test(RequestorTestCase):
+    async def test_b4_the_timeout_writes_our_cancellation_then_gives_up(self) -> None:
+        att = self.root / "att.txt"
+        att.write_text("x", encoding="utf-8")
+        t = asyncio.create_task(
+            self.requestor.request(
+                "summarizer", "summarize", timeout=TIMEOUT, attachments=[str(att)]
+            )
+        )
+        rid = await self._one_request_rid()
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "abandoned")
+        self.assertIsNone(outcome.response)
+        can = read_envelope(self.peer_inbox, rid, ".can.json")
+        self.assertIsNone(validate("cancellation", can))
+        self.assertEqual(can["rid"], rid)
+        self.assertEqual(can["cancellation"]["name"], "summarize")
+        self.assertFalse(can["cancellation"]["force"])
+        lines = self._outreq_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["final_status"], "abandoned")
+        self.assertIsNotNone(lines[0]["can"])
+        self.assertFalse((self.root / "forum" / "att.txt").exists())  # B5 on the give-up
+
+    async def test_a_cancellation_response_ends_the_exchange_cancelled(self) -> None:
+        t = asyncio.create_task(self.requestor.request("summarizer", "summarize", timeout=TIMEOUT))
+        rid = await self._one_request_rid()
+        await self._wait_for_files(self.peer_inbox, 2)  # the request, then the can
+        req = read_envelope(self.peer_inbox, rid)
+        # the receiver answers the cancellation: an acknowledgement, not an error
+        await write_response(self.peer_inbox, req, cancellation=True, result=None)
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "cancelled")
+        # confirmed as usual: the request file was still there, so the con went out
+        con = read_envelope(self.peer_inbox, rid, ".con.json")
+        self.assertIsNone(validate("confirmation", con))
+        lines = self._outreq_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["final_status"], "cancelled")
+        self.assertTrue(lines[0]["res"]["response"]["cancellation"])
+
+    async def test_setting_cancel_starts_b4(self) -> None:
+        cancel = asyncio.Event()
+        t = asyncio.create_task(
+            self.requestor.request("summarizer", "summarize", timeout=0, cancel=cancel)
+        )
+        rid = await self._one_request_rid()
+        await asyncio.sleep(0.1)
+        cancel.set()
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "abandoned")
+        self.assertTrue((self.peer_inbox / f"{rid}.can.json").exists())
+
+
+class CancelledCallerTest(RequestorTestCase):
+    async def test_a_cancelled_caller_leaves_nothing_armed_and_the_exchange_ends(self) -> None:
+        att = self.root / "att.txt"
+        att.write_text("x", encoding="utf-8")
+        t = asyncio.create_task(
+            self.requestor.request("summarizer", "summarize", timeout=0, attachments=[str(att)])
+        )
+        rid = await self._one_request_rid()
+        await asyncio.sleep(0.1)  # let it settle into the watch
+        t.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await t
+        with no_leftovers():
+            async with asyncio.timeout(WAKE):
+                while self.requestor._exchanges:
+                    await asyncio.sleep(0.01)
+        # the exchange ended in the background: its B4, its give-up, its diarium line, its B5
+        self.assertTrue((self.peer_inbox / f"{rid}.can.json").exists())
+        self.assertFalse((self.root / "forum" / "att.txt").exists())
+        lines = self._outreq_lines()
+        self.assertEqual([d["final_status"] for d in lines], ["abandoned"])
+
+    async def test_a_failed_self_cancellation_does_not_strand_the_exchange(self) -> None:
+        real = validate
+
+        def planted(kind: SchemaKind, value: Any) -> str | None:
+            if kind == "cancellation":
+                return "(root) a planted rejection"
+            return real(kind, value)
+
+        with mock.patch("actio._requestor.validate", side_effect=planted):
+            t = asyncio.create_task(
+                self.requestor.request("summarizer", "summarize", timeout=TIMEOUT)
+            )
+            rid = await self._one_request_rid()
+            outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "abandoned")
+        self.assertEqual(self.requestor._exchanges, {})
+        self.assertFalse((self.peer_inbox / f"{rid}.can.json").exists())
+        logs = [
+            e for e in self.ctx.events if isinstance(e, LogEvent) and "cancellation" in e.message
+        ]
+        self.assertEqual(len(logs), 1)
+        lines = self._outreq_lines()
+        self.assertEqual([d["final_status"] for d in lines], ["abandoned"])
+        self.assertIsNone(lines[0]["can"])
+
+
+class CommandTest(RequestorTestCase):
+    async def test_command_writes_and_forgets(self) -> None:
+        rid = await self.requestor.command("summarizer", "stop", {"force": False})
+        self.assertEqual(len(rid), 26)
+        cmd = read_envelope(self.peer_inbox, rid)
+        self.assertIsNone(validate("request", cmd))
+        self.assertEqual(cmd["type"], "cmd")
+        self.assertEqual(cmd["request"]["name"], "stop")
+        self.assertEqual(cmd["request"]["timeout"], 0)
+        # a command is not tracked: no exchange, no diarium line, no watcher left behind
+        self.assertEqual(self.requestor._exchanges, {})
+        self.assertEqual(self.ctx.diarium, [])
+        self.assertEqual(self.watcher._folders, {})
+
+
+class StopTest(RequestorTestCase):
+    async def test_stop_abandons_every_outstanding_exchange(self) -> None:
+        t1 = asyncio.create_task(self.requestor.request("summarizer", "summarize", timeout=0))
+        t2 = asyncio.create_task(self.requestor.request("summarizer", "summarize", timeout=0))
+        rids = {p.name[: -len(".json")] for p in await self._wait_for_files(self.peer_inbox, 2)}
+        await self.requestor.stop()
+        self.assertEqual(self.requestor._exchanges, {})
+        lines = self._outreq_lines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual({d["final_status"] for d in lines}, {"abandoned"})
+        self.assertEqual({d["req"]["rid"] for d in lines}, rids)
+        # the callers' laps see the settled exchange and return its outcome; nothing left armed
+        results = await asyncio.wait_for(asyncio.gather(t1, t2), WAKE)
+        self.assertEqual([r.final_status for r in results], ["abandoned", "abandoned"])
+
+
+class LostInboxTest(RequestorTestCase):
+    async def test_a_lost_inbox_abandons_the_exchange(self) -> None:
+        t = asyncio.create_task(self.requestor.request("summarizer", "summarize", timeout=0))
+        await self._one_request_rid()
+        shutil.rmtree(self.peer_inbox.parent)  # the peer agent's folder goes away
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "abandoned")
+        self.assertTrue(
+            any(f"{os.sep}summarizer" in folder for folder, _ in self.hooks.watch_errors)
+        )
+        self.assertEqual(self.requestor._exchanges, {})
+        self.assertEqual(len(self._outreq_lines()), 1)
+
+
+class PeerAnswerTest(RequestorTestCase):
+    async def test_a_peers_error_answer_is_not_an_exception(self) -> None:
+        t = asyncio.create_task(self.requestor.request("summarizer", "summarize", timeout=0))
+        rid = await self._one_request_rid()
+        req = read_envelope(self.peer_inbox, rid)
+        await write_response(
+            self.peer_inbox, req, error=True, result={"code": 2000, "msg": "no such document"}
+        )
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "confirmed")
+        body = cast("ResponseBody", outcome.response)
+        self.assertIsNotNone(body)
+        self.assertTrue(body["error"])
+        self.assertEqual(cast("dict[str, Any]", body["result"])["code"], 2000)
+
+    async def test_an_encrypted_response_confirms_without_a_body(self) -> None:
+        t = asyncio.create_task(self.requestor.request("summarizer", "summarize", timeout=0))
+        rid = await self._one_request_rid()
+        req = read_envelope(self.peer_inbox, rid)
+        res = make_response(req)
+        res["response"] = base64.b64encode(json.dumps({"ts": 1}).encode()).decode()
+        (self.peer_inbox / f"{rid}.res.json").write_text(json.dumps(res), encoding="utf-8")
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "confirmed")
+        self.assertIsNone(outcome.response)
+
+
+class SelfCallTest(RequestorTestCase):
+    async def test_a_self_call_is_no_special_case(self) -> None:
+        t = asyncio.create_task(self.requestor.request("planner", "summarize", timeout=0))
+        own_inbox = self.root / "planner" / "inbox"
+        (path,) = await self._wait_for_files(own_inbox, 1)
+        rid = path.name[: -len(".json")]
+        req = read_envelope(own_inbox, rid)
+        await write_response(own_inbox, req)  # the receiver writes beside the request, as usual
+        outcome = await asyncio.wait_for(t, WAKE)
+        self.assertEqual(outcome.final_status, "confirmed")
+
+
+if __name__ == "__main__":
+    unittest.main()
