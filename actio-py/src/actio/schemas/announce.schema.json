@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "announce.schema.json",
+  "title": "Actio announce file (nuntium/<agent_id>.n.json) and broadcast file (nuntium/nuntium.json)",
+  "description": "Signal only: any creation or update triggers a complete scan. All fields are mandatory.",
+  "type": "object",
+  "properties": {
+    "id": { "$ref": "common.schema.json#/$defs/agentId", "description": "ID of the announcing agent." },
+    "datetime": { "$ref": "common.schema.json#/$defs/datetime", "description": "Time of the announce." },
+    "ts": { "$ref": "common.schema.json#/$defs/ts", "description": "Timestamp of the announce." },
+    "nuntium": { "type": "string", "description": "Text with the news, e.g. \"agent is active\"." }
+  },
+  "required": ["id", "datetime", "ts", "nuntium"],
+  "additionalProperties": false
+}

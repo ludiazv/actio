@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "response.schema.json",
+  "title": "Actio response file (<rid>.res.json)",
+  "description": "Written once by the receiver in its own inbox, with the same header as the request (only datetime changes). Requests only. The body is an object, or a base64 string when encryption is in use. A non-error result must follow the capability result schema published in spec.json (checked by the requestor, not by this schema).",
+  "type": "object",
+  "allOf": [{ "$ref": "common.schema.json#/$defs/requestHeader" }],
+  "properties": {
+    "response": {
+      "anyOf": [
+        { "$ref": "#/$defs/body" },
+        { "$ref": "common.schema.json#/$defs/base64" }
+      ]
+    }
+  },
+  "required": ["response"],
+  "unevaluatedProperties": false,
+  "$defs": {
+    "body": {
+      "type": "object",
+      "properties": {
+        "ts": { "$ref": "common.schema.json#/$defs/ts" },
+        "nonce": { "$ref": "common.schema.json#/$defs/nonce" },
+        "signature": { "$ref": "common.schema.json#/$defs/signature" },
+        "error": { "type": "boolean", "description": "The response is an error; false for a cancellation response." },
+        "cancellation": { "type": "boolean", "description": "The response acknowledges a cancellation." },
+        "result": { "description": "Result of the work (capability result schema), error result (error schema), or null for a cancellation response." },
+        "attachments": { "$ref": "common.schema.json#/$defs/attachments" },
+        "work_time": { "$ref": "common.schema.json#/$defs/duration", "description": "Seconds of actual work, without waiting times." }
+      },
+      "required": ["ts", "nonce", "signature", "error", "cancellation", "result", "attachments"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "cancellation": { "const": true } }, "required": ["cancellation"] },
+          "then": {
+            "properties": {
+              "error": { "const": false },
+              "result": { "const": null },
+              "attachments": { "type": "array", "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "error": { "const": true } }, "required": ["error"] },
+          "then": { "properties": { "result": { "$ref": "error.schema.json" } } }
+        }
+      ]
+    }
+  }
+}

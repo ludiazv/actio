@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "error.schema.json",
+  "title": "ActioErrorResponse",
+  "description": "The result of an error response (error=true). Requests rejected at A0 use the standardized codes (see Acceptance errors).",
+  "type": "object",
+  "properties": {
+    "code": {
+      "type": "integer",
+      "description": "Optional error code. Requests rejected at A0 use the standardized codes (see Acceptance errors)."
+    },
+    "msg": {
+      "type": "string",
+      "description": "Error message"
+    },
+    "details": {
+      "type": "string",
+      "description": "Error details"
+    }
+  },
+  "required": ["msg"],
+  "additionalProperties": false
+}

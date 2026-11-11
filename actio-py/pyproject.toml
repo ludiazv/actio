@@ -1,0 +1,52 @@
+# Dependencies are exactly the approved set (§2 of the plan, G-3): jsonschema and watchdog at
+# runtime; ruff, mypy and the uv_build backend for development and build only. Tests use the
+# standard library's unittest. A new dependency is a stop.
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14"]
+build-backend = "uv_build"
+
+[project]
+name = "actio-py"
+version = "0.1.0"
+description = "A Python implementation of the Actio protocol v0.1 (core conformance profile)"
+requires-python = ">=3.13"
+license = "MIT"
+dependencies = [
+  "jsonschema==4.26.0",
+  "watchdog==7.0.0",
+]
+
+[dependency-groups]
+dev = [
+  "mypy==2.4.1",
+  "ruff==0.17.3",
+]
+
+[project.scripts]
+actio = "actio._cli:main"
+
+# The distribution is `actio-py`, the import name is `actio` (U-5).
+[tool.uv.build-backend]
+module-name = "actio"
+module-root = "src"
+
+[tool.ruff]
+target-version = "py313"
+src = ["src", "tests"]
+# The plan asks only that `ruff format --check` be clean; 100 columns is the project's choice, and it
+# keeps the line counts of §9 down. `ruff format` is the authority, not this number.
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["src", "tests"]
+mypy_path = "src"
+
+# jsonschema ships no type information (§2 U-1): the only untyped dependency allowed.
+[[tool.mypy.overrides]]
+module = ["jsonschema", "jsonschema.*"]
+ignore_missing_imports = true

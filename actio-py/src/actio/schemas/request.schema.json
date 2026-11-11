@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "request.schema.json",
+  "title": "Actio request file (<rid>.json)",
+  "description": "Written once by the requestor in the inbox of dst. Carries a request (type \"req\") or a command (type \"cmd\"). The body is an object, or a base64 string when encryption is in use; the decrypted body is validated with #/$defs/body.",
+  "type": "object",
+  "allOf": [
+    { "$ref": "common.schema.json#/$defs/header" },
+    {
+      "if": { "type": "object", "properties": { "type": { "const": "req" } } },
+      "then": { "type": "object", "properties": { "request": { "$ref": "#/$defs/requestRules" } } },
+      "else": { "type": "object", "properties": { "request": { "$ref": "#/$defs/commandRules" } } }
+    }
+  ],
+  "properties": {
+    "request": {
+      "anyOf": [
+        { "$ref": "#/$defs/body" },
+        { "$ref": "common.schema.json#/$defs/base64" }
+      ]
+    }
+  },
+  "required": ["request"],
+  "unevaluatedProperties": false,
+  "$defs": {
+    "body": {
+      "type": "object",
+      "properties": {
+        "ts": { "$ref": "common.schema.json#/$defs/ts" },
+        "nonce": { "$ref": "common.schema.json#/$defs/nonce" },
+        "signature": { "$ref": "common.schema.json#/$defs/signature" },
+        "name": { "type": "string", "minLength": 1, "description": "Capability name (type \"req\") or command name (type \"cmd\")." },
+        "parameters": { "description": "Parameters of the request or command; null if there are none." },
+        "timeout": { "$ref": "common.schema.json#/$defs/duration", "description": "Requestor timeout for the task; 0 = no timeout." },
+        "attachments": { "$ref": "common.schema.json#/$defs/attachments" }
+      },
+      "required": ["ts", "nonce", "signature", "name", "parameters", "timeout", "attachments"],
+      "additionalProperties": false
+    },
+    "requestRules": {
+      "description": "Extra rules for type \"req\" (applied only when the body is not encrypted). Guarded by \"if\": {\"type\": \"object\"} so that an encrypted body (a base64 string) still passes; a plain \"type\": \"object\" here would reject it. The guard also satisfies strict validators (Ajv strictTypes), which require an explicit type next to \"properties\".",
+      "if": { "type": "object" },
+      "then": {
+        "type": "object",
+        "properties": {
+          "name": { "$ref": "common.schema.json#/$defs/capabilityName" },
+          "parameters": { "type": ["object", "null"] }
+        }
+      }
+    },
+    "commandRules": {
+      "description": "Parameters of the protocol-standard commands (type \"cmd\"); custom commands are free. Applied only when the body is not encrypted: every branch \"if\" has \"type\": \"object\", so an encrypted body (a base64 string) matches no branch and passes; the \"type\": \"object\" in each \"then\" is there for strict validators (Ajv strictTypes).",
+      "allOf": [
+        {
+          "if": { "type": "object", "properties": { "name": { "const": "stop" } }, "required": ["name"] },
+          "then": {
+            "type": "object",
+            "properties": {
+              "parameters": {
+                "type": "object",
+                "properties": { "force": { "type": "boolean" } },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        {
+          "if": { "type": "object", "properties": { "name": { "const": "enable" } }, "required": ["name"] },
+          "then": {
+            "type": "object",
+            "properties": {
+              "parameters": {
+                "type": "object",
+                "properties": { "enabled": { "type": "boolean" } },
+                "required": ["enabled"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        {
+          "if": { "type": "object", "properties": { "name": { "const": "restart" } }, "required": ["name"] },
+          "then": {
+            "type": "object",
+            "properties": {
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "force": { "type": "boolean" },
+                  "delay": { "$ref": "common.schema.json#/$defs/duration" }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        {
+          "if": { "type": "object", "properties": { "name": { "const": "ping" } }, "required": ["name"] },
+          "then": { "type": "object", "properties": { "parameters": { "type": "null" } } }
+        }
+      ]
+    }
+  }
+}

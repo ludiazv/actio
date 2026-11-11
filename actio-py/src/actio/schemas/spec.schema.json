@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "spec.schema.json",
+  "title": "Actio agent specification (<agent folder>/spec.json)",
+  "description": "Publication of the agent's identity, capabilities and security features. Capability names must be unique within the agent (not expressible in JSON Schema).",
+  "type": "object",
+  "properties": {
+    "id": { "$ref": "common.schema.json#/$defs/agentId", "description": "Unique agent ID." },
+    "actio_version": { "$ref": "common.schema.json#/$defs/actioVersion" },
+    "datetime": { "$ref": "common.schema.json#/$defs/datetime", "description": "Last time the spec was updated." },
+    "description": { "type": "string", "description": "What the agent can do." },
+    "namespaces": {
+      "description": "Absent, null or empty: the agent belongs to the null namespace. null can be listed explicitly; \"*\" means all namespaces.",
+      "type": ["array", "null"],
+      "items": {
+        "anyOf": [
+          { "type": "string", "minLength": 1 },
+          { "type": "null" }
+        ]
+      }
+    },
+    "depends": {
+      "description": "Hard dependencies (agent IDs). Defaults to an empty list.",
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/agentId" }
+    },
+    "wants": {
+      "description": "Optional dependencies (agent IDs). Defaults to an empty list.",
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/agentId" }
+    },
+    "disabled": {
+      "description": "The agent is disabled (changed with the enable command). Absent means false.",
+      "type": "boolean"
+    },
+    "accepts_commands_from": {
+      "description": "Agent IDs allowed to send commands; an empty list means nobody.",
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/agentId" }
+    },
+    "capabilities": {
+      "description": "Capabilities offered to the team; can be empty.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/capability" }
+    },
+    "security_support": {
+      "description": "Security features implemented; empty if none.",
+      "type": "array",
+      "items": { "enum": ["sign", "encrypt", "issuer_sign"] },
+      "uniqueItems": true
+    },
+    "security_posture": {
+      "enum": ["trusted", "untrusted", "secret", "zero-trust"]
+    },
+    "security": {
+      "description": "Security attributes as key-value pairs, e.g. public keys, issuer ID, issuer certificate.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string", "minLength": 1 },
+          "value": { "type": "string" }
+        },
+        "required": ["key", "value"],
+        "additionalProperties": false
+      }
+    },
+    "info": {
+      "description": "Extra information; free content, not schema validated.",
+      "type": "object"
+    }
+  },
+  "required": [
+    "id",
+    "actio_version",
+    "datetime",
+    "description",
+    "accepts_commands_from",
+    "capabilities",
+    "security_support",
+    "security_posture"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "capability": {
+      "description": "An OpenAI tool definition (name, description, parameters) plus the actio object.",
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "common.schema.json#/$defs/capabilityName" },
+        "description": { "type": "string" },
+        "parameters": {
+          "description": "JSON object with the OpenAI tool calling parameter format; can be empty.",
+          "type": "object"
+        },
+        "actio": { "$ref": "#/$defs/capabilityActio" }
+      },
+      "required": ["name", "description", "parameters", "actio"],
+      "additionalProperties": false
+    },
+    "capabilityActio": {
+      "type": "object",
+      "properties": {
+        "result": {
+          "description": "JSON schema of the result.",
+          "anyOf": [{ "type": "object" }, { "type": "boolean" }]
+        },
+        "skill": { "type": "string", "description": "Harness hint, no protocol effect." },
+        "tool": { "type": "boolean", "description": "Harness hint, no protocol effect." },
+        "tool_name": { "type": "string", "description": "Harness hint, no protocol effect." },
+        "sync": { "type": "boolean", "description": "Harness hint, no protocol effect." },
+        "accepts_from": {
+          "description": "Absent or empty: every agent can use the capability; otherwise only the listed agents.",
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/agentId" }
+        },
+        "max_parallel": {
+          "description": "Maximum parallel requests, managed by the receiver. 0: unbounded.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "recommended_timeout": {
+          "description": "Recommended timeout for the response, in seconds.",
+          "$ref": "common.schema.json#/$defs/duration"
+        },
+        "disabled": { "type": "boolean", "description": "The capability is disabled or unavailable." }
+      },
+      "required": ["result"],
+      "additionalProperties": false
+    }
+  }
+}
