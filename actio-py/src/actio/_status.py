@@ -78,9 +78,10 @@ class StatusPublisher:
     It owns the lock, the latch, the sync provider and a `Spawn`, and knows the five folders. The guarded
     write runs as its own task from `spawn`, awaited through `asyncio.shield`, so a caller cancelled
     mid-write cannot free the lock while the write is still in flight. After this publisher has written
-    a status of `inactive` the latch is set and every later write through it is a no-op: it latches on
-    its own write, because it can't see the agent's state. A restart builds a fresh publisher, and with
-    it a fresh latch.
+    a status of `inactive` the latch is set and every later **status** write through it is a no-op: it
+    latches on its own write, because it can't see the agent's state. The announce is not gated, because
+    C1 writes `inactive` first and the announce second (*Announcement and Discovery*), and both are MUSTs.
+    A restart builds a fresh publisher, and with it a fresh latch.
     """
 
     def __init__(self, folders: AgentFolders, provider: SyncProvider, spawn: Spawn) -> None:
@@ -92,17 +93,18 @@ class StatusPublisher:
 
     @property
     def latched(self) -> bool:
-        """True once `inactive` has been written here; from then on every write is a no-op."""
+        """True once `inactive` has been written here; from then on every status write is a no-op."""
         return self._latched
 
-    async def _publish(self, path: str, doc: Any, latches: bool) -> None:
+    async def _publish(self, path: str, doc: Any, latches: bool, status: bool = False) -> None:
         """The guarded write (D-9): the locked section is its own task from `spawn`, and the caller
         awaits it through `asyncio.shield`. A caller cancelled mid-write keeps the lock held until the
-        write lands; a latched publisher writes nothing — not an exception, not a log line, a no-op."""
+        write lands; once latched, a status write does nothing — not an exception, not a log line, a
+        no-op — while the announce and the spec still go through (C1 follows `inactive`)."""
 
         async def locked() -> None:
             async with self._lock:
-                if self._latched:
+                if status and self._latched:
                     return
                 await write_json_atomic(path, doc, self._folders.agent, self._provider)
                 if latches:
@@ -123,6 +125,7 @@ class StatusPublisher:
             os.path.join(self._folders.agent, "status.json"),
             status,
             latches=status["status"] == "inactive",
+            status=True,
         )
 
     async def announce(self, id: AgentId, text: str, ts: float) -> None:

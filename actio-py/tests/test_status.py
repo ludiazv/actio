@@ -197,15 +197,20 @@ class PublisherTest(ActioTestCase):
             status_path = Path(folders.agent) / "status.json"
             spec_path = Path(folders.agent) / "spec.json"
             announce_path = Path(folders.nuntium) / f"{AGENT}.n.json"
-            # From then on every write through it is a no-op: not an exception, not a log line.
+            # The latch gates *status* writes: not an exception, not a log line, a no-op. C1 writes
+            # `inactive` and then the announce, and both are MUSTs, so the announce still lands.
             await publisher.publish_status(build_status(AGENT, "busy", TS))
+            await publisher.publish_status(build_status(AGENT, "idle", TS))
             await publisher.publish_spec(spec)
             await publisher.announce(AGENT, "late news", TS)
             self.assertEqual(
                 json.loads(status_path.read_text(encoding="utf-8"))["status"], "inactive"
             )
             self.assertEqual(json.loads(spec_path.read_text(encoding="utf-8")), spec)
-            self.assertFalse(announce_path.exists())
+            self.assertTrue(announce_path.exists(), "C1's announce must follow `inactive`")
+            self.assertEqual(
+                json.loads(announce_path.read_text(encoding="utf-8"))["nuntium"], "late news"
+            )
 
     async def test_a_fresh_publisher_writes_again(self) -> None:
         with actio_tree() as root:
