@@ -1,12 +1,12 @@
-"""`ActioAgent`: the lifecycle, lane C (its own capability registrations), the commands, and the API
-plan §4 froze (*Agent Lifecycle*, *Agent's status*, *Namespaces*, D-8, D-9, D-10, D-17). WP7.
+"""`ActioAgent`: the lifecycle, lane C (its own capability registrations), the commands, and the public
+API (*Agent Lifecycle*, *Agent's status*, *Namespaces*, D-8, D-9, D-10).
 
 The signature below is the frozen one: keyword-only, and `namespaces=None` means the field is **absent**
-from `spec.json`, not `null` inside it (D-22). Nothing of the environment is read until `start()`, so a
-bad `ACTIO_SYNC` surfaces there (D-21).
+from `spec.json`, not `null` inside it (*Namespaces*). Nothing of the environment is read until `start()`,
+so a bad `ACTIO_SYNC` surfaces there (D-21).
 
-An agent belongs to one event loop and is not thread-safe (plan §4 semantics 7). It installs no signal
-handler and starts no event loop (semantics 8): the example does both.
+An agent belongs to one event loop and is not thread-safe. It installs no signal handler and starts no
+event loop: the example does both.
 """
 
 from __future__ import annotations
@@ -28,8 +28,16 @@ from ._types import (
 )
 
 
-class ActioAgent(AgentContext):
-    """One agent in the shared tree: it serves its inbox and talks to the others."""
+class ActioAgent:
+    """One agent in the shared tree: it serves its inbox and talks to the others.
+
+    It subclasses nothing. Its engines (the receiver, the requestor, the status publisher) are handed
+    `_ctx`, a private object that satisfies `AgentContext` structurally; making the agent itself the
+    context would put `emit`, `sync`, `folders` and the rest on the public surface, and would make the
+    class abstract to a consumer's `mypy`.
+    """
+
+    _ctx: AgentContext  # built by `start()`: the seam, never a public attribute
 
     def __init__(
         self,
@@ -55,7 +63,7 @@ class ActioAgent(AgentContext):
     ) -> Callable[[CapabilityHandler], CapabilityHandler] | None:
         """Register a capability: a call, or the decorator form. `ValueError` for a bad capability or a
         name already taken; `TypeError` for a handler that is not `async def`. The input is deep-copied,
-        so the caller cannot alias what we publish (plan §5.4)."""
+        so the caller cannot alias what we publish."""
         raise NotImplementedError("WP7")
 
     @overload
@@ -72,7 +80,7 @@ class ActioAgent(AgentContext):
 
     def on_event(self, handler: Callable[[ActioEvent], None]) -> None:
         """Subscribe to the observability stream. Callbacks run synchronously on the loop and must
-        return quickly; one that raises produces a single `LogEvent` (§4 semantics 5)."""
+        return quickly; one that raises produces a single `LogEvent`."""
         raise NotImplementedError("WP7")
 
     async def start(self) -> None:
@@ -94,11 +102,11 @@ class ActioAgent(AgentContext):
         raise NotImplementedError("WP7")
 
     def agmen(self) -> Mapping[AgentId, AgentView]:
-        """What the callability rules leave usable, read-only, keyed by agent id (§4)."""
+        """What the callability rules leave usable, read-only, keyed by agent id."""
         raise NotImplementedError("WP7")
 
-    async def refresh(self) -> None:
-        """A full discovery scan now; read the new view with `agmen()`."""
+    async def refresh(self) -> Mapping[AgentId, AgentView]:
+        """A full discovery scan now, and the new view: the same mapping `agmen()` then returns."""
         raise NotImplementedError("WP7")
 
     async def request(
@@ -111,7 +119,11 @@ class ActioAgent(AgentContext):
         attachments: Sequence[str] = (),
         cancel: asyncio.Event | None = None,
     ) -> RequestOutcome:
-        """Lane B. Raises `ActioCallError` when the callability rules refuse it locally, before writing."""
+        """Lane B. Raises `ActioCallError` when the callability rules refuse it locally, before writing.
+
+        `timeout == 0` means wait until the answer or the cancel; the caller's own task being cancelled
+        still ends the exchange correctly in the background.
+        """
         raise NotImplementedError("WP7")
 
     async def command(self, dst: AgentId, name: str, params: Any = None) -> Rid:
@@ -131,5 +143,6 @@ class ActioAgent(AgentContext):
         raise NotImplementedError("WP7")
 
     def _spawn(self, coro: Coroutine[Any, Any, Any], name: str) -> asyncio.Task[Any]:
-        """The one task helper (§5.2): it keeps the strong reference and reports a crash as a `LogEvent`."""
+        """The one task helper, of the shape `Spawn` in `_types.py`: it keeps the strong reference and
+        reports a crash as a `LogEvent`. Everything long-lived comes from here."""
         raise NotImplementedError("WP7")

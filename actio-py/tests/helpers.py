@@ -1,8 +1,10 @@
-"""The helpers every later test uses (plan §9: `unittest`, one event loop, `-X dev -W error`).
+"""The helpers every later test uses: `unittest`, one event loop per test, `-X dev -W error`.
 
-`no_leftovers` is §5.2's rule as a check: after `stop`, nothing of ours is armed. Every end-to-end
-scenario (WP9) and the lifecycle tests (WP7) use it. The default executor's parked worker threads are
-excluded, as the plan says; watchdog's threads are not, because an agent that stopped should have none.
+`no_leftovers` is the "after `stop`, nothing is armed" rule as a check: every end-to-end scenario and
+every lifecycle test uses it. `ActioTestCase` makes it automatic, for the case that rule exists to
+catch: a test that left an agent running raced its own temporary folder's cleanup and failed on one
+machine and passed on another. The default executor's parked worker threads are not ours to stop — and
+threads are compared as objects, never by name, because a name proves nothing.
 """
 
 from __future__ import annotations
@@ -11,13 +13,15 @@ import asyncio
 import contextlib
 import tempfile
 import threading
+import unittest
 from collections.abc import Iterator
 from pathlib import Path
 
 
-def thread_names() -> set[str]:
-    """The threads alive now, minus the default executor's idle workers."""
-    return {t.name for t in threading.enumerate() if not t.name.startswith("ThreadPoolExecutor")}
+def our_threads() -> set[threading.Thread]:
+    """The threads alive now, minus the default executor's workers, which asyncio names `asyncio_<n>`
+    and parks for reuse after a `to_thread` call. Compared by identity, so a name proves nothing."""
+    return {t for t in threading.enumerate() if not t.name.startswith("asyncio_")}
 
 
 def task_names() -> set[str]:
@@ -30,14 +34,40 @@ def task_names() -> set[str]:
 @contextlib.contextmanager
 def no_leftovers() -> Iterator[None]:
     """Fail if a task or a thread of ours is still armed when the block ends."""
-    before_threads = thread_names()
+    before_threads = our_threads()
     loop = asyncio.get_running_loop()
     before_tasks = {id(t) for t in asyncio.all_tasks(loop)}
     yield
     left_tasks = sorted(t.get_name() for t in asyncio.all_tasks(loop) if id(t) not in before_tasks)
-    left_threads = sorted(thread_names() - before_threads)
+    left_threads = sorted(t.name for t in our_threads() - before_threads)
     if left_tasks or left_threads:
         raise AssertionError(f"still armed after stop: tasks={left_tasks} threads={left_threads}")
+
+
+class ActioTestCase(unittest.IsolatedAsyncioTestCase):
+    """The base class for anything that starts an agent: after the test, none of it is still running.
+
+    The instrument is `no_leftovers`'s, armed in `asyncSetUp` and checked by a cleanup registered there,
+    which runs after this test's own `addAsyncCleanup(agent.stop)` and before the loop is closed — the
+    only moment at which a forgotten `stop` is still visible. A running agent keeps tasks armed (its
+    heartbeat, its receiver) and a watcher thread, so it fails the check. Registering it as a cleanup,
+    rather than overriding a hook, is what makes unittest *record* the failure: an exception raised from
+    `tearDown`'s or `doCleanups`'s own body escapes the run instead.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._threads_before = our_threads()
+        self._tasks_before = {id(t) for t in asyncio.all_tasks(self._loop)}
+        self.addCleanup(self._assert_nothing_armed)  # added first, so it runs last
+
+    def _assert_nothing_armed(self) -> None:
+        left_tasks = sorted(
+            t.get_name() for t in asyncio.all_tasks(self._loop) if id(t) not in self._tasks_before
+        )
+        left_threads = sorted(t.name for t in our_threads() - self._threads_before)
+        if left_tasks or left_threads:
+            self.fail(f"a test left something armed: tasks={left_tasks} threads={left_threads}")
 
 
 @contextlib.contextmanager

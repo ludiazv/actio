@@ -1,8 +1,9 @@
 """`actio`: an Actio protocol v0.1 agent in Python (the core conformance profile).
 
-The public surface is frozen at M0 (plan §4) and pinned by `tests/test_api.py`; the protocol shapes are
-pinned against the schemas by `tests/test_protocol_drift.py`. Everything else in the package is private
-by naming (`_*.py`) and is not part of the API.
+The public surface is frozen at M0 and pinned by `tests/test_api.py`; the protocol shapes are pinned
+against the schemas by `tests/test_protocol_drift.py`. Everything else in the package is private by
+naming (`_*.py`) and is not part of the API — including how a sync provider is chosen, which is
+`ActioConfig.sync`, a string, as in `actio-ts`.
 """
 
 from ._agent import ActioAgent
@@ -51,7 +52,6 @@ from ._protocol import (
     Ts,
 )
 from ._status import health
-from ._sync import create_sync_provider
 from ._types import (
     ActioCallError,
     ActioError,
@@ -75,7 +75,6 @@ from ._types import (
     RequestOutcome,
     ScanResult,
     StatusEvent,
-    SyncProvider,
 )
 from ._validate import check_params
 
@@ -88,7 +87,6 @@ __all__ = (
     "scan",
     "health",
     "read_diarium",
-    "create_sync_provider",
     # exceptions
     "ActioError",
     "ActioCallError",
@@ -107,7 +105,6 @@ __all__ = (
     "CapabilityHandler",
     "CommandContext",
     "CommandHandler",
-    "SyncProvider",
     "StatusEvent",
     "AnnounceEvent",
     "InreqEvent",

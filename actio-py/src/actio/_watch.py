@@ -1,18 +1,17 @@
-"""One `watchdog` observer per agent, and an event that means only "look again" (D-23, D-18). WP1.
+"""One `watchdog` observer per agent, and an event that means only "look again" (D-23, D-18).
 
-Start from the oracle's sketch at `orchestra/oracle/sketches/watch_sketch.py.txt`, with its two
-corrections from the plan: the audit interval is a parameter (a test shortens it), and the audit task
-is started by an `async def open(...)` classmethod through `_spawn`, not in `__init__`, which cannot
-await.
-
-watchdog leaves two gaps fsnotify does not: a renamed folder reports nothing, and a kernel overflow on
-a non-recursive watch is discarded with no event. The audit re-checks each folder's inode, so a loss
-costs at most the audit interval, never silence. Its logger gets a `NullHandler` (the traps table).
+An `async def open(...)` classmethod starts it, because `__init__` cannot await: `open` takes a `Spawn`
+so the audit task is started the one way long-lived tasks are started, and it takes the audit interval
+so a test can shorten it. Two gaps fsnotify does not have: a renamed folder reports nothing, and a
+kernel overflow on a non-recursive watch is discarded with no event. The audit re-checks each folder's
+inode, so a loss costs at most the audit interval, never silence. Its logger gets a `NullHandler`.
 """
 
 from __future__ import annotations
 
 import asyncio
+
+from ._types import Spawn
 
 type Markers = dict[str, str]
 
@@ -31,8 +30,8 @@ class Watcher:
     """One per agent: `open()` at start, `close()` at stop; folders are watched non-recursively."""
 
     @classmethod
-    async def open(cls, audit_seconds: float = AUDIT_SECONDS) -> Watcher:
-        """Create it on the running loop, and start its audit task through `_spawn`."""
+    async def open(cls, spawn: Spawn, audit_seconds: float = AUDIT_SECONDS) -> Watcher:
+        """Create it on the running loop, and start its audit task with `spawn`."""
         raise NotImplementedError("WP1")
 
     def subscribe(self, folder: str) -> FolderWatch:

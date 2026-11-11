@@ -1,4 +1,4 @@
-"""Plan §4 is frozen at M0: this test pins the public surface, the shapes and the signatures (R1).
+"""The public surface was frozen at M0: this test pins the names, the shapes and the signatures.
 
 A work package that changes one of these names, one keyword-only marker or one dataclass field has to
 stop and ask, and this test says so first.
@@ -16,7 +16,7 @@ from typing import Any
 import actio
 from actio._types import AgentContext, AgentFolders
 
-# §4's table, plus the protocol types it exports and D-21's factory.
+# The table of *Public API*, plus the protocol types the package exports.
 REQUIRED = (
     # the agent and its API
     "ActioAgent",
@@ -26,7 +26,6 @@ REQUIRED = (
     "scan",
     "health",
     "read_diarium",
-    "create_sync_provider",
     # exceptions
     "ActioError",
     "ActioCallError",
@@ -43,7 +42,6 @@ REQUIRED = (
     "Health",
     "CapabilityContext",
     "CommandContext",
-    "SyncProvider",
     "ActioEvent",
     "StatusEvent",
     "AnnounceEvent",
@@ -75,7 +73,7 @@ REQUIRED = (
     "StatusTask",
 )
 
-# The methods §4's table names, on the class.
+# The method names that table gives, on the class.
 AGENT_METHODS = (
     "capability",
     "on_command",
@@ -113,7 +111,7 @@ def positional(func: Any) -> list[str]:
 
 class SurfaceTest(unittest.TestCase):
     def test_all_is_unique_and_complete(self) -> None:
-        """No duplicates. The order is by role, so the tuple reads like §4 instead of like a dictionary."""
+        """No duplicates. The order is by role, so the tuple reads like the table, not like a dictionary."""
         self.assertEqual(len(actio.__all__), len(set(actio.__all__)))
 
     def test_everything_advertised_exists(self) -> None:
@@ -128,10 +126,10 @@ class SurfaceTest(unittest.TestCase):
     def test_the_frozen_names_are_present(self) -> None:
         for name in REQUIRED:
             if not hasattr(actio, name):
-                self.fail(f"§4 names {name!r}, and it is not in the package")
+                self.fail(f"*Public API* names {name!r}, and it is not in the package")
         for name in AGENT_METHODS:
             if not callable(getattr(actio.ActioAgent, name, None)):
-                self.fail(f"§4 names agent.{name}(), and it is not on ActioAgent")
+                self.fail(f"*Public API* names agent.{name}(), and it is not on ActioAgent")
 
 
 class AgentSurfaceTest(unittest.TestCase):
@@ -193,9 +191,46 @@ class AgentSurfaceTest(unittest.TestCase):
         self.assertEqual(parameters_of(actio.ActioAgent.on_event), ["handler"])
         self.assertEqual(parameters_of(actio.ActioAgent.fail), ["message"])
 
-    def test_the_agent_is_an_agent_context(self) -> None:
-        """The internal seam: `ActioAgent` is what hands `AgentContext` to the receiver and requestor."""
-        self.assertIn(AgentContext, actio.ActioAgent.__mro__)
+    def test_the_agent_subclasses_nothing_and_exports_no_seam(self) -> None:
+        """The seam the engines use is a private object, not a base class.
+
+        A class that inherits a Protocol is abstract to a consumer's `mypy` — it inherits the Protocol's
+        members as abstract — and would put `emit`, `sync`, `folders`, `config`, `id`, `now`, `spec`,
+        `state` and `append_diarium` on the public surface, none of which the table names.
+        """
+        self.assertEqual(actio.ActioAgent.__bases__, (object,))
+        seam = set(AgentContext.__annotations__) | {
+            name for name in vars(AgentContext) if not name.startswith("_")
+        }
+        self.assertTrue(seam, "the seam has to have members for this to mean anything")
+        for name in sorted(seam):
+            self.assertFalse(hasattr(actio.ActioAgent, name), f"agent.{name} is not public API")
+
+    def test_a_consumer_can_build_an_agent_and_use_both_registration_forms(self) -> None:
+        """A consumer's own call sites, type-checked by `mypy` from here.
+
+        `tests` is in mypy's files, so if a frozen signature could not be satisfied from outside — the
+        way an abstract base class defeats it — this fails the type check rather than a review. The bodies
+        are still stubs, so the registration raises; what matters here is that they type-check.
+        """
+        agent = actio.ActioAgent(id="echo", description="d", accepts_commands_from=["*"])
+        cap: actio.Capability = {
+            "name": "echo",
+            "description": "Echo the text back",
+            "parameters": {"type": "object", "properties": {"text": {"type": "string"}}},
+            "actio": {"result": {"type": "object"}},
+        }
+
+        async def echo(params: Any, ctx: actio.CapabilityContext) -> Any:
+            return params
+
+        with self.assertRaises(NotImplementedError):
+            agent.capability(cap, echo)  # the call form
+        with self.assertRaises(NotImplementedError):
+
+            @agent.capability(cap)  # the decorator form, as *Public API* shows it
+            async def decorated(params: Any, ctx: actio.CapabilityContext) -> Any:
+                return params
 
 
 class FunctionSurfaceTest(unittest.TestCase):
@@ -204,7 +239,13 @@ class FunctionSurfaceTest(unittest.TestCase):
         self.assertTrue(inspect.iscoroutinefunction(actio.read_diarium))
         self.assertEqual(positional(actio.health), ["status", "now"])
         self.assertEqual(positional(actio.check_params), ["cap", "params"])
-        self.assertEqual(parameters_of(actio.create_sync_provider), ["value", "on_error"])
+
+    def test_choosing_a_sync_provider_is_not_public(self) -> None:
+        """A caller picks a provider with `ActioConfig.sync`, a string, as `actio-ts` does. Creating one is
+        internal, so neither the factory nor its Protocol reaches `actio.`."""
+        for name in ("create_sync_provider", "SyncProvider"):
+            self.assertFalse(hasattr(actio, name), name)
+            self.assertNotIn(name, actio.__all__)
 
     def test_load_config_takes_the_env_and_every_field(self) -> None:
         names = set(inspect.signature(actio.load_config).parameters)
@@ -286,7 +327,7 @@ class ShapeTest(unittest.TestCase):
         )
 
     def test_the_contexts_are_protocols_with_the_named_members(self) -> None:
-        """§4 names the members a handler may rely on; a protocol states them as annotations or methods."""
+        """The members a handler may rely on; a Protocol states them as annotations or methods."""
         for cls, members in (
             (
                 actio.CapabilityContext,

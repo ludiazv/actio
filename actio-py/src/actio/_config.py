@@ -1,7 +1,9 @@
-"""`ActioConfig`: defaults, the environment, and the injectable clock (*Timers and thresholds*, D-14).
+"""`ActioConfig`: defaults, the environment, and the injectable clock (*Timers and thresholds*).
 
-Durations are **seconds** as `float`, as everywhere in asyncio, where `actio-ts` uses milliseconds.
-The three environment overrides for protocol timers are given in **seconds**, per the spec.
+Durations are **seconds** as `float`, as everywhere in asyncio, where `actio-ts` uses milliseconds. The
+three environment overrides for protocol timers are given in **seconds**, as every duration in the
+protocol is (*Timers and thresholds*); `ACTIO_DIR` is the protocol's own variable (*Implementation
+guidance*), and the rest of the names are as `actio-ts` reads them.
 Precedence: defaults < environment < keyword overrides. Bad values raise `ValueError` here, which
 `load_config` callers see at `start()` — a bad environment must not be silently ignored.
 """
@@ -72,7 +74,7 @@ def load_config(
     stop_grace: float | None = None,
     clock: Callable[[], float] | None = None,
 ) -> ActioConfig:
-    """The effective config: defaults < environment < overrides, validated (D-14)."""
+    """The effective config: defaults < environment < overrides, validated."""
     source: Mapping[str, str] = os.environ if env is None else env
 
     if root is None:
@@ -126,7 +128,10 @@ def _validate(config: ActioConfig) -> None:
         "stop_grace",
     ):
         value: Any = getattr(config, name)
-        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        # `bool` is an `int` in Python, and a duration of `True` is a mistake, not 1 second.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"config.{name} must be a number >= 0 (seconds), got {value!r}")
+        if not math.isfinite(value) or value < 0:
             raise ValueError(f"config.{name} must be a number >= 0 (seconds), got {value!r}")
     if not callable(config.clock):
         raise ValueError("config.clock must be a callable returning seconds")

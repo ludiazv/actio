@@ -1,4 +1,4 @@
-"""The public non-protocol types, the exceptions, and the handler contracts (*Public API*, plan §4).
+"""The public non-protocol types, the exceptions, and the handler contracts (*Public API*).
 
 These are the types a caller passes or receives, other than the protocol shapes in `_protocol.py`.
 Everything here is frozen at M0: a work package that wants one changed stops and asks.
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from ._config import ActioConfig
@@ -17,6 +17,8 @@ from ._protocol import (
     Capability,
     CapabilityName,
     DiariumEntry,
+    InreqFinalStatus,
+    OutreqFinalStatus,
     ResponseBody,
     Rid,
     Spec,
@@ -30,6 +32,12 @@ Health = Literal["healthy", "online", "degraded", "zombie"] | None
 # The two handler signatures. Handlers take decoded JSON and return JSON-serializable data.
 CapabilityHandler = Callable[[Any, "CapabilityContext"], Awaitable[Any]]
 CommandHandler = Callable[[Any, "CommandContext"], Awaitable[None]]
+
+# The one task helper, and the only way a long-lived task starts. It keeps a strong reference to the
+# task and reports an unexpected exception as a `LogEvent`. `ActioAgent._spawn` has exactly this shape,
+# which is why the watcher and the status publisher take a `Spawn` instead of importing the agent: it
+# also lets a test pass a small local one (*Agent Lifecycle*, D-9, D-23).
+type Spawn = Callable[[Coroutine[Any, Any, Any], str], asyncio.Task[Any]]
 
 
 @runtime_checkable
@@ -61,7 +69,12 @@ class RequestOutcome:
 
 
 class ActioError(Exception):
-    """A handler refuses a request or fails: `code >= 1000` (*Acceptance errors*, D-17)."""
+    """A handler refuses a request or fails: `code >= 1000` (*Acceptance errors*).
+
+    A code below 1000 raises `ValueError`: the protocol's own refusal codes are 100-108 and belong to
+    the receiver, so a handler that names one is a bug, and failing at the raise keeps a handler from
+    posing as an acceptance error. `actio-ts` does not check; the README's differences section says so.
+    """
 
     def __init__(self, code: int, message: str, details: Any = None) -> None:
         if code < 1000:
@@ -104,13 +117,13 @@ class AnnounceEvent:
 @dataclasses.dataclass(frozen=True, slots=True)
 class InreqEvent:
     rid: Rid
-    final_status: str
+    final_status: InreqFinalStatus
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class OutreqEvent:
     rid: Rid
-    final_status: str
+    final_status: OutreqFinalStatus
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -201,10 +214,11 @@ class AgentFolders:
 
 @runtime_checkable
 class AgentContext(Protocol):
-    """The internal seam `ActioAgent` hands its receiver, requestor and publisher (not public API).
+    """The internal seam the agent hands its receiver, requestor and publisher. Not public API.
 
-    `ActioAgent` satisfies it. Keeping it a Protocol is what stops `_receiver.py` and `_requestor.py`
-    from importing `_agent.py`, which would be a cycle.
+    A private object built by `ActioAgent` satisfies it *structurally*: `ActioAgent` does not subclass
+    it, because a class that subclasses a Protocol is abstract to `mypy` for every consumer and would
+    make the seam's members part of the public API.
     """
 
     config: ActioConfig
