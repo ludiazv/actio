@@ -54,7 +54,7 @@ class FakeContext:
             forum=str(root / "forum"),
             nuntium=str(root / "nuntium"),
         )
-        self.sync = create_sync_provider("none")
+        self.sync = create_sync_provider("none", spawn=spawn)
         self.events: list[ActioEvent] = []
         # (entry, names in forum at the moment the entry was appended): pins ordering against B5
         self.diarium: list[tuple[DiariumEntry, list[str]]] = []

@@ -14,8 +14,17 @@ import contextlib
 import tempfile
 import threading
 import unittest
-from collections.abc import Iterator
+from collections.abc import Coroutine, Iterator
 from pathlib import Path
+from typing import Any
+
+
+def spawn(coro: Coroutine[Any, Any, Any], name: str) -> asyncio.Task[Any]:
+    """The stand-in for the agent's `Spawn`: one named task per call, nothing else.
+
+    Every seam that takes a `Spawn` is handed this in tests, so no test invents a second spawn shape.
+    """
+    return asyncio.get_running_loop().create_task(coro, name=name)
 
 
 def our_threads() -> set[threading.Thread]:

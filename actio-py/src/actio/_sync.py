@@ -15,7 +15,7 @@ import re
 from collections.abc import Callable
 from typing import Any
 
-from ._types import SyncProvider
+from ._types import Spawn, SyncProvider
 
 MIN_DELAY_MS = 1
 MAX_DELAY_MS = 10_000
@@ -60,12 +60,19 @@ class _MutagenProvider:
     A flush request is never absorbed by the run already in flight: while a run is going, at most one
     follow-up run is promised, and `flush()` resolves only once a run that started after the call has
     finished, so the writes made during a flush are covered by the next one.
+
+    The runs are the agent's tasks: the provider is handed the same `Spawn` the watcher and the status
+    publisher get, so a flush run is tracked like every other task the agent starts and `stop` can wait
+    for it. A failing run goes to `on_error` and nowhere else.
     """
 
-    def __init__(self, session: str, on_error: Callable[[Exception], None] | None) -> None:
+    def __init__(
+        self, session: str, spawn: Spawn, on_error: Callable[[Exception], None] | None = None
+    ) -> None:
         self.fsync = False
         self.delay_ms = 0
         self._session = session
+        self._spawn = spawn
         self._on_error = on_error
         self._loop = asyncio.get_running_loop()  # the agent creates the provider at `start`
         self._timer: asyncio.TimerHandle | None = None
@@ -87,21 +94,21 @@ class _MutagenProvider:
 
     def _run(self) -> asyncio.Task[None]:
         if self._running is None:
-            return self._spawn()
+            return self._start_flush()
         if self._pending is None:
             in_flight = self._running
             assert in_flight is not None
-            self._pending = self._loop.create_task(self._follow_up(in_flight))
+            self._pending = self._spawn(self._follow_up(in_flight), "actio.sync.follow_up")
         return self._pending
 
     async def _follow_up(self, in_flight: asyncio.Task[None]) -> None:
         await in_flight
         self._pending = None  # free the slot first: the follow-up becomes the new in-flight run
-        self._running = self._spawn()
+        self._running = self._start_flush()
         await self._running
 
-    def _spawn(self) -> asyncio.Task[None]:
-        task = self._loop.create_task(self._flush_once())
+    def _start_flush(self) -> asyncio.Task[None]:
+        task = self._spawn(self._flush_once(), "actio.sync.flush")
         self._running = task
 
         def _settled(done: asyncio.Task[None]) -> None:
@@ -140,9 +147,14 @@ class _MutagenProvider:
 
 
 def create_sync_provider(
-    value: str, on_error: Callable[[Exception], None] | None = None
+    value: str, *, spawn: Spawn, on_error: Callable[[Exception], None] | None = None
 ) -> SyncProvider:
-    """Parse one `ACTIO_SYNC` value; a bad value raises `ValueError` at `start()`, never silently."""
+    """Parse one `ACTIO_SYNC` value; a bad value raises `ValueError` at `start()`, never silently.
+
+    `spawn` is the agent's frozen `Spawn`: the mutagen provider runs its debounced flushes as tasks of
+    the agent, so `stop` waits for them and nothing is left armed. A delay or `none` provider starts no
+    task and ignores it.
+    """
     if value == "none":
         return _NopProvider(False, 0)
     match = _DELAY.match(value)
@@ -151,7 +163,7 @@ def create_sync_provider(
     if value.startswith("mutagen:"):
         session: Any = value.removeprefix("mutagen:")
         if session:
-            return _MutagenProvider(session, on_error)
+            return _MutagenProvider(session, spawn, on_error)
     raise ValueError(
         f"ACTIO_SYNC: unknown sync provider {value!r} (expected none, delay[:<ms>], "
         "fsync+delay[:<ms>] or mutagen:<session>)"

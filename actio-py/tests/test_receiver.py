@@ -265,7 +265,7 @@ class FakeContext:
             forum=str(agent_dir_path / "forum"),
             nuntium=str(agent_dir_path / "nuntium"),
         )
-        self.sync = create_sync_provider("none")
+        self.sync = create_sync_provider("none", spawn=spawn)
         self._clock = clock
         self._spec = spec
         self._handlers = handlers

@@ -124,7 +124,7 @@ class PublisherTest(ActioTestCase):
     async def test_publish_spec_writes_the_validated_spec(self) -> None:
         with actio_tree() as root:
             folders = folders_for(root)
-            publisher = StatusPublisher(folders, create_sync_provider("none"), spawn)
+            publisher = StatusPublisher(folders, create_sync_provider("none", spawn=spawn), spawn)
             spec = load_spec()
             await publisher.publish_spec(spec)
             doc = json.loads((Path(folders.agent) / "spec.json").read_text(encoding="utf-8"))
@@ -134,7 +134,7 @@ class PublisherTest(ActioTestCase):
     async def test_publish_status_writes_a_validated_status(self) -> None:
         with actio_tree() as root:
             folders = folders_for(root)
-            publisher = StatusPublisher(folders, create_sync_provider("none"), spawn)
+            publisher = StatusPublisher(folders, create_sync_provider("none", spawn=spawn), spawn)
             await publisher.publish_status(build_status(AGENT, "idle", TS))
             doc = json.loads((Path(folders.agent) / "status.json").read_text(encoding="utf-8"))
             self.assertIsNone(validate("status", doc))
@@ -143,7 +143,7 @@ class PublisherTest(ActioTestCase):
     async def test_an_invalid_status_raises_and_writes_nothing(self) -> None:
         with actio_tree() as root:
             folders = folders_for(root)
-            publisher = StatusPublisher(folders, create_sync_provider("none"), spawn)
+            publisher = StatusPublisher(folders, create_sync_provider("none", spawn=spawn), spawn)
             bad = cast(
                 Status,
                 {
@@ -160,7 +160,7 @@ class PublisherTest(ActioTestCase):
     async def test_an_invalid_spec_raises_and_writes_nothing(self) -> None:
         with actio_tree() as root:
             folders = folders_for(root)
-            publisher = StatusPublisher(folders, create_sync_provider("none"), spawn)
+            publisher = StatusPublisher(folders, create_sync_provider("none", spawn=spawn), spawn)
             bad_spec = cast(Spec, {k: v for k, v in load_spec().items() if k != "id"})
             with self.assertRaises(ValueError):
                 await publisher.publish_spec(bad_spec)
@@ -169,7 +169,7 @@ class PublisherTest(ActioTestCase):
     async def test_announce_writes_the_nuntium_file(self) -> None:
         with actio_tree() as root:
             folders = folders_for(root)
-            publisher = StatusPublisher(folders, create_sync_provider("none"), spawn)
+            publisher = StatusPublisher(folders, create_sync_provider("none", spawn=spawn), spawn)
             await publisher.announce(AGENT, "agent is active", TS)
             path = Path(folders.nuntium) / f"{AGENT}.n.json"
             doc = json.loads(path.read_text(encoding="utf-8"))
@@ -187,7 +187,7 @@ class PublisherTest(ActioTestCase):
     async def test_the_latch_makes_every_later_write_a_no_op(self) -> None:
         with actio_tree() as root:
             folders = folders_for(root)
-            publisher = StatusPublisher(folders, create_sync_provider("none"), spawn)
+            publisher = StatusPublisher(folders, create_sync_provider("none", spawn=spawn), spawn)
             spec = load_spec()
             await publisher.publish_spec(spec)
             await publisher.publish_status(build_status(AGENT, "idle", TS))
@@ -215,12 +215,12 @@ class PublisherTest(ActioTestCase):
     async def test_a_fresh_publisher_writes_again(self) -> None:
         with actio_tree() as root:
             folders = folders_for(root)
-            publisher = StatusPublisher(folders, create_sync_provider("none"), spawn)
+            publisher = StatusPublisher(folders, create_sync_provider("none", spawn=spawn), spawn)
             await publisher.publish_status(build_status(AGENT, "inactive", TS))
             self.assertTrue(publisher.latched)
             status_path = Path(folders.agent) / "status.json"
             # A restart builds a fresh publisher, and with it a fresh latch.
-            fresh = StatusPublisher(folders, create_sync_provider("none"), spawn)
+            fresh = StatusPublisher(folders, create_sync_provider("none", spawn=spawn), spawn)
             self.assertFalse(fresh.latched)
             await fresh.publish_status(build_status(AGENT, "idle", TS))
             self.assertEqual(json.loads(status_path.read_text(encoding="utf-8"))["status"], "idle")
@@ -228,7 +228,7 @@ class PublisherTest(ActioTestCase):
     async def test_nothing_is_armed_after_use(self) -> None:
         with actio_tree() as root:
             folders = folders_for(root)
-            publisher = StatusPublisher(folders, create_sync_provider("none"), spawn)
+            publisher = StatusPublisher(folders, create_sync_provider("none", spawn=spawn), spawn)
             with no_leftovers():
                 await publisher.publish_status(build_status(AGENT, "idle", TS))
                 await publisher.announce(AGENT, "agent is active", TS)
@@ -241,7 +241,9 @@ class GuardedWriteTest(ActioTestCase):
         for i in range(50):
             with actio_tree() as root:
                 folders = folders_for(root)
-                publisher = StatusPublisher(folders, create_sync_provider("none"), spawn)
+                publisher = StatusPublisher(
+                    folders, create_sync_provider("none", spawn=spawn), spawn
+                )
                 status_path = Path(folders.agent) / "status.json"
 
                 async def beat(publisher: StatusPublisher = publisher) -> None:
@@ -267,7 +269,9 @@ class GuardedWriteTest(ActioTestCase):
         for i in range(50):
             with actio_tree() as root:
                 folders = folders_for(root)
-                publisher = StatusPublisher(folders, create_sync_provider("none"), spawn)
+                publisher = StatusPublisher(
+                    folders, create_sync_provider("none", spawn=spawn), spawn
+                )
                 status_path = Path(folders.agent) / "status.json"
                 idle = build_status(AGENT, "idle", time.time())
                 before = [
@@ -293,7 +297,9 @@ class GuardedWriteTest(ActioTestCase):
         with actio_tree() as root:
             folders = folders_for(root)
             # A 50 ms sync provider: the tick's write is measurably in flight when C1 comes.
-            publisher = StatusPublisher(folders, create_sync_provider("delay:50"), spawn)
+            publisher = StatusPublisher(
+                folders, create_sync_provider("delay:50", spawn=spawn), spawn
+            )
             status_path = Path(folders.agent) / "status.json"
 
             async def beat() -> None:

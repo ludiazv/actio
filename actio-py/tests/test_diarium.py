@@ -23,7 +23,7 @@ from actio._diarium import (
 from actio._protocol import DiariumEntry, ExchangeRecord, InreqFinalStatus, OutreqFinalStatus
 from actio._sync import create_sync_provider
 from actio._validate import validate
-from helpers import ActioTestCase, actio_tree
+from helpers import ActioTestCase, actio_tree, spawn
 
 AGENT = "summarizer"
 TS = 1_792_836_000.0  # 2026-10-24T10:00:00Z
@@ -100,7 +100,7 @@ class AppendTest(ActioTestCase):
             agent = root / AGENT
             agent.mkdir()  # the agent folder exists: it is created at registration
             folder = str(agent)
-            provider = create_sync_provider("none")
+            provider = create_sync_provider("none", spawn=spawn)
             first = log_event(AGENT, TS, "one")
             second = status_event(AGENT, TS + 1, "idle")
             await append(folder, first, provider)
@@ -112,7 +112,7 @@ class AppendTest(ActioTestCase):
     async def test_append_refuses_an_invalid_entry_before_writing(self) -> None:
         with actio_tree() as root:
             folder = str(root / AGENT)
-            provider = create_sync_provider("none")
+            provider = create_sync_provider("none", spawn=spawn)
             # Not one of the four states: the schema's `if`/`then` for `status` rejects it.
             bad: DiariumEntry = {
                 "id": AGENT,
@@ -146,7 +146,7 @@ class ReadDiariumTest(ActioTestCase):
             agent = root / AGENT
             agent.mkdir()  # the agent folder exists: it is created at registration
             folder = str(agent)
-            provider = create_sync_provider("none")
+            provider = create_sync_provider("none", spawn=spawn)
             entries = [
                 status_event(AGENT, TS, "inactive"),
                 announce_event(AGENT, TS + 1),
@@ -209,7 +209,7 @@ class ReadDiariumTest(ActioTestCase):
             agent = root / AGENT
             agent.mkdir()  # the agent folder exists: it is created at registration
             folder = str(agent)
-            provider = create_sync_provider("none")
+            provider = create_sync_provider("none", spawn=spawn)
             custom: DiariumEntry = {
                 "id": AGENT,
                 "datetime": "2026-10-24T10:00:00Z",

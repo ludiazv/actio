@@ -21,7 +21,7 @@ from actio._sync import (
     MUTAGEN_DEBOUNCE_MS,
     create_sync_provider,
 )
-from helpers import actio_tree
+from helpers import actio_tree, spawn
 
 
 class GrammarTest(unittest.TestCase):
@@ -35,7 +35,7 @@ class GrammarTest(unittest.TestCase):
             "fsync+delay:250": (True, 250),
         }
         for value, (fsync, delay_ms) in cases.items():
-            provider = create_sync_provider(value)
+            provider = create_sync_provider(value, spawn=spawn)
             self.assertEqual(provider.fsync, fsync, value)
             self.assertEqual(provider.delay_ms, delay_ms, value)
             provider.close()
@@ -52,10 +52,10 @@ class GrammarTest(unittest.TestCase):
             "",
         ):
             with self.assertRaises(ValueError, msg=value):
-                create_sync_provider(value)
+                create_sync_provider(value, spawn=spawn)
 
     def test_none_does_no_fsync_and_no_delay(self) -> None:
-        provider = create_sync_provider("none")
+        provider = create_sync_provider("none", spawn=spawn)
         self.assertFalse(provider.fsync)
         self.assertEqual(provider.delay_ms, 0)
         provider.close()
@@ -63,7 +63,7 @@ class GrammarTest(unittest.TestCase):
 
 class DelayWaitsTest(unittest.IsolatedAsyncioTestCase):
     async def test_a_delay_actually_waits_about_that_long(self) -> None:
-        provider = create_sync_provider("delay:80")
+        provider = create_sync_provider("delay:80", spawn=spawn)
         with actio_tree() as root:
             start = time.monotonic()
             await write_json_atomic(str(root / "a.json"), {}, str(root / "tmp"), provider)
@@ -75,7 +75,7 @@ class DelayWaitsTest(unittest.IsolatedAsyncioTestCase):
 class MutagenTest(unittest.IsolatedAsyncioTestCase):
     async def test_a_run_that_cannot_start_reaches_on_error_and_escapes_nothing(self) -> None:
         errors: list[Exception] = []
-        provider = create_sync_provider("mutagen:test-session", on_error=errors.append)
+        provider = create_sync_provider("mutagen:test-session", on_error=errors.append, spawn=spawn)
         with mock.patch.dict(os.environ, {"ACTIO_MUTAGEN_BIN": "/nonexistent/actio-mutagen"}):
             await provider.flush()  # must not raise
             provider.close()
@@ -88,7 +88,7 @@ class MutagenTest(unittest.IsolatedAsyncioTestCase):
             fake = root / "mutagen"
             fake.write_text(f"#!/bin/sh\necho run >> {log}\n", encoding="utf-8")
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-            provider = create_sync_provider("mutagen:s")
+            provider = create_sync_provider("mutagen:s", spawn=spawn)
             with mock.patch.dict(os.environ, {"ACTIO_MUTAGEN_BIN": str(fake)}):
                 provider.notify()
                 provider.notify()
@@ -105,7 +105,7 @@ class MutagenTest(unittest.IsolatedAsyncioTestCase):
             fake = root / "mutagen"
             fake.write_text(f"#!/bin/sh\necho run >> {log}\n", encoding="utf-8")
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-            provider = create_sync_provider("mutagen:s")
+            provider = create_sync_provider("mutagen:s", spawn=spawn)
             with mock.patch.dict(os.environ, {"ACTIO_MUTAGEN_BIN": str(fake)}):
                 provider.notify()
                 provider.notify()

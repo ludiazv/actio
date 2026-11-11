@@ -31,7 +31,7 @@ from actio._files import (
     write_json_atomic,
 )
 from actio._sync import create_sync_provider
-from helpers import actio_tree
+from helpers import actio_tree, spawn
 
 
 class DumpsTest(unittest.TestCase):
@@ -95,7 +95,9 @@ class AtomicWriteTest(unittest.IsolatedAsyncioTestCase):
             tmp = root / "tmp"
             target = root / "agents" / "a" / "status.json"
             target.parent.mkdir(parents=True)  # the folder layout is not the file layer's job
-            await write_json_atomic(str(target), {"s": 1}, str(tmp), create_sync_provider("none"))
+            await write_json_atomic(
+                str(target), {"s": 1}, str(tmp), create_sync_provider("none", spawn=spawn)
+            )
             self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"s": 1})
             self.assertEqual([p.name for p in tmp.iterdir() if p.name.endswith(".tmp")], [])
 
@@ -114,7 +116,9 @@ class AtomicWriteTest(unittest.IsolatedAsyncioTestCase):
                 mock.patch("actio._files.nonce", return_value="f" * 32),
                 mock.patch("actio._files.os.replace", side_effect=spy),
             ):
-                await write_json_atomic(str(target), {}, str(tmp), create_sync_provider("none"))
+                await write_json_atomic(
+                    str(target), {}, str(tmp), create_sync_provider("none", spawn=spawn)
+                )
             self.assertEqual(seen, [str(tmp / f".x.json.{'f' * 32}.tmp")])
 
 
@@ -122,7 +126,7 @@ class AppendJsonlTest(unittest.IsolatedAsyncioTestCase):
     async def test_two_appends_are_two_lines_with_a_trailing_newline(self) -> None:
         with actio_tree() as root:
             path = root / "nuntium.jsonl"
-            provider = create_sync_provider("none")
+            provider = create_sync_provider("none", spawn=spawn)
             await append_jsonl(str(path), {"n": 1}, provider)
             await append_jsonl(str(path), {"n": 2}, provider)
             self.assertEqual(path.read_text(encoding="utf-8"), '{"n":1}\n{"n":2}\n')
@@ -135,7 +139,7 @@ class SmallHelpersTest(unittest.IsolatedAsyncioTestCase):
             src.write_bytes(b"the bytes")
             tmp = root / "tmp"
             dst = root / "dst.bin"
-            await copy_file(str(src), str(dst), str(tmp), create_sync_provider("none"))
+            await copy_file(str(src), str(dst), str(tmp), create_sync_provider("none", spawn=spawn))
             self.assertEqual(dst.read_bytes(), b"the bytes")
             self.assertEqual([p.name for p in tmp.iterdir() if p.name.endswith(".tmp")], [])
 
@@ -176,15 +180,16 @@ class SyncHooksTest(unittest.IsolatedAsyncioTestCase):
         # One worker thread, and two writes with a 1.5 s pause each. A pause slept inside the thread
         # would serialise them: 3.0 s. A pause awaited on the loop: 1.5 s, and the thread is free.
         with actio_tree() as root:
+            here = str(root)
             loop = asyncio.get_running_loop()
-            provider = create_sync_provider("delay:1500")
+            provider = create_sync_provider("delay:1500", spawn=spawn)
             pool = ThreadPoolExecutor(max_workers=1)
             loop.set_default_executor(pool)
             try:
                 start = time.monotonic()
                 await asyncio.gather(
-                    write_json_atomic(os.path.join(root, "a.json"), {"n": 1}, root, provider),
-                    write_json_atomic(os.path.join(root, "b.json"), {"n": 2}, root, provider),
+                    write_json_atomic(os.path.join(here, "a.json"), {"n": 1}, here, provider),
+                    write_json_atomic(os.path.join(here, "b.json"), {"n": 2}, here, provider),
                 )
                 elapsed = time.monotonic() - start
             finally:
@@ -197,9 +202,12 @@ class SyncHooksTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_write_bytes_atomic_replaces_once_and_leaves_no_temp(self) -> None:
         with actio_tree() as root:
-            target = os.path.join(root, "inbox", "part.dat")
+            here = str(root)
+            target = os.path.join(here, "inbox", "part.dat")
             await make_dirs(os.path.dirname(target))
-            await write_bytes_atomic(target, b"\x00\xff bytes", root, create_sync_provider("none"))
+            await write_bytes_atomic(
+                target, b"\x00\xff bytes", here, create_sync_provider("none", spawn=spawn)
+            )
             with open(target, "rb") as fh:
                 self.assertEqual(fh.read(), b"\x00\xff bytes")
             self.assertEqual([n for n in os.listdir(root) if n.endswith(".tmp")], [])
@@ -211,7 +219,9 @@ class SyncHooksTest(unittest.IsolatedAsyncioTestCase):
             os.makedirs(os.path.dirname(path))
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write('{"a": 1}')
-            mtime_ns, text = await read_text_with_mtime(path)
+            got = await read_text_with_mtime(path)
+            self.assertIsNotNone(got)
+            mtime_ns, text = got or (0, "")
             self.assertEqual(text, '{"a": 1}')
             self.assertGreater(mtime_ns, 0)
             os.chmod(path, 0o000)
