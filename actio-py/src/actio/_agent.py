@@ -385,10 +385,7 @@ class ActioAgent:
             await self._reannounce_after_delay(
                 run, f"agent {self._id} is active"
             )  # then the announce
-            # An alias so the file-call grep (which catches a bare `open(`) sees the watcher's
-            # constructor for what it is: not a file call.
-            open_watcher = Watcher.open
-            watcher = await open_watcher(self._spawn, audit_seconds=AUDIT_SECONDS)
+            watcher = await Watcher.open(self._spawn, audit_seconds=AUDIT_SECONDS)
             run.watcher = watcher
             ctx = _Ctx(self, run)
             run.receiver = Receiver(ctx, _ReceiverHooks(self), watcher, self._spawn)
