@@ -8,8 +8,8 @@ are an unparsable file, not a value.
 
 The `delay` provider's pause is awaited **on the loop after the thread returns**, never slept inside
 the thread: a `delay:10000` write would otherwise hold an executor thread for ten seconds, and a
-burst of writes would starve every other disk operation (§9: no `time.sleep`, a worker thread
-included).
+burst of writes would starve every other disk operation. Nothing in this package sleeps; a pause is
+always an `await`.
 """
 
 from __future__ import annotations

@@ -47,9 +47,9 @@ class InstalledSchemasTest(unittest.TestCase):
 class ByteIdenticalCopyTest(unittest.TestCase):
     """The copy is byte-identical to `../doc/schemas/`.
 
-    A missing reference is a **failure**, not a skip (§9: no skip decorator, and a test whose input is
-    missing fails with a message). A validation copy that is cut from git alone must copy the reference
-    in beside it — the layout this test expects is `../doc/schemas` next to `actio-py`.
+    A missing reference is a **failure**, not a skip: a test whose input is missing fails, with a
+    message. A validation copy cut from git alone must copy the reference in beside it — the layout this
+    test expects is `../doc/schemas` next to `actio-py`.
     """
 
     def setUp(self) -> None:
