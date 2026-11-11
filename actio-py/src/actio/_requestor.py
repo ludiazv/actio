@@ -89,7 +89,6 @@ class Requestor:
         self._watch = watch
         self._spawn = spawn  # every task this lane starts, including a settlement, is the agent's
         self._exchanges: dict[Rid, _Outbound] = {}
-        self._settling: set[asyncio.Task[RequestOutcome]] = set()
 
     async def request(
         self,
@@ -155,9 +154,9 @@ class Requestor:
                 with contextlib.suppress(BaseException):
                     await ex.task
         for ex in live:
-            await self._settle(ex, "abandoned", None)  # waits for a settlement already in flight
-        while self._settling:  # one already out of `_exchanges` can't be: they leave when settled
-            await asyncio.gather(*self._settling, return_exceptions=True)
+            await self._settle(ex, "abandoned", None)  # an exchange leaves the table only when settled,
+        # so a settlement already in flight is still here, and `shield` waits for it (D-9: every owed
+        # `outreq` line is on disk before the agent publishes `inactive`)
 
     # -- the envelopes ----------------------------------------------------
 
@@ -375,10 +374,7 @@ class Requestor:
         if ex.settling is None:
             ex.done = True
             ex.outcome = RequestOutcome(final_status=final, response=ex.response_body)
-            task = self._spawn(self._settle_now(ex, final, con), f"actio.settle.{ex.rid}")
-            self._settling.add(task)
-            task.add_done_callback(self._settling.discard)
-            ex.settling = task
+            ex.settling = self._spawn(self._settle_now(ex, final, con), f"actio.settle.{ex.rid}")
         return await asyncio.shield(ex.settling)
 
     async def _settle_now(
