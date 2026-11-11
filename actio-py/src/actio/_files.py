@@ -9,56 +9,214 @@ are an unparsable file, not a value.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
+import os
+import shutil
+import time
 from typing import Any
 
 from ._types import SyncProvider
+from ._util import nonce
+
+
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"an unparsable JSON constant from a peer: {name}")
+
+
+# Nesting beyond this is unparsable: deep enough to hit the interpreter's recursion limit (or the
+# C scanner's stack), never a value the protocol has. The pre-scan keeps the C scanner far from a
+# stack overflow, which no exception would report.
+MAX_DEPTH = 1000
+
+
+def _depth_ok(text: str) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > MAX_DEPTH:
+                return False
+        elif ch in "]}":
+            depth -= 1
+    return True
+
+
+def _ensure_json_value(obj: Any) -> None:
+    """The encoder would silently write a tuple as an array; the protocol's values are JSON, so no."""
+    stack: list[Any] = [obj]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, tuple):
+            raise TypeError("a tuple is not a JSON value; use a list")
+        if isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, (list, set, frozenset)):
+            stack.extend(value)
 
 
 def dumps(obj: Any) -> str:
-    """The one JSON writer of the protocol: compact, non-ASCII kept, no NaN or Infinity."""
-    raise NotImplementedError("WP1")
+    """The one JSON writer of the protocol: compact, non-ASCII kept, no NaN, Infinity or tuples."""
+    _ensure_json_value(obj)
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def loads(text: str) -> Any:
     """The one JSON reader: raises on NaN, Infinity and nesting too deep (D-15)."""
-    raise NotImplementedError("WP1")
+    if not _depth_ok(text):
+        raise ValueError("a document nested too deep to parse")
+    try:
+        return json.loads(text, parse_constant=_reject_constant)
+    except RecursionError as err:
+        # A RecursionError is not a ValueError, and a caller must not see it (D-15).
+        raise ValueError("a document nested too deep to parse") from err
+
+
+def _fsync_dir(folder: str) -> None:
+    try:
+        fd = os.open(folder, os.O_RDONLY)
+    except OSError:
+        return  # not openable on some platforms
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass  # a directory fsync is not supported on some platforms
+    finally:
+        os.close(fd)
+
+
+def _post_write(target: str, provider: SyncProvider) -> None:
+    if provider.fsync:
+        _fsync_dir(os.path.dirname(target))
+    provider.notify()
+    if provider.delay_ms > 0:
+        time.sleep(provider.delay_ms / 1000)
+
+
+def _temp_in(tmp_dir: str, base: str) -> str:
+    os.makedirs(tmp_dir, exist_ok=True)
+    return os.path.join(tmp_dir, f".{base}.{nonce()}.tmp")
+
+
+def _replace(tmp: str, target: str) -> None:
+    try:
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)  # a failed rename leaves no temp behind
+        raise
 
 
 async def read_json(path: str) -> Any:
     """The whole file as a value; None when it is missing or unparsable (*Files* rule 1.5)."""
-    raise NotImplementedError("WP1")
+
+    def _read() -> Any:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return loads(fh.read())
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+
+    return await asyncio.to_thread(_read)
 
 
 async def write_json_atomic(path: str, obj: Any, tmp_dir: str, provider: SyncProvider) -> None:
     """Temp file `.<base>.<nonce>.tmp` in `tmp_dir`, then `os.replace`; the provider's hooks follow."""
-    raise NotImplementedError("WP1")
+
+    def _write() -> None:
+        tmp = _temp_in(tmp_dir, os.path.basename(path))
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(dumps(obj))
+            if provider.fsync:
+                fh.flush()
+                os.fsync(fh.fileno())
+        _replace(tmp, path)
+        _post_write(path, provider)
+
+    await asyncio.to_thread(_write)
 
 
 async def append_jsonl(path: str, obj: Any, provider: SyncProvider) -> None:
     """One `os.write` of one line on an `O_APPEND` descriptor (*File Format* rule 6)."""
-    raise NotImplementedError("WP1")
+
+    def _append() -> None:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, dumps(obj).encode("utf-8") + b"\n")
+            if provider.fsync:
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        _post_write(path, provider)
+
+    await asyncio.to_thread(_append)
 
 
 async def copy_file(src: str, dst: str, tmp_dir: str, provider: SyncProvider) -> None:
     """An attachment: copy to a temp file in the destination's `tmp_dir`, then rename."""
-    raise NotImplementedError("WP1")
+
+    def _copy() -> None:
+        tmp = _temp_in(tmp_dir, os.path.basename(dst))
+        shutil.copyfile(src, tmp)
+        if provider.fsync:
+            fd = os.open(tmp, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
+        _replace(tmp, dst)
+        _post_write(dst, provider)
+
+    await asyncio.to_thread(_copy)
 
 
 async def read_bytes(path: str) -> bytes:
     """An attachment's bytes, for `ctx.publish_attachment` and the CLI."""
-    raise NotImplementedError("WP1")
+
+    def _read() -> bytes:
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    return await asyncio.to_thread(_read)
 
 
 async def list_dir(path: str) -> list[str]:
     """The entry names of a folder; raises `OSError` when it is gone (the caller decides)."""
-    raise NotImplementedError("WP1")
+    return await asyncio.to_thread(os.listdir, path)
 
 
 async def make_dirs(path: str) -> None:
     """Create a folder and its parents; idempotent."""
-    raise NotImplementedError("WP1")
+
+    def _make() -> None:
+        os.makedirs(path, exist_ok=True)
+
+    await asyncio.to_thread(_make)
 
 
 async def remove(path: str) -> None:
     """Remove a file or folder, ignoring a missing path (housekeeping, D-16)."""
-    raise NotImplementedError("WP1")
+
+    def _remove() -> None:
+        if not os.path.lexists(path):
+            return
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+
+    await asyncio.to_thread(_remove)
