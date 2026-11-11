@@ -74,7 +74,9 @@ def _schema_registry() -> referencing.Registry:
         folder = resources.files("actio.schemas")
         reg = referencing.Registry()
         for name in _SCHEMA_FILES:
-            schema = json.loads(folder.joinpath(f"{name}.schema.json").read_text(encoding="utf-8"))
+            # The schema pack is package data, read once: not a file of the tree (D-20).
+            pack = folder.joinpath(f"{name}.schema.json").read_text(encoding="utf-8")  # schema pack
+            schema = json.loads(pack)
             _schemas[f"{name}.schema.json"] = schema
             reg = reg.with_resource(schema["$id"], referencing.Resource.from_contents(schema))
         _registry = reg

@@ -154,7 +154,9 @@ class Requestor:
                 with contextlib.suppress(BaseException):
                     await ex.task
         for ex in live:
-            await self._settle(ex, "abandoned", None)  # an exchange leaves the table only when settled,
+            await self._settle(
+                ex, "abandoned", None
+            )  # an exchange leaves the table only when settled,
         # so a settlement already in flight is still here, and `shield` waits for it (D-9: every owed
         # `outreq` line is on disk before the agent publishes `inactive`)
 
