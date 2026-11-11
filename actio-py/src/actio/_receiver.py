@@ -481,8 +481,9 @@ class Receiver:
             if req is not None and not name_matches(cast(RequestBody, req["request"]), can_body):
                 return f"cancellation name mismatch for rid {ex.rid}"
             ex.cancelled.set()
-            if ex.res is None:
-                ex.can = cast(CancellationFile, file)  # a late can leaves `can: null` (Q1)
+            # A `can` after the response is recorded too: the archive ends `cancelled`
+            # (*Envelope lifecycle*, "Cancelled after the response"); no second response.
+            ex.can = cast(CancellationFile, file)
             return None
         if ex.con is not None:
             return None  # the confirmation file is written once; later ones are no-ops
@@ -523,9 +524,9 @@ class Receiver:
         )
         ex = _Exchange(rid, header, None, "responded", asyncio.Event(), res=file)
         can = await self._read_known_envelope(f"{rid}.can.json", "cancellation", file)
-        # a late can (the stored answer is not a cancellation) leaves `can: null` in the record (Q1)
-        is_cancel = isinstance(file["response"], dict) and file["response"]["cancellation"]
-        if can is not None and is_cancel:
+        if can is not None:
+            # A stored late `can` is recorded: the archive ends `cancelled`
+            # (*Envelope lifecycle*, "Cancelled after the response").
             ex.can = cast(CancellationFile, can)
             ex.cancelled.set()
         con = await self._read_known_envelope(f"{rid}.con.json", "confirmation", file)

@@ -4,9 +4,10 @@ A fake context (fake clock, in-memory events, a real diarium in a temporary tree
 `Receiver` on a real `Watcher`. Timeouts are generous on purpose: watchdog timing varies under
 load, and the suite runs eight times at once at each milestone, where a flake is a failure.
 
-The late-cancellation expectations here pin the brief's rule (a late `can` leaves `can: null` and
-the status follows the confirmation); see `orchestra/oracle/Q1.md` for the conflict with the
-reference and the protocol.
+The late-cancellation expectations follow the protocol's *Envelope lifecycle* paths table and
+*Sync and Race Conditions* (a `can` after the response archives the exchange as `cancelled`, the
+`can` recorded, no second response); `../actio-ts/src/receiver.ts` agrees. A brief once said
+otherwise; the protocol is the authority.
 """
 
 from __future__ import annotations
@@ -20,8 +21,9 @@ from typing import Any, cast
 
 from actio._config import load_config
 from actio._diarium import append, read_diarium
-from actio._protocol import DiariumEntry, ExchangeRecord, Spec, StatusState
+from actio._protocol import CancellationBody, DiariumEntry, ExchangeRecord, Spec, StatusState
 from actio._receiver import Receiver
+from actio._requestor import Requestor
 from actio._sync import create_sync_provider
 from actio._types import (
     ActioEvent,
@@ -248,19 +250,20 @@ class FakeContext:
         spec: Spec,
         handlers: dict[str, CapabilityHandler],
         *,
+        agent: str = "summarizer",
         confirm_timeout: float = 0.3,
     ) -> None:
-        agent = root / "summarizer"
+        agent_dir_path = root / agent
         self.config = load_config(
             env={}, root=str(root), confirm_timeout=confirm_timeout, clock=clock.value
         )
-        self.id = "summarizer"
+        self.id = agent
         self.folders = AgentFolders(
             root=str(root),
-            agent=str(agent),
-            inbox=str(agent / "inbox"),
-            forum=str(agent / "forum"),
-            nuntium=str(agent / "nuntium"),
+            agent=str(agent_dir_path),
+            inbox=str(agent_dir_path / "inbox"),
+            forum=str(agent_dir_path / "forum"),
+            nuntium=str(agent_dir_path / "nuntium"),
         )
         self.sync = create_sync_provider("none")
         self._clock = clock
@@ -335,6 +338,18 @@ async def inreq_for(root: Path, r: str) -> ExchangeRecord | None:
     read = await read_diarium(str(agent_dir(root)))
     for line in read.lines:
         if line["event"] != "inreq":
+            continue
+        data = line["event_data"]
+        if isinstance(data, dict) and _record_rid(data) == r:
+            return cast(ExchangeRecord, data)
+    return None
+
+
+async def outreq_for(root: Path, r: str) -> ExchangeRecord | None:
+    """The `outreq` record of `r` in the `caller`'s diarium (the requestor's own write)."""
+    read = await read_diarium(str(root / "caller"))
+    for line in read.lines:
+        if line["event"] != "outreq":
             continue
         data = line["event_data"]
         if isinstance(data, dict) and _record_rid(data) == r:
@@ -679,8 +694,9 @@ class CancellationTest(ReceiverTest):
             assert isinstance(can_body, dict)
             self.assertEqual(can_body["name"], "summarize")
 
-    async def test_a_late_cancellation_leaves_can_null(self) -> None:
-        """The brief's Q1 rule: a `can` after the response does not become the record's `can`."""
+    async def test_a_late_cancellation_archives_cancelled_with_the_can(self) -> None:
+        """Protocol, *Envelope lifecycle*, "Cancelled after the response": the late `can` is
+        recorded, the exchange ends `cancelled`, and no second response is written."""
         with actio_tree() as root:
             await self.boot(root)
             r = rid(15)
@@ -691,8 +707,11 @@ class CancellationTest(ReceiverTest):
             await wait_until("the archive", archived_check(root, r))
             record = await inreq_for(root, r)
             assert record is not None
-            self.assertEqual(record["final_status"], "confirmed")
-            self.assertIsNone(record["can"])
+            self.assertEqual(record["final_status"], "cancelled")
+            can = record["can"]
+            assert can is not None
+            self.assertEqual(cast(CancellationBody, can["cancellation"])["name"], "summarize")
+            self.assertEqual(res_body(record)["result"], "short")  # the first response stands
             self.assertIsNotNone(record["con"])
 
     async def test_a_confirmation_before_the_response_archives_on_the_response(self) -> None:
@@ -881,8 +900,9 @@ class RecoveryTest(ReceiverTest):
             self.assertFalse(self.res_path(root, r).exists())
             self.assertEqual(list(inbox(root).iterdir()), [inbox(root) / f"{r}.json"])
 
-    async def test_a_late_cancellation_on_a_retracked_exchange_leaves_can_null(self) -> None:
-        """Q1, retrack side: a stored non-cancellation response plus a late `can` keeps `can: null`."""
+    async def test_a_late_cancellation_on_a_retracked_exchange_archives_cancelled(self) -> None:
+        """*Envelope lifecycle*, "Cancelled after the response", via a retracked exchange: the
+        late `can` is recorded and the exchange ends `cancelled`."""
         with actio_tree() as root:
             for sub in ("inbox", "forum", "nuntium"):
                 (agent_dir(root) / sub).mkdir(parents=True)
@@ -896,8 +916,10 @@ class RecoveryTest(ReceiverTest):
             await wait_until("the archive", archived_check(root, r))
             record = await inreq_for(root, r)
             assert record is not None
-            self.assertEqual(record["final_status"], "confirmed")
-            self.assertIsNone(record["can"])
+            self.assertEqual(record["final_status"], "cancelled")
+            self.assertIsNotNone(record["can"])
+            self.assertEqual(res_body(record)["result"], "old")  # the stored response stands
+            self.assertIsNotNone(record["con"])
 
 
 async def _inreq_count(root: Path, r: str) -> int:
@@ -1096,3 +1118,81 @@ class WatchLossTest(ReceiverTest):
             self.assertIsInstance(hooks.watch_errors[0][1], OSError)
             # The receiver is still alive (the loop waits on nothing) until `stop`.
             await receiver.stop()
+
+
+class TwoSidedTest(ReceiverTest):
+    """The same exchange seen from both sides: for one late `can`, the receiver's `inreq` and
+    the requestor's `outreq` must agree (protocol, *Sync and Race Conditions*)."""
+
+    async def test_a_late_can_is_cancelled_in_both_diariums(self) -> None:
+        # Protocol, *Sync and Race Conditions*: the requestor writes its `can` just after the work
+        # is done, before the response is observed; the receiver does not answer twice and both
+        # diariums record the exchange as `cancelled`.
+        with actio_tree() as root:
+            for agent in ("caller", "summarizer"):
+                for sub in ("inbox", "forum", "nuntium"):
+                    (root / agent / sub).mkdir(parents=True)
+
+            async def slowish(parameters: Any, ctx: Any) -> str:
+                await asyncio.sleep(0.15)
+                return "done"
+
+            rctx = FakeContext(root, Clock(), make_spec(), {"summarize": slowish})
+            qctx = FakeContext(root, Clock(), make_spec(), {}, agent="caller")
+            rwatch = await Watcher.open(spawn)
+            qwatch = await Watcher.open(spawn)
+            self.addAsyncCleanup(rwatch.close)
+            self.addAsyncCleanup(qwatch.close)
+            hooks = FakeHooks()
+            receiver = Receiver(rctx, hooks, rwatch)
+            self.addAsyncCleanup(receiver.stop)
+            self.addAsyncCleanup(settle_tasks, receiver)
+            await receiver.start()
+            requestor = Requestor(qctx, hooks, qwatch)
+            self.addAsyncCleanup(requestor.stop)
+            cancel = asyncio.Event()
+            t = asyncio.create_task(
+                requestor.request(
+                    "summarizer", "summarize", {"text": "hi"}, timeout=0, cancel=cancel
+                )
+            )
+            inbox_dir = root / "summarizer" / "inbox"
+            await wait_for(
+                "the request file",
+                lambda: any(
+                    p.name.endswith(".json") and not p.name.endswith(".res.json")
+                    for p in inbox_dir.iterdir()
+                ),
+            )
+            await asyncio.sleep(0.05)  # the work is running; the response is not written yet
+            cancel.set()
+            outcome = await asyncio.wait_for(t, SETTLE)
+            self.assertEqual(outcome.final_status, "cancelled")
+            # The inbox is archived away; take the rid from the diarium.
+            r = self._rid_from_outreq(root)
+            await wait_until("the archive", archived_check(root, r))
+            record = await inreq_for(root, r)
+            assert record is not None
+            self.assertEqual(record["final_status"], "cancelled")
+            can = record["can"]
+            assert can is not None
+            self.assertTrue(res_body(record)["cancellation"])  # the receiver answered the can
+            self.assertIsNotNone(record["con"])
+            out = await outreq_for(root, r)
+            assert out is not None
+            self.assertEqual(out["final_status"], "cancelled")
+            self.assertIsNotNone(out["can"])
+            # The two diariums agree on one exchange.
+            self.assertEqual(record["final_status"], out["final_status"])
+
+    @staticmethod
+    def _rid_from_outreq(root: Path) -> str:
+        """The one `outreq` rid of the caller (the exchange is already settled when this runs)."""
+        lines = (root / "caller" / "diarium.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            data = cast(DiariumEntry, json.loads(line))
+            if data["event"] == "outreq":
+                rid = _record_rid(cast("dict[str, Any]", data["event_data"]))
+                if rid is not None:
+                    return rid
+        raise AssertionError("no outreq line yet")
