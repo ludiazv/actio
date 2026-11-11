@@ -332,6 +332,14 @@ def inbox(root: Path, agent: str = "summarizer") -> Path:
     return root / agent / "inbox"
 
 
+async def wait_inbox_empty(root: Path, agent: str = "summarizer") -> None:
+    """The archive writes its `inreq` line and deletes after it (*Envelope lifecycle*, D-11), so a test
+    that asserts an emptied inbox waits for the deletions: on a slow disk the line lands first."""
+    await wait_for(
+        "the inbox emptied by the archive", lambda: not list(inbox(root, agent).iterdir())
+    )
+
+
 def agent_dir(root: Path, agent: str = "summarizer") -> Path:
     return root / agent
 
@@ -530,7 +538,13 @@ class LaneATest(ReceiverTest):
             self.assertIsNone(record["can"])
             self.assertIsNone(record["con"])
             self.assertEqual(res_body(record)["result"], "short")
+            await wait_inbox_empty(root)
             self.assertEqual(list(inbox(root).iterdir()), [])
+            # The `InreqEvent` is emitted when the archive is complete, deletions included.
+            await wait_for(
+                "the inreq event",
+                lambda: any(isinstance(e, InreqEvent) and e.rid == r for e in ctx.events),
+            )
             inreqs = [e for e in ctx.events if isinstance(e, InreqEvent)]
             self.assertEqual([(e.rid, e.final_status) for e in inreqs], [(r, "completed")])
 
@@ -550,6 +564,8 @@ class LaneATest(ReceiverTest):
             record = await inreq_for(root, r)
             assert record is not None
             self.assertEqual(res_body(record)["attachments"], ["notes/out.txt"])
+            # The archive's `inreq` line comes first, the deletions after: wait for this one.
+            await wait_for("the attachment deleted", lambda: not forum_file.exists())
             self.assertFalse(forum_file.exists())
 
     async def test_work_time_uses_the_clock_the_receiver_reads(self) -> None:
@@ -761,6 +777,7 @@ class CancellationTest(ReceiverTest):
             self.assertEqual(record["final_status"], "confirmed")
             self.assertEqual(res_body(record)["result"], "short")
             self.assertIsNotNone(record["con"])
+            await wait_inbox_empty(root)
             self.assertEqual(list(inbox(root).iterdir()), [])
 
     async def test_a_header_mismatch_on_the_cancellation_is_ignored(self) -> None:
@@ -886,6 +903,7 @@ class RecoveryTest(ReceiverTest):
             self.assertEqual(record["final_status"], "confirmed")
             self.assertEqual(res_body(record)["result"], "old")
             self.assertIsNone(record["can"])
+            await wait_inbox_empty(root)
             self.assertEqual(list(inbox(root).iterdir()), [])
 
     async def test_a_request_with_a_stored_response_keeps_the_stored_one(self) -> None:
@@ -914,6 +932,7 @@ class RecoveryTest(ReceiverTest):
             assert record is not None
             self.assertEqual(res_body(record)["result"], "old")
             self.assertEqual(record["final_status"], "confirmed")
+            await wait_inbox_empty(root)
             self.assertEqual(list(inbox(root).iterdir()), [])
 
     async def test_a_duplicate_rid_is_served_once(self) -> None:
@@ -922,6 +941,7 @@ class RecoveryTest(ReceiverTest):
             r = rid(24)
             await self.files(root, **{f"{r}.json": request_file(r)})
             await wait_until("the archive", archived_check(root, r))
+            await wait_inbox_empty(root)  # the retry arrives once the first archive has finished
             # The requestor retries with the same rid: it is ignored and never re-served; the
             # reference keeps the file (a next run would re-serve it, D-4), so it stays in the inbox.
             await self.files(root, **{f"{r}.json": request_file(r)})
@@ -950,6 +970,7 @@ class RecoveryTest(ReceiverTest):
             self.assertIsNotNone(record["can"])
             self.assertEqual(res_body(record)["result"], "old")  # the stored response stands
             self.assertIsNotNone(record["con"])
+            await wait_inbox_empty(root)
             self.assertEqual(list(inbox(root).iterdir()), [])
 
     async def test_a_stored_late_cancellation_is_recovered_as_cancelled(self) -> None:
@@ -979,6 +1000,7 @@ class RecoveryTest(ReceiverTest):
             self.assertFalse(res_body(record)["cancellation"])  # the stored response is ordinary
             self.assertEqual(res_body(record)["result"], "old")  # and it stands
             self.assertIsNotNone(record["con"])
+            await wait_inbox_empty(root)
             self.assertEqual(list(inbox(root).iterdir()), [])
 
 
@@ -1020,7 +1042,13 @@ class CommandTest(ReceiverTest):
             self.assertIsNone(record["can"])
             self.assertIsNone(record["res"])
             self.assertIsNone(record["con"])
+            await wait_inbox_empty(root)
             self.assertEqual(list(inbox(root).iterdir()), [])
+            # The `InreqEvent` is emitted when the archive is complete, deletions included.
+            await wait_for(
+                "the inreq event",
+                lambda: any(isinstance(e, InreqEvent) and e.rid == r for e in ctx.events),
+            )
             inreqs = [e for e in ctx.events if isinstance(e, InreqEvent)]
             self.assertEqual([(e.rid, e.final_status) for e in inreqs], [(r, "completed")])
 
@@ -1072,9 +1100,16 @@ class CommandTest(ReceiverTest):
             assert record is not None
             self.assertEqual(record["final_status"], "dropped")
             self.assertEqual(hooks.commands, [])
+            await wait_for(
+                "the dropped-command log",
+                lambda: any(
+                    isinstance(e, LogEvent) and "dropped command" in e.message for e in ctx.events
+                ),
+            )
             self.assertTrue(
                 any(isinstance(e, LogEvent) and "dropped command" in e.message for e in ctx.events)
             )
+            await wait_inbox_empty(root)
             self.assertEqual(list(inbox(root).iterdir()), [])
 
     async def test_an_unknown_command_is_dropped(self) -> None:
@@ -1133,6 +1168,7 @@ class StopTest(ReceiverTest):
             assert record is not None
             self.assertEqual(record["final_status"], "completed")
             self.assertEqual(res_body(record)["result"]["code"], 300)
+            await wait_inbox_empty(root)
             self.assertEqual(list(inbox(root).iterdir()), [])
             self.assertEqual([e for e in ctx.events if isinstance(e, LogEvent)], [])
 
@@ -1146,6 +1182,7 @@ class StopTest(ReceiverTest):
             record = await inreq_for(root, r)
             assert record is not None
             self.assertEqual(record["final_status"], "completed")
+            await wait_inbox_empty(root)
             self.assertEqual(list(inbox(root).iterdir()), [])
 
     async def test_stop_is_idempotent(self) -> None:
