@@ -210,8 +210,10 @@ class AgentSurfaceTest(unittest.TestCase):
         """A consumer's own call sites, type-checked by `mypy` from here.
 
         `tests` is in mypy's files, so if a frozen signature could not be satisfied from outside — the
-        way an abstract base class defeats it — this fails the type check rather than a review. The bodies
-        are still stubs, so the registration raises; what matters here is that they type-check.
+        way an abstract base class defeats it — this fails the type check rather than a review. Registering
+        is a dict write: no folders, no config, no `start()`. The stub-era version of this test asked for
+        `NotImplementedError`, which pinned the *stub* rather than the API and failed by construction the
+        moment the module was implemented.
         """
         agent = actio.ActioAgent(id="echo", description="d", accepts_commands_from=["*"])
         cap: actio.Capability = {
@@ -224,13 +226,26 @@ class AgentSurfaceTest(unittest.TestCase):
         async def echo(params: Any, ctx: actio.CapabilityContext) -> Any:
             return params
 
-        with self.assertRaises(NotImplementedError):
-            agent.capability(cap, echo)  # the call form
-        with self.assertRaises(NotImplementedError):
+        agent.capability(cap, echo)  # the call form
 
-            @agent.capability(cap)  # the decorator form, as *Public API* shows it
-            async def decorated(params: Any, ctx: actio.CapabilityContext) -> Any:
-                return params
+        upper: actio.Capability = {
+            "name": "upper",
+            "description": "Upper the text",
+            "parameters": {"type": "object", "properties": {"text": {"type": "string"}}},
+            "actio": {"result": {"type": "object"}},
+        }
+
+        @agent.capability(upper)  # the decorator form, as *Public API* shows it
+        async def decorated(params: Any, ctx: actio.CapabilityContext) -> Any:
+            return params
+
+        async def plain(params: Any, ctx: actio.CapabilityContext) -> Any:
+            return params
+
+        # A decorator that wrapped the handler would replace what the caller wrote: `@` above and the
+        # explicit application below must both leave the caller's own coroutine in hand.
+        self.assertTrue(inspect.iscoroutinefunction(decorated))
+        self.assertIs(agent.capability({**upper, "name": "lower"})(plain), plain)
 
 
 class FunctionSurfaceTest(unittest.TestCase):
