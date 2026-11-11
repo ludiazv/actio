@@ -11,7 +11,16 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from ._diarium import inreq_event, log_event
-from ._files import copy_file, loads, make_dirs, remove, write_json_atomic
+from ._files import (
+    loads,
+    make_dirs,
+    mtime_ns,
+    read_text_with_mtime,
+    remove,
+    unreadable_reason,
+    write_bytes_atomic,
+    write_json_atomic,
+)
 from ._protocol import (
     AgentId,
     CancellationBody,
@@ -33,6 +42,7 @@ from ._types import (
     IgnoredEvent,
     InreqEvent,
     LogEvent,
+    Spawn,
 )
 from ._util import format_iso, nonce
 from ._validate import (
@@ -46,7 +56,7 @@ from ._validate import (
     same_header,
     validate,
 )
-from ._watch import FolderWatch, Watcher, scan_folder
+from ._watch import FolderWatch, Watcher, scan
 
 _SUFFIX: dict[str, str] = {"cancellation": "can", "response": "res", "confirmation": "con"}
 _SUFFIX_RE = re.compile(r"\.(can|res|con)\.json$")
@@ -131,17 +141,13 @@ class _CapabilityContext:
         return await self._receiver._publish_attachment(self._ex, name, data)
 
 
-def _read_text(path: str) -> str:
-    """The whole file as text; `OSError` when unreadable, `UnicodeDecodeError` (a `ValueError`) when not UTF-8."""
-    with open(path, "rb") as fh:
-        return fh.read().decode("utf-8")
-
-
 class Receiver:
     """Serves one agent's inbox until `stop`; created at `start`, closed by `stop`."""
 
-    def __init__(self, ctx: AgentContext, hooks: ReceiverHooks, watch: Watcher) -> None:
-        self._ctx, self._hooks, self._watch = ctx, hooks, watch
+    def __init__(
+        self, ctx: AgentContext, hooks: ReceiverHooks, watch: Watcher, spawn: Spawn
+    ) -> None:
+        self._ctx, self._hooks, self._watch, self._spawn = ctx, hooks, watch, spawn
         self._handlers: _HandlerTable = cast(_HandlerTable, ctx)
         self._inbox, self._forum = ctx.folders.inbox, ctx.folders.forum
         self._exchanges: dict[str, _Exchange] = {}
@@ -167,7 +173,7 @@ class Receiver:
         self._sub = self._watch.subscribe(self._inbox)
         self._entries = self._build_entries()
         await self._scan_once()
-        self._loop_task = self._spawn(self._loop_coro(), "actio.receiver", "receiver loop failed")
+        self._loop_task = self._start(self._loop_coro(), "actio.receiver", "receiver loop failed")
 
     async def stop(self, *, force: bool = False) -> None:
         """`force` abandons work still running (D-9, D-10); the grace wait, when wanted, is the agent's."""
@@ -213,22 +219,24 @@ class Receiver:
 
     # --- the one task helper -------------------------------------------------
 
-    def _spawn(
+    async def _run_guarded(self, coro: Coroutine[Any, Any, Any], message: str) -> None:
+        """The crash report of an unexpected exception, as exactly one `LogEvent` (never a crash);
+        a cancelled task reports nothing."""
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            self._ctx.emit(LogEvent(message=f"{message}: {err}"))
+
+    def _start(
         self, coro: Coroutine[Any, Any, Any], name: str, message: str | None = None
     ) -> asyncio.Task[Any]:
-        # The `Spawn` seam, kept private because the frozen constructor takes no spawn: a named task
-        # and a strong reference, so a task can never vanish mid-run; `message` reports an
-        # unexpected exception as one `LogEvent` (never a crash).
-        task = asyncio.get_running_loop().create_task(coro, name=name)
+        """One of this receiver's tasks: the wrapped coroutine handed to the injected `Spawn`, and a
+        strong reference kept until it ends (a task with none can be garbage-collected mid-run)."""
+        task = self._spawn(self._run_guarded(coro, message) if message is not None else coro, name)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-        if message is not None:
-
-            def done(t: asyncio.Task[Any]) -> None:
-                if not t.cancelled() and (err := t.exception()) is not None:
-                    self._ctx.emit(LogEvent(message=f"{message}: {err}"))
-
-            task.add_done_callback(done)
         return task
 
     # --- the inbox loop ------------------------------------------------------
@@ -247,9 +255,7 @@ class Receiver:
 
     async def _scan_once(self) -> None:
         try:
-            changed, self._markers = await asyncio.to_thread(
-                scan_folder, self._inbox, self._markers
-            )
+            changed, self._markers = await scan(self._inbox, self._markers)
         except OSError as err:
             cast(
                 FolderWatch, self._sub
@@ -288,11 +294,18 @@ class Receiver:
     async def _read_envelope(self, path: str) -> tuple[dict[str, Any] | None, str | None]:
         # (value, ignore-reason); a vanished file is (None, None).
         try:
-            value = loads(await asyncio.to_thread(_read_text, path))
-        except FileNotFoundError:
-            return None, None
+            read = await read_text_with_mtime(path)
         except OSError as err:
-            return None, f"unreadable file: {err.strerror or err}"
+            return None, unreadable_reason(err)
+        except UnicodeDecodeError as err:
+            # Readable, but not text: an unparsable file, so `_validate` words it (D-15). The wording
+            # names the parser's position, never a byte of the peer's value; `unreadable` is for the
+            # read that failed, which is what `_files.unreadable_reason` is for.
+            return None, malformed_reason(err)
+        if read is None:
+            return None, None
+        try:
+            value = loads(read[1])
         except ValueError as err:
             return None, malformed_reason(err)
         return (value, None) if isinstance(value, dict) else (None, "not a JSON object")
@@ -313,7 +326,7 @@ class Receiver:
         ex = _Exchange(rid, header, file, "accepting", asyncio.Event())
         self._exchanges[rid] = ex
         self._drain_deferred(ex)
-        ex.serve = self._spawn(self._serve(ex), f"actio.serve.{rid}", f"{rid} left unsettled")
+        ex.serve = self._start(self._serve(ex), f"actio.serve.{rid}", f"{rid} left unsettled")
 
     async def _serve(self, ex: _Exchange) -> None:
         # A0, then A1 (the handler as its own task), then A2.
@@ -337,7 +350,7 @@ class Receiver:
         self._hooks.on_state_change()
         started = self._ctx.now()
         try:
-            ex.task = self._spawn(self._work(ex, entry, body), f"actio.work.{ex.rid}")
+            ex.task = self._start(self._work(ex, entry, body), f"actio.work.{ex.rid}")
             await asyncio.wait({ex.task})
             if ex.cancelled.is_set():
                 await self._respond(ex, "cancellation")
@@ -554,12 +567,18 @@ class Receiver:
                     ex, cast(CancellationFile | ConfirmationFile, file), kind
                 )
             if reason is not None:
-                self._spawn(self._ignore(full, name, reason), f"actio.ignore.{ex.rid}")
+                self._start(self._ignore(full, name, reason), f"actio.ignore.{ex.rid}")
 
     async def _read_inbox_value(self, name: str) -> dict[str, Any] | None:
         try:
-            value = loads(await asyncio.to_thread(_read_text, os.path.join(self._inbox, name)))
-        except (OSError, ValueError):
+            read = await read_text_with_mtime(os.path.join(self._inbox, name))
+        except (OSError, UnicodeDecodeError):
+            return None
+        if read is None:
+            return None
+        try:
+            value = loads(read[1])
+        except ValueError:
             return None
         return value if isinstance(value, dict) else None
 
@@ -611,7 +630,7 @@ class Receiver:
     def _queue_command(self, rid: str, step: Callable[[], Coroutine[Any, Any, None]]) -> None:
         self._command_queue.append((rid, step))
         if self._drain is None or self._drain.done():
-            self._drain = self._spawn(self._drain_commands(), "actio.commands", "drain failed")
+            self._drain = self._start(self._drain_commands(), "actio.commands", "drain failed")
 
     async def _drain_commands(self) -> None:
         # Lane D runs one command at a time, sorted by rid (a ULID: the requestor's creation order),
@@ -619,7 +638,7 @@ class Receiver:
         while self._command_queue and not self._stopped:
             self._command_queue.sort(key=lambda item: item[0])
             rid, step = self._command_queue.pop(0)
-            task = self._spawn(step(), f"actio.command.{rid}")
+            task = self._start(step(), f"actio.command.{rid}")
             self._lifecycle.add(task)
             task.add_done_callback(self._lifecycle.discard)
             try:
@@ -672,7 +691,7 @@ class Receiver:
         # D-9: the promise of every archive in flight is tracked, so `stop()` can await them all.
         if ex.rid in self._archiving:
             return
-        task = self._spawn(
+        task = self._start(
             self._archive(ex), f"actio.archive.{ex.rid}", f"archive of {ex.rid} failed"
         )
         self._archiving[ex.rid] = task
@@ -727,7 +746,7 @@ class Receiver:
     async def _ignore(self, path: str, name: str, reason: str) -> None:
         # One line, once per (path, mtime); the file stays in the inbox, nothing else is touched.
         try:
-            key = f"{path}:{(await asyncio.to_thread(os.stat, path)).st_mtime_ns}"
+            key = f"{path}:{await mtime_ns(path)}"
         except OSError:
             return  # vanished: nothing to ignore
         if key in self._ignored_seen:
@@ -742,15 +761,13 @@ class Receiver:
     # --- attachments --------------------------------------------------------------
 
     async def _publish_attachment(self, ex: _Exchange, name: str, data: bytes) -> str:
-        # Write to `forum` (atomic, through the sync provider's hooks); the archive deletes it.
+        # Written to `forum` in one atomic operation through the sync provider's hooks; a half-taken
+        # attachment is what a peer reads back as a truncated file. The archive deletes it.
         target = Path(self._forum) / name
         if not target.resolve().is_relative_to(Path(self._forum).resolve()):
             raise ValueError(f"attachment {name!r} escapes forum")
         await make_dirs(str(target.parent))
-        tmp = os.path.join(self._ctx.folders.agent, f".{Path(name).name}.{nonce()}.tmp")
-        await asyncio.to_thread(Path(tmp).write_bytes, data)
-        await copy_file(tmp, str(target), self._ctx.folders.agent, self._ctx.sync)
-        await remove(tmp)
+        await write_bytes_atomic(str(target), data, self._ctx.folders.agent, self._ctx.sync)
         ex.attachments.append(name)
         return name
 

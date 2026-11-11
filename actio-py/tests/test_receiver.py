@@ -294,6 +294,18 @@ def spawn(coro: Any, name: str) -> asyncio.Task[Any]:
     return asyncio.get_running_loop().create_task(coro, name=name)
 
 
+# Every task a test starts through the receiver's `Spawn` and the watcher's: joined by `settle_tasks`
+# before `stop` runs, so a coroutine that a cancel never reached is never reported as abandoned.
+SAFE_SPAWNS: set[asyncio.Task[Any]] = set()
+
+
+def safe_spawn(coro: Any, name: str) -> asyncio.Task[Any]:
+    task = asyncio.get_running_loop().create_task(coro, name=name)
+    SAFE_SPAWNS.add(task)
+    task.add_done_callback(SAFE_SPAWNS.discard)
+    return task
+
+
 async def wait_for(what: str, predicate: Callable[[], bool], timeout: float = SETTLE) -> None:
     """Poll until `predicate` is true; the failure names what was waited for."""
     loop = asyncio.get_running_loop()
@@ -418,12 +430,16 @@ async def slow_handler(parameters: Any, ctx: Any) -> str:
 
 
 async def settle_tasks(receiver: Receiver) -> None:
-    """Join the receiver's exchange tasks (a handler can outlive its exchange) before `stop` runs;
-    the loop task is the exception: `stop` cancels it."""
+    """Join every task a test started (the receiver's own and the watcher's) before `stop` runs:
+    a handler can outlive its exchange, and `-W error` fails on a coroutine a cancel never reached."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 10.0
     while True:
-        live = [t for t in receiver._tasks if t.get_name() != "actio.receiver" and not t.done()]
+        live = [
+            t
+            for t in SAFE_SPAWNS | receiver._tasks
+            if not t.done() and t.get_name() not in ("actio.receiver", "actio.audit")
+        ]
         if not live or loop.time() > deadline:
             return
         await asyncio.sleep(0.02)
@@ -431,6 +447,17 @@ async def settle_tasks(receiver: Receiver) -> None:
 
 class ReceiverTest(ActioTestCase):
     """Boots a receiver for `summarizer` on a fresh tree; every test stops it before it ends."""
+
+    async def settle(self, receiver: Receiver) -> None:
+        """The one wait helper of the receiver's own tasks (a handler can outlive its exchange)."""
+        await settle_tasks(receiver)
+
+    def cleanup_spawns(self) -> None:
+        """The watcher's own tasks join too: `-W error` fails on a coroutine a cancel never reached."""
+        self.addAsyncCleanup(self._drain_spawns)
+
+    async def _drain_spawns(self) -> None:
+        await asyncio.gather(*list(SAFE_SPAWNS), return_exceptions=True)
 
     async def boot(
         self,
@@ -452,11 +479,12 @@ class ReceiverTest(ActioTestCase):
             confirm_timeout=confirm_timeout,
         )
         hooks = FakeHooks(peers)
-        watcher = await Watcher.open(spawn)
+        watcher = await Watcher.open(safe_spawn)
+        self.cleanup_spawns()
         self.addAsyncCleanup(watcher.close)
-        receiver = Receiver(ctx, hooks, watcher)
+        receiver = Receiver(ctx, hooks, watcher, safe_spawn)
         self.addAsyncCleanup(receiver.stop)
-        self.addAsyncCleanup(settle_tasks, receiver)
+        self.addAsyncCleanup(self.settle, receiver)
         await receiver.start()
         return ctx, hooks, receiver
 
@@ -537,10 +565,12 @@ class LaneATest(ReceiverTest):
 
             ctx = FakeContext(root, clock, make_spec(), {"summarize": handler}, confirm_timeout=0.3)
             hooks = FakeHooks()
-            watcher = await Watcher.open(spawn)
+            watcher = await Watcher.open(safe_spawn)
+            self.cleanup_spawns()
             self.addAsyncCleanup(watcher.close)
-            receiver = Receiver(ctx, hooks, watcher)
+            receiver = Receiver(ctx, hooks, watcher, safe_spawn)
             self.addAsyncCleanup(receiver.stop)
+            self.addAsyncCleanup(self.settle, receiver)
             await receiver.start()
             r = rid(3)
             write_files_sync(root, **{f"{r}.json": request_file(r)})
@@ -920,6 +950,36 @@ class RecoveryTest(ReceiverTest):
             self.assertIsNotNone(record["can"])
             self.assertEqual(res_body(record)["result"], "old")  # the stored response stands
             self.assertIsNotNone(record["con"])
+            self.assertEqual(list(inbox(root).iterdir()), [])
+
+    async def test_a_stored_late_cancellation_is_recovered_as_cancelled(self) -> None:
+        """Protocol, *Envelope lifecycle*, "Cancelled after the response", and *Sync and Race
+        Conditions* ("if the cancellation arrives after the response, the receiver archives the
+        request as cancelled"): a startup that finds `<rid>.res.json` (an ordinary response) **and**
+        `<rid>.can.json` already in the inbox archives `cancelled` with the `can` recorded, the
+        stored response standing, and no second response."""
+        with actio_tree() as root:
+            for sub in ("inbox", "forum", "nuntium"):
+                (agent_dir(root) / sub).mkdir(parents=True)
+            r = rid(32)
+            write_files_sync(
+                root,
+                **{
+                    f"{r}.res.json": response_file(r, result="old"),
+                    f"{r}.can.json": cancellation_file(r),
+                },
+            )
+            await self.boot(root)
+            await self.files(root, **{f"{r}.con.json": confirmation_file(r)})
+            await wait_until("the archive", archived_check(root, r))
+            record = await inreq_for(root, r)
+            assert record is not None
+            self.assertEqual(record["final_status"], "cancelled")
+            self.assertIsNotNone(record["can"])
+            self.assertFalse(res_body(record)["cancellation"])  # the stored response is ordinary
+            self.assertEqual(res_body(record)["result"], "old")  # and it stands
+            self.assertIsNotNone(record["con"])
+            self.assertEqual(list(inbox(root).iterdir()), [])
 
 
 async def _inreq_count(root: Path, r: str) -> int:
@@ -1139,14 +1199,15 @@ class TwoSidedTest(ReceiverTest):
 
             rctx = FakeContext(root, Clock(), make_spec(), {"summarize": slowish})
             qctx = FakeContext(root, Clock(), make_spec(), {}, agent="caller")
-            rwatch = await Watcher.open(spawn)
-            qwatch = await Watcher.open(spawn)
+            rwatch = await Watcher.open(safe_spawn)
+            qwatch = await Watcher.open(safe_spawn)
+            self.cleanup_spawns()
             self.addAsyncCleanup(rwatch.close)
             self.addAsyncCleanup(qwatch.close)
             hooks = FakeHooks()
-            receiver = Receiver(rctx, hooks, rwatch)
+            receiver = Receiver(rctx, hooks, rwatch, safe_spawn)
             self.addAsyncCleanup(receiver.stop)
-            self.addAsyncCleanup(settle_tasks, receiver)
+            self.addAsyncCleanup(self.settle, receiver)
             await receiver.start()
             requestor = Requestor(qctx, hooks, qwatch, spawn)
             self.addAsyncCleanup(requestor.stop)

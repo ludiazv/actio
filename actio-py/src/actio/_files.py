@@ -104,7 +104,7 @@ async def _after_write(op: Callable[[], None], provider: SyncProvider) -> None:
 
 
 def unreadable_reason(err: OSError) -> str:
-    """The one wording of a file that exists but cannot be read (I-7): one line, at most `LIMIT`, and
+    """The one wording of a file that exists but cannot be read (D-15): one line, at most `LIMIT`, and
     never a value of the peer's. A schema rejection is worded by `_validate.reason`; this is the only
     place an I/O rejection is worded, because the reader is the thing that knows."""
     return f"unreadable: {err}".replace("\n", " ")[:LIMIT]
@@ -194,7 +194,7 @@ async def read_text_with_mtime(path: str) -> tuple[int, str] | None:
     """`(mtime_ns, text)` of one file in a single thread hop.
 
     None when the file (or a parent folder) is missing; it **raises** when the file is there but cannot
-    be read or decoded, because a caller must report that as an ignored file with a reason (I-7) rather
+    be read or decoded, because a caller must report that as an ignored file with a reason (D-15) rather
     than lose it as a missing one. The dedup of D-11 needs the mtime and the text from one hop: a file
     read and then stat'ed can be a different file.
     """
