@@ -90,7 +90,7 @@ MAP: tuple[Entry, ...] = (
 
 def load_schemas() -> dict[str, dict[str, Any]]:
     """The 11 schemas as the package reads them at run time (D-20: `importlib.resources`)."""
-    folder = resources.files("actio.schemas")
+    folder = resources.files("actio").joinpath("schemas")
     return {
         name: json.loads(folder.joinpath(name).read_text(encoding="utf-8")) for name in SCHEMA_NAMES
     }

@@ -71,7 +71,10 @@ def _schema_registry() -> referencing.Registry:
     `common.schema.json#/$defs/rid`; the registry is what makes that cross-file hop resolve."""
     global _registry
     if _registry is None:
-        folder = resources.files("actio.schemas")
+        # `actio.schemas` is a folder of data, not a module to import: importing it would leave a
+        # public `schemas` attribute on the package (tests/test_api.py's surface rule). The pack is
+        # read through the package that owns it.
+        folder = resources.files("actio").joinpath("schemas")
         reg = referencing.Registry()
         for name in _SCHEMA_FILES:
             # The schema pack is package data, read once: not a file of the tree (D-20).

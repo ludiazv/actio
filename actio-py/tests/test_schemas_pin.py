@@ -20,7 +20,7 @@ REFERENCE = Path(__file__).resolve().parents[2] / "doc" / "schemas"
 
 
 def installed() -> dict[str, dict[str, Any]]:
-    folder = resources.files("actio.schemas")
+    folder = resources.files("actio").joinpath("schemas")
     names = sorted(p.name for p in COPY.glob("*.json"))
     return {name: json.loads(folder.joinpath(name).read_text(encoding="utf-8")) for name in names}
 
@@ -37,7 +37,7 @@ class InstalledSchemasTest(unittest.TestCase):
 
     def test_the_package_reads_its_own_schemas(self) -> None:
         """D-20: the schemas reach the code through `importlib.resources`, not through the source tree."""
-        folder = resources.files("actio.schemas")
+        folder = resources.files("actio").joinpath("schemas")
         names = sorted(p.name for p in COPY.glob("*.json"))
         self.assertEqual(
             sorted(p.name for p in folder.iterdir() if p.name.endswith(".json")), names
