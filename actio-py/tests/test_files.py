@@ -38,8 +38,14 @@ class DumpsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             dumps(float("inf"))
 
-    def test_a_tuple_a_set_and_a_datetime_are_not_serializable(self) -> None:
-        for bad in ({"t": (1, 2)}, {"s": {1, 2}}, {"d": datetime.datetime(2026, 1, 1)}):
+    def test_a_tuple_is_written_as_an_array(self) -> None:
+        self.assertEqual(dumps(("a", 1)), '["a",1]')
+        self.assertEqual(dumps({"t": ("a", 1)}), '{"t":["a",1]}')
+
+    def test_a_set_a_datetime_and_bytes_refuse_to_be_written(self) -> None:
+        # Each raises `TypeError` by itself; the reason text is never used anywhere (it never
+        # reaches a peer), so the tests pin the type of the raise, not its wording.
+        for bad in ({"s": {1, 2}}, {"d": datetime.datetime(2026, 1, 1)}, {"b": b"x"}):
             with self.assertRaises(TypeError):
                 dumps(bad)
 

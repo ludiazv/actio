@@ -54,22 +54,8 @@ def _depth_ok(text: str) -> bool:
     return True
 
 
-def _ensure_json_value(obj: Any) -> None:
-    """The encoder would silently write a tuple as an array; the protocol's values are JSON, so no."""
-    stack: list[Any] = [obj]
-    while stack:
-        value = stack.pop()
-        if isinstance(value, tuple):
-            raise TypeError("a tuple is not a JSON value; use a list")
-        if isinstance(value, dict):
-            stack.extend(value.values())
-        elif isinstance(value, (list, set, frozenset)):
-            stack.extend(value)
-
-
 def dumps(obj: Any) -> str:
-    """The one JSON writer of the protocol: compact, non-ASCII kept, no NaN, Infinity or tuples."""
-    _ensure_json_value(obj)
+    """The one JSON writer of the protocol: compact, non-ASCII kept, no NaN or Infinity."""
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
