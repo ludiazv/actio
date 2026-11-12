@@ -26,6 +26,7 @@ from jsonschema import Draft202012Validator
 from actio import ActioAgent, Capability, CapabilityHandler, CommandHandler, LogEvent
 from actio._config import ActioConfig
 from actio._protocol import DiariumEntry
+from actio._receiver import HANDLER_CANCEL_WAIT
 from actio._types import AgentView
 from actio._util import format_iso
 from helpers import ActioTestCase, actio_tree
@@ -1504,3 +1505,173 @@ class TwoAgentTest(AgentTest):
             self.assertEqual(status_path(root, PEER).read_bytes(), status_before)
             self.assertEqual(spec_path(root, PEER).read_bytes(), spec_before)
             self.assertEqual(announce_path(root, PEER).read_bytes(), announce_before)
+
+    # --- D-9's bound on the receiver's last phase ---------------------------------------------------
+    #
+    # A handler that swallows the cancellation `stop()` sends used to hold `stop()` forever: the code-300
+    # answer was already on disk, but the receiver waited on the handler task, so `inactive`, the watcher's
+    # close and every later lifecycle step never came. `HANDLER_CANCEL_WAIT` bounds that wait. The handler
+    # task left running is the one documented exception to "nothing of ours is armed after `stop`", so each
+    # row ends it by hand and the base class' leftover check keeps its meaning. The shape is the probe that
+    # found it.
+
+    def _stubborn(self, beta: ActioAgent, started: asyncio.Event, leave: asyncio.Event) -> None:
+        """A capability that ignores the cancellation `stop()` sends — until its own test says otherwise."""
+
+        @beta.capability(cap("stubborn"))
+        async def stubborn(params: Any, ctx: Any) -> dict[str, Any]:
+            started.set()
+            while True:
+                try:
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    if leave.is_set():
+                        raise  # the test ends its own rogue handler, after the bound was asserted
+                    continue  # the bad handler: the cancellation is swallowed
+
+    async def _stop_past_a_handler_that_will_not_stop(self, force: bool) -> None:
+        """`beta` stops while its handler ignores the cancellation: C1 lands, the handler is named, and the
+        exchange is archived like any answered one.
+
+        `confirm_timeout` sits *inside* `HANDLER_CANCEL_WAIT` on purpose: the code 300 is answered at once, so
+        its confirmation timer fires during the wait and the exchange archives itself and leaves the receiver's
+        table while its `serve` task is still pending — the case a cancellation driven by that table misses.
+        """
+        grace = 0.2
+        async with self.tree() as root:
+            started, leave = asyncio.Event(), asyncio.Event()
+            messages: list[str] = []
+            beta, _ = self.build_peer(root, stop_grace=grace, confirm_timeout=0.5)
+            self._stubborn(beta, started, leave)
+            beta.on_event(lambda e: messages.append(e.message) if isinstance(e, LogEvent) else None)
+            await beta.start()
+            alpha, _ = await self.boot(root, stop_grace=grace, confirm_timeout=0.5)
+            await self._see(alpha, "stubborn")
+
+            call = asyncio.create_task(alpha.request(PEER, "stubborn", {}, timeout=30))
+            await wait_for("beta's handler to start", started.is_set, timeout=WATCH_SETTLE)
+            # Captured before the stop, and the stop is bounded by the same number the row asserts: whatever
+            # happens below, this row ends the handler it started — a row that hangs the suite when a bound
+            # breaks reports nothing.
+            work = [t for t in asyncio.all_tasks() if t.get_name().startswith("actio.work.")]
+            loop = asyncio.get_running_loop()
+            allowed = grace + HANDLER_CANCEL_WAIT + 0.8
+            t0 = loop.time()
+            try:
+                # `shield`: if the bound does not hold, the failure is this row's, and the teardown below
+                # ends the handler so the stuck stop can still finish.
+                try:
+                    await asyncio.wait_for(asyncio.shield(beta.stop(force=force)), allowed)
+                except TimeoutError as err:
+                    raise AssertionError(
+                        f"beta.stop() returned nothing within {allowed}s: D-9's bound on the handler wait "
+                        "did not hold"
+                    ) from err
+                took = loop.time() - t0
+                # C1 came, and it came inside the bound it is owed: the grace, then HANDLER_CANCEL_WAIT.
+                self.assertLess(took, allowed, f"stop() took {took:.2f}s: the bound did not hold")
+                self.assertGreaterEqual(
+                    took, HANDLER_CANCEL_WAIT, f"stop() took {took:.2f}s: the bound was not spent"
+                )
+                self.assertEqual(doc(status_path(root, PEER))["status"], "inactive")
+
+                # One handler left armed, and exactly one line saying so — naming its rid.
+                self.assertEqual(
+                    len(work),
+                    1,
+                    f"handler tasks left armed after stop: {[t.get_name() for t in work]}",
+                )
+                named = [m for m in messages if "outlived" in m]
+                self.assertEqual(len(named), 1, f"the bound reported: {named}")
+                self.assertIn(work[0].get_name().removeprefix("actio.work."), named[0])
+
+                # Answered, so archived: the code 300 is the one response, and the files are gone.
+                await wait_for(
+                    "beta's inreq line",
+                    lambda: any(line["event"] == "inreq" for line in lines(root, PEER)),
+                    timeout=WATCH_SETTLE,
+                )
+                records = [
+                    cast(dict[str, Any], line["event_data"])
+                    for line in lines(root, PEER)
+                    if line["event"] == "inreq"
+                ]
+                self.assertEqual([r["final_status"] for r in records], ["completed"])
+                res = cast(dict[str, Any], records[0]["res"])
+                self.assertEqual(cast(dict[str, Any], res["response"])["result"]["code"], 300)
+                self.assertEqual(list(inbox_dir(root, PEER).glob("*.json")), [])
+            finally:
+                # End what this row started: the rogue handler (with `leave`, since it swallows a
+                # cancellation), and `alpha`'s call — `beta` archived its own copy of the code 300 as part
+                # of stopping, so whether `alpha` can still read the answer is a race the row does not
+                # depend on (the same order is in the reference: its `stop()` writes the 300, then archives).
+                leave.set()
+                for task in work:
+                    task.cancel()
+                call.cancel()
+                await asyncio.gather(call, *work, return_exceptions=True)
+
+    async def test_a_graceful_stop_reaches_inactive_past_a_handler_that_will_not_stop(self) -> None:
+        await self._stop_past_a_handler_that_will_not_stop(force=False)
+
+    async def test_a_forced_stop_reaches_inactive_past_a_handler_that_will_not_stop(self) -> None:
+        await self._stop_past_a_handler_that_will_not_stop(force=True)
+
+    async def test_a_handler_that_ends_late_within_the_bound_answers_once(self) -> None:
+        """What the bound leans on: the wait is a bound, not a fixed sleep, and a handler that answers after
+        `stop()` wrote the code 300 writes nothing. `beta`'s `<rid>.res.json` holds one content, the 300."""
+        grace = 0.2
+        async with self.tree() as root:
+            started = asyncio.Event()
+
+            async def late(params: Any, ctx: Any) -> dict[str, Any]:
+                started.set()
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.3)  # swallowed once, then answered late, inside the bound
+                return {"late": True}
+
+            beta, _ = self.build_peer(root, caps={"late": late}, stop_grace=grace)
+            await beta.start()
+            alpha, _ = await self.boot(root, stop_grace=grace)
+            await self._see(alpha, "late")
+            call = asyncio.create_task(alpha.request(PEER, "late", {}, timeout=30))
+            await wait_for("beta's handler to start", started.is_set, timeout=WATCH_SETTLE)
+
+            seen: list[Any] = []
+
+            async def watch_responses() -> None:
+                """Every distinct `result` that ever sat in `beta`'s response file."""
+                while True:
+                    for path in inbox_dir(root, PEER).glob("*.res.json"):
+                        try:
+                            body = cast(dict[str, Any], doc(path)["response"])
+                        except (OSError, ValueError, KeyError):
+                            continue  # mid-write: the temp name is not in the glob, a torn read is not a content
+                        if not seen or seen[-1] != body.get("result"):
+                            seen.append(body.get("result"))
+                    await asyncio.sleep(0.02)
+
+            watcher = asyncio.create_task(watch_responses())
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            await asyncio.wait_for(beta.stop(), HANDLER_CANCEL_WAIT)
+            took = loop.time() - t0
+            await asyncio.sleep(
+                1.2
+            )  # past the late answer: had it landed as a second response, it is seen
+            watcher.cancel()  # the watcher is the test's own loop: it ends when the test does
+            await asyncio.wait_for(asyncio.gather(watcher, call, return_exceptions=True), 10.0)
+
+            self.assertLess(
+                took,
+                HANDLER_CANCEL_WAIT,
+                f"stop() took {took:.2f}s: the bound was slept, not spent",
+            )
+            self.assertEqual(
+                [cast(dict[str, Any], r)["code"] for r in seen if r is not None],
+                [300],
+                f"beta's response file held: {seen}",
+            )
+            self.assertEqual(doc(status_path(root, PEER))["status"], "inactive")

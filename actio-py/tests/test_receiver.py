@@ -22,7 +22,7 @@ from typing import Any, cast
 from actio._config import load_config
 from actio._diarium import append, read_diarium
 from actio._protocol import CancellationBody, DiariumEntry, ExchangeRecord, Spec, StatusState
-from actio._receiver import Receiver
+from actio._receiver import HANDLER_CANCEL_WAIT, Receiver
 from actio._requestor import Requestor
 from actio._sync import create_sync_provider
 from actio._types import (
@@ -475,6 +475,7 @@ class ReceiverTest(ActioTestCase):
         handlers: dict[str, CapabilityHandler] | None = None,
         peers: dict[str, Spec] | None = None,
         confirm_timeout: float = 0.3,
+        handler_cancel_wait: float = HANDLER_CANCEL_WAIT,
     ) -> tuple[FakeContext, FakeHooks, Receiver]:
         for sub in ("inbox", "forum", "nuntium"):
             (agent_dir(root) / sub).mkdir(parents=True, exist_ok=True)
@@ -490,7 +491,7 @@ class ReceiverTest(ActioTestCase):
         watcher = await Watcher.open(safe_spawn)
         self.cleanup_spawns()
         self.addAsyncCleanup(watcher.close)
-        receiver = Receiver(ctx, hooks, watcher, safe_spawn)
+        receiver = Receiver(ctx, hooks, watcher, safe_spawn, handler_cancel_wait)
         self.addAsyncCleanup(receiver.stop)
         self.addAsyncCleanup(self.settle, receiver)
         await receiver.start()
@@ -1171,6 +1172,58 @@ class StopTest(ReceiverTest):
             await wait_inbox_empty(root)
             self.assertEqual(list(inbox(root).iterdir()), [])
             self.assertEqual([e for e in ctx.events if isinstance(e, LogEvent)], [])
+
+    async def test_a_handler_that_will_not_stop_is_left_after_the_bound(self) -> None:
+        """D-9's last phase is a bound, not an open wait: a handler that swallows the cancellation `stop()`
+        sends it is left to end on its own, named by exactly one `log` line of its rid."""
+        started, leave = asyncio.Event(), asyncio.Event()
+
+        async def stubborn(parameters: Any, ctx: Any) -> str:
+            started.set()
+            while True:
+                try:
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    if leave.is_set():
+                        raise
+                    continue
+
+        with actio_tree() as root:
+            ctx, _, receiver = await self.boot(
+                root,
+                handlers={"summarize": stubborn},
+                confirm_timeout=5.0,
+                handler_cancel_wait=0.2,  # D-9's bound, shrunk through the constructor: not a 1 s sleep
+            )
+            r = rid(0)
+            await self.files(root, **{f"{r}.json": request_file(r)})
+            await wait_for("the handler to start", started.is_set)
+            work = [t for t in asyncio.all_tasks() if t.get_name().startswith("actio.work.")]
+            loop = asyncio.get_running_loop()
+            try:
+                t0 = loop.time()
+                await asyncio.wait_for(receiver.stop(), 3.0)
+                took = loop.time() - t0
+                self.assertGreaterEqual(
+                    took, 0.2, f"stop() took {took:.2f}s: the bound was not spent"
+                )
+                self.assertLess(took, 1.0, f"stop() took {took:.2f}s: the bound is not a bound")
+                # Answered once with the code 300 — and archived, as an answered exchange is at stop, so the
+                # answer is in the `inreq` record — and the receiver says who is left running.
+                record = await inreq_for(root, r)
+                assert record is not None
+                self.assertEqual(record["final_status"], "completed")
+                self.assertEqual(res_body(record)["result"]["code"], 300)
+                named = [e.message for e in ctx.events if isinstance(e, LogEvent)]
+                self.assertEqual(len(named), 1, f"the bound reported: {named}")
+                self.assertIn(r, named[0])
+            finally:
+                # The row ends its own rogue handler — `leave` only opens its `raise` branch, which a
+                # cancellation then takes. A hung suite reports nothing.
+                leave.set()
+                for task in work:
+                    task.cancel()
+                await asyncio.gather(*work, return_exceptions=True)
 
     async def test_stop_archives_a_responded_exchange(self) -> None:
         with actio_tree() as root:

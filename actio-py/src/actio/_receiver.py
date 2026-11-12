@@ -67,6 +67,12 @@ WATCH_JOIN_TIMEOUT = 5.0
 # The A2 answer of a work abandoned by `stop()` (D-10).
 AGENT_STOPPING_MSG = "agent_stopping: the agent stops before answering"
 STOPPING_RESULT: dict[str, Any] = {"code": 300, "msg": AGENT_STOPPING_MSG}
+# D-9's bound on the receiver's last phase: how long `stop()` waits for a handler it has cancelled. The
+# reference awaits no handler at all — its `stop()` aborts the handler's controller and awaits only the
+# archives (`actio-ts/src/receiver.ts`, `stop()`). Python waits, but only up to this bound: a handler that
+# swallows its cancellation would otherwise hold `stop()` — and with it C1, the watcher's close, and every
+# later lifecycle step — forever.
+HANDLER_CANCEL_WAIT = 1.0
 
 
 class ReceiverHooks(Protocol):
@@ -145,9 +151,16 @@ class Receiver:
     """Serves one agent's inbox until `stop`; created at `start`, closed by `stop`."""
 
     def __init__(
-        self, ctx: AgentContext, hooks: ReceiverHooks, watch: Watcher, spawn: Spawn
+        self,
+        ctx: AgentContext,
+        hooks: ReceiverHooks,
+        watch: Watcher,
+        spawn: Spawn,
+        handler_cancel_wait: float = HANDLER_CANCEL_WAIT,
     ) -> None:
         self._ctx, self._hooks, self._watch, self._spawn = ctx, hooks, watch, spawn
+        # D-9's bound, shrinkable in tests; the agent leaves it at the module constant.
+        self._handler_cancel_wait = handler_cancel_wait
         self._handlers: _HandlerTable = cast(_HandlerTable, ctx)
         self._inbox, self._forum = ctx.folders.inbox, ctx.folders.forum
         self._exchanges: dict[str, _Exchange] = {}
@@ -197,10 +210,34 @@ class Receiver:
                 await self._respond(ex, "error", result=STOPPING_RESULT, forced=True)
             elif ex.phase == "accepting" and ex.serve is not None and not ex.serve.done():
                 ex.serve.cancel()
-        await asyncio.gather(
-            *[ex.serve for ex in self._exchanges.values() if ex.serve and not ex.serve.done()],
-            return_exceptions=True,
-        )
+        # (the serve task) -> (the exchange it serves, its handler task), captured now: an exchange can
+        # leave `_exchanges` during the bound — its confirmation timer fires, and it archives itself — and a
+        # pending task that nobody cancels is a `stop()` that never returns.
+        waits = {
+            ex.serve: (ex, ex.task)
+            for ex in self._exchanges.values()
+            if ex.serve and not ex.serve.done()
+        }
+        if waits:
+            # D-9's phase bound: the wait for a cancelled handler is `HANDLER_CANCEL_WAIT`, no longer. The
+            # exchange is already answered with the code 300 above, so this wait can only collect a late
+            # answer that `_respond`'s guard would drop anyway (probed: one response, one content). Past the
+            # bound the handler task is left to end on its own — the one documented exception to "nothing
+            # of ours is armed after stop", named by its rid — and its exchange is archived like any
+            # answered one. A handler that answers inside the bound is answered as before.
+            _, pending = await asyncio.wait(list(waits), timeout=self._handler_cancel_wait)
+            for task in pending:
+                task.cancel()  # `serve` is ours; the handler whose cancellation it swallowed is not
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in pending:
+                ex, handler = waits[task]
+                if handler is not None and not handler.done():
+                    self._ctx.emit(
+                        LogEvent(
+                            message=f"stop: the handler of {ex.rid} outlived {HANDLER_CANCEL_WAIT}s "
+                            f"of D-9's bound; it is left to end on its own"
+                        )
+                    )
         for ex in list(self._exchanges.values()):
             if ex.res is not None:
                 self._start_archive(ex)
