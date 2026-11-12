@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import os
 import re
@@ -73,6 +74,8 @@ STOPPING_RESULT: dict[str, Any] = {"code": 300, "msg": AGENT_STOPPING_MSG}
 # swallows its cancellation would otherwise hold `stop()` — and with it C1, the watcher's close, and every
 # later lifecycle step — forever.
 HANDLER_CANCEL_WAIT = 1.0
+
+CONFIRM_POLL = 0.05  # the shortest sleep the confirmation wait takes between scans
 
 
 class ReceiverHooks(Protocol):
@@ -197,6 +200,11 @@ class Receiver:
         if self._stopped:
             return
         self._stopped = True
+        # D-9's phase (3) owns one bound, `handler_cancel_wait`, and two waits live inside it: the cancelled
+        # handlers, and the confirmations of the exchanges this stop answers. The deadline is set once, here,
+        # so the phase cannot take a second second by running its waits in sequence. It is the loop's clock,
+        # because the waits are the loop's: a config clock that stands still would spend the bound forever.
+        phase_over = asyncio.get_running_loop().time() + self._handler_cancel_wait
         if self._loop_task is not None:
             self._loop_task.cancel()
             await asyncio.gather(self._loop_task, return_exceptions=True)
@@ -235,7 +243,10 @@ class Receiver:
             # bound the handler task is left to end on its own — the one documented exception to "nothing
             # of ours is armed after stop", named by its rid — and its exchange is archived like any
             # answered one. A handler that answers inside the bound is answered as before.
-            _, pending = await asyncio.wait(list(waits), timeout=self._handler_cancel_wait)
+            _, pending = await asyncio.wait(
+                list(waits),
+                timeout=max(0.0, phase_over - asyncio.get_running_loop().time()),
+            )
             for task in pending:
                 task.cancel()  # `serve` is ours; the handler whose cancellation it swallowed is not
             await asyncio.gather(*pending, return_exceptions=True)
@@ -249,6 +260,11 @@ class Receiver:
                             "it is left to end on its own"
                         )
                     )
+        # An answer a caller is watching for must be readable: the protocol's code-300 rule says the exchange
+        # "then ends as any other answered request (confirmation, archive as `confirmed` or `completed`)",
+        # and it is the archive that deletes the response file. So the rest of the phase's bound is spent
+        # waiting for the confirmations, and only then is each answer archived.
+        await self._await_confirmations(phase_over)
         for ex in list(self._exchanges.values()):
             if ex.res is not None:
                 self._start_archive(ex)
@@ -266,6 +282,39 @@ class Receiver:
             self._ctx.emit(LogEvent(message=f"watcher join timed out: {WATCH_JOIN_TIMEOUT}s"))
 
     # --- the one task helper -------------------------------------------------
+
+    def _owed(self) -> list[_Exchange]:
+        """The exchanges `stop()` still owes a confirmation to: answered here, not confirmed, not archiving."""
+        return [
+            ex
+            for ex in self._exchanges.values()
+            if ex.res is not None and ex.con is None and ex.rid not in self._archiving
+        ]
+
+    async def _await_confirmations(self, phase_over: float) -> None:
+        """D-9's phase (3), inside the phase's own bound: watch the inbox for the confirmation of every
+        exchange this stop answered — the code-300 answers and any ordinary answer written just before — and
+        stop watching when they are all in or the bound is spent. A confirmation archives its exchange as it
+        always does (`confirmed`); one that never comes costs the rest of the bound and no more, and the
+        archive below ends that exchange `completed`."""
+        if (sub := self._sub) is None:
+            return
+        loop = asyncio.get_running_loop()
+        while self._owed():
+            if (remaining := phase_over - loop.time()) <= 0:
+                return
+            sub.changed.clear()
+            await (
+                self._scan_once()
+            )  # the loop's own scan: `_process_file` admits what is owed and nothing else
+            if not self._owed():
+                return
+            with contextlib.suppress(TimeoutError):
+                # The watch is the fast path; the floor is what makes the bound real. A wait that only the
+                # watcher can end is as long as the watcher's latency, and that is not a second (probed: the
+                # confirmation of an answer written at the stop's heels arrived in milliseconds and was still
+                # missed, so the exchange archived `completed` while its caller was reading the answer).
+                await asyncio.wait_for(sub.changed.wait(), timeout=min(remaining, CONFIRM_POLL))
 
     def _start(
         self, coro: Coroutine[Any, Any, Any], name: str, message: str | None = None
@@ -321,7 +370,12 @@ class Receiver:
             await self._process_file(name)
 
     async def _process_file(self, name: str) -> None:
-        if self._stopped or not name.endswith(".json"):
+        if not name.endswith(".json"):
+            return
+        if self._stopped and not self._owed_during_stop(name):
+            # While `stop()` waits out phase (3), the inbox is open to one thing: the confirmation, or a late
+            # cancellation, of an exchange this stop has already answered. A new request is still refused, and
+            # so is a second answer (`_respond`'s guard); `A2` writes nothing after the stop starts.
             return
         path = os.path.join(self._inbox, name)
         value, reason = await self._read_envelope(path)
@@ -346,6 +400,15 @@ class Receiver:
             await self._dispatch_later(
                 cast(CancellationFile | ConfirmationFile, value), path, name, kind
             )
+
+    def _owed_during_stop(self, name: str) -> bool:
+        """Is this inbox file owed while `stop()` waits for confirmations? Only a confirmation or a
+        cancellation whose rid is an exchange answered here and not yet confirmed: never a request."""
+        for suffix in (".con.json", ".can.json"):
+            if name.endswith(suffix):
+                ex = self._exchanges.get(name[: -len(suffix)])
+                return ex is not None and ex.res is not None and ex.con is None
+        return False
 
     async def _read_envelope(self, path: str) -> tuple[dict[str, Any] | None, str | None]:
         # (value, ignore-reason); a vanished file is (None, None).
