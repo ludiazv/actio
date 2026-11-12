@@ -266,25 +266,33 @@ class Receiver:
 
     # --- the one task helper -------------------------------------------------
 
-    async def _run_guarded(self, coro: Coroutine[Any, Any, Any], message: str) -> None:
-        """The crash report of an unexpected exception, as exactly one `LogEvent` (never a crash);
-        a cancelled task reports nothing."""
-        try:
-            await coro
-        except asyncio.CancelledError:
-            raise
-        except Exception as err:
-            self._ctx.emit(LogEvent(message=f"{message}: {err}"))
-
     def _start(
         self, coro: Coroutine[Any, Any, Any], name: str, message: str | None = None
     ) -> asyncio.Task[Any]:
-        """One of this receiver's tasks: the wrapped coroutine handed to the injected `Spawn`, and a
-        strong reference kept until it ends (a task with none can be garbage-collected mid-run)."""
-        task = self._spawn(self._run_guarded(coro, message) if message is not None else coro, name)
+        """One of this receiver's tasks: the coroutine goes to the injected `Spawn` as it is, and a strong
+        reference is kept until it ends (a task with none can be garbage-collected mid-run).
+
+        The crash report is a done callback, not a wrapper around the coroutine. A task cancelled before
+        its first step closes its own coroutine, and a wrapper would leave the coroutine inside it
+        unawaited: `-X dev` reports that at collection time, where `-W error` cannot reach it, so the
+        row that stops a loop two statements after starting it would print a warning and stay green."""
+        task = self._spawn(coro, name)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        if message is not None:
+            task.add_done_callback(self._crashed(message))
         return task
+
+    def _crashed(self, message: str) -> Callable[[asyncio.Task[Any]], None]:
+        def report(task: asyncio.Task[Any]) -> None:
+            # The crash report of an unexpected exception, as exactly one `LogEvent` (never a crash); a
+            # cancelled task reports nothing. Reading the exception here is also what retrieves it.
+            if task.cancelled():
+                return
+            if (err := task.exception()) is not None:
+                self._ctx.emit(LogEvent(message=f"{message}: {err}"))
+
+        return report
 
     # --- the inbox loop ------------------------------------------------------
 
