@@ -1553,6 +1553,13 @@ class TwoAgentTest(AgentTest):
             released.set()
             outcome = await call
             self.assertEqual(outcome.final_status, "confirmed")
+            # `confirmed` is `alpha`'s confirmation landing: `beta`'s archive, and its `inreq` line, follow
+            # it. Wait for the line before reading it — 3.13 caught this read racing its own subject.
+            await wait_for(
+                "beta's inreq line for the exchange",
+                lambda: any(line["event"] == "inreq" for line in lines(root, PEER)),
+                timeout=WATCH_SETTLE,
+            )
             archived = [
                 cast(dict[str, Any], line["event_data"])
                 for line in lines(root, PEER)
