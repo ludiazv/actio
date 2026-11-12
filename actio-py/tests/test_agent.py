@@ -1515,6 +1515,61 @@ class TwoAgentTest(AgentTest):
             self.assertEqual(spec_path(root, PEER).read_bytes(), spec_before)
             self.assertEqual(announce_path(root, PEER).read_bytes(), announce_before)
 
+    # --- the forum's ownership: a response attachment's window ------------------------------------------
+
+    async def test_a_response_attachment_precedes_the_response_and_leaves_with_the_archive(
+        self,
+    ) -> None:
+        """The ownership table gives response attachments to the receiver: written at `A2` in `forum`,
+        deleted at the archive (`A4`), and the archive is what the confirmation starts. So a caller that
+        reads one after `request()` returns is racing `A4` and winning — 20 of 20 readable measures a race,
+        not a guarantee. Both ends are pinned here across the wire through the public API: the file is in
+        the shared forum while `beta`'s handler is still parked and no `.res.json` exists yet, so the
+        responder's own writes put it there first; the archived `inreq` lists it; and it is gone once
+        `beta` archives. A caller that needs bytes puts them in `result` — the protocol opens no window.
+        """
+        released = asyncio.Event()
+
+        async def publishing(params: Any, ctx: Any) -> dict[str, Any]:
+            await ctx.publish_attachment("notes/out.txt", b"the answer's own file")
+            await released.wait()  # hold the exchange open: no response file yet
+            return {"text": "done"}
+
+        async with self.tree() as root:
+            alpha, _ = await self.boot(root)
+            beta, _ = self.build_peer(root, caps={"notes": publishing})
+            await beta.start()
+            await self._see(alpha, "notes")
+            call = asyncio.create_task(alpha.request(PEER, "notes", {}, timeout=0))
+            forum_file = root / "forum" / "notes" / "out.txt"
+            await wait_for(
+                "the response attachment in the shared forum",
+                lambda: forum_file.exists(),
+                timeout=WATCH_SETTLE,
+            )
+            self.assertEqual(forum_file.read_bytes(), b"the answer's own file")
+            # The handler is parked: the file is in the forum before any response exists to list it.
+            self.assertEqual(list(inbox_dir(root, PEER).glob("*.res.json")), [])
+            released.set()
+            outcome = await call
+            self.assertEqual(outcome.final_status, "confirmed")
+            archived = [
+                cast(dict[str, Any], line["event_data"])
+                for line in lines(root, PEER)
+                if line["event"] == "inreq"
+            ]
+            self.assertEqual([line["final_status"] for line in archived], ["confirmed"])
+            res = cast(dict[str, Any], archived[0]["res"])
+            self.assertEqual(
+                cast(dict[str, Any], res["response"])["attachments"], ["notes/out.txt"]
+            )
+            await wait_for(
+                "beta's archive to take the attachment",
+                lambda: not forum_file.exists(),
+                timeout=WATCH_SETTLE,
+            )
+            self.assertFalse(forum_file.exists())
+
     # --- semantics 6: the protocol's I/O has a thread pool of its own --------------------------------
 
     async def test_a_storm_of_blocking_handlers_does_not_delay_a_quiet_request(self) -> None:
