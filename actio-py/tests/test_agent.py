@@ -15,7 +15,7 @@ import asyncio
 import contextlib
 import json
 import shutil
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any, cast
 from unittest import mock
@@ -264,12 +264,45 @@ async def quick_handler(parameters: Any, ctx: Any) -> dict[str, str]:
     return {"text": "short"}
 
 
+async def echo_handler(parameters: Any, ctx: Any) -> dict[str, Any]:
+    return {"echoed": (parameters or {}).get("text", "")}
+
+
 class AgentTest(ActioTestCase):
     """Builds an agent for `alpha` in a fresh tree; every test ends with it stopped.
 
     The base class fails the test if a task or a thread of ours is still armed, so a lifecycle test
     that leaks a heartbeat or a watcher thread cannot pass.
     """
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self._agents: list[ActioAgent] = []  # every agent this test built, in build order
+
+    def track(self, agent: ActioAgent) -> ActioAgent:
+        """Register an agent so `tree()` below stops it before its folders go away."""
+        self._agents.append(agent)
+        self.addAsyncCleanup(agent.stop)
+        return agent
+
+    @contextlib.asynccontextmanager
+    async def tree(self) -> AsyncIterator[Path]:
+        """`actio_tree()`, with the agents this test built stopped **before** its folders go away.
+
+        A test that ends with an agent running deletes its tree under that agent's feet: a delayed
+        write (D-2's `announce_delay` re-announce, D-8's status write) can land mid-removal, and
+        `TemporaryDirectory.cleanup()` then raises for a reason that has nothing to do with what the
+        test asked. The folders outlive every task of the agents that own them — which is what D-9's
+        stop order is for. `stop()` on an already stopped agent returns at once, so a test that stopped
+        its agent on purpose is unaffected.
+        """
+        started = len(self._agents)
+        with actio_tree() as root:
+            try:
+                yield root
+            finally:
+                for agent in self._agents[started:]:
+                    await agent.stop()
 
     def build(
         self,
@@ -291,7 +324,7 @@ class AgentTest(ActioTestCase):
         )
         for name, handler in (caps or {}).items():
             agent.capability(cap(name), handler)
-        self.addAsyncCleanup(agent.stop)
+        self.track(agent)
         return agent, the_clock
 
     async def boot(self, root: Path, **kw: Any) -> tuple[ActioAgent, Clock]:
@@ -306,7 +339,7 @@ class SpineTest(AgentTest):
         announce (status first, with a delay); on exit `inactive` and the announce after it. Every
         announcement writes its diarium line, so the run's diarium is `idle`, `announce`, `inactive`,
         `announce`. Asserted on the files and the diarium, not internal state."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = self.build(root)
             async with agent:
                 spec = doc(spec_path(root))
@@ -346,7 +379,7 @@ class StopTest(AgentTest):
         `inactive` write — the outbound side is stopped (step 4) before the status (C1). The test's
         caller tasks are not the agent's: the stop tears the agent down, and the callers go away
         with it, as a torn-down handler would (the exchange ends correctly in the background)."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             peer_tree(root)  # the peer never answers
             agent, _ = await self.boot(root)
             tasks = [asyncio.create_task(agent.request(PEER, "echo", {"n": i})) for i in range(3)]
@@ -388,7 +421,7 @@ class StopTest(AgentTest):
         """D-9 and the publisher's latch: the heartbeat is stopped with the run, and nothing may
         outwrite the `inactive`. The clock is ticked past a fresh datetime, so an armed tick would
         be visible in the file."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, clock = await self.boot(root, heartbeat_interval=0.05)
             await agent.stop()
             before = status_path(root).read_bytes()
@@ -400,7 +433,7 @@ class StopTest(AgentTest):
         """D-9: a slow tick must not land after `inactive`. The stop awaits the heartbeat (step 5)
         before C1, and the publisher's latch keeps a late write out; this test gives the in-flight
         tick every chance to land (it finishes after `stop()` returns) and then reads the file."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root, heartbeat_interval=0.05)
             run = agent._run
             assert run is not None
@@ -431,7 +464,7 @@ class LifecycleTest(AgentTest):
     async def test_a_stop_during_start_waits_for_it_and_ends_inactive(self) -> None:
         """D-9: a stop during start waits for it — the lifecycle steps run one at a time — and ends
         with the agent inactive and nothing armed."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = self.build(root, announce_delay=1.0)  # a catchable start
             start = asyncio.create_task(agent.start())
             await wait_for(
@@ -446,7 +479,7 @@ class LifecycleTest(AgentTest):
     async def test_a_cancelled_start_leaves_nothing_armed_and_publishes_inactive(self) -> None:
         """D-9: a caller who cancels `start` aborts it and leaves nothing armed, publishing
         `inactive` if `idle` was."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = self.build(root, announce_delay=1.0)  # a catchable start
             start = asyncio.create_task(agent.start())
             await wait_for("start to publish the idle status", lambda: status_path(root).exists())
@@ -462,7 +495,7 @@ class LifecycleTest(AgentTest):
         """D-9: a second `stop` only waits for the first; the teardown runs once, in order. An
         in-flight request makes the first teardown spend its grace, so "the second waited" is
         observable: without the wait, the status would still be `busy` when both calls return."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             peer_tree(root)  # the request's source, discovered and callable
             release = asyncio.Event()
 
@@ -491,7 +524,7 @@ class LifecycleTest(AgentTest):
             self.assertEqual(doc(status_path(root))["status"], "inactive")
 
     async def test_wait_stopped_returns_when_stopped_for_good(self) -> None:
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root)
             stopped = asyncio.create_task(agent.wait_stopped())
             await asyncio.sleep(0.1)
@@ -503,7 +536,7 @@ class LifecycleTest(AgentTest):
         """*Agent's status*: `fail` is status `error` plus an announce; there is no recovery, and a
         second `fail` does not announce again. Every announcement writes its diarium line, so `fail`
         appends one `announce` line and the no-op second `fail` appends none."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root)
             # The start's announce wrote one line; the `fail`'s will be the second.
             self.assertEqual(
@@ -539,7 +572,7 @@ class LifecycleTest(AgentTest):
         """D-22: a lost own inbox is fatal: log it and enter `error`, with the announce. The log is
         the observability event (the diarium keeps the `status` line), as the reference does. The `fail`
         the loss arms writes its `announce` diarium line — exactly one, on top of the start's."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root)
             events: list[Any] = []
             agent.on_event(lambda e: events.append(e))
@@ -564,7 +597,7 @@ class LifecycleTest(AgentTest):
         of leaving it armed behind the stop, and the run ends at C1's `inactive`. The sync provider holds
         each write, so the `fail` is still in flight when `stop()` runs. The base class's leftover check is
         the other half: an untracked `actio.fail` is still armed at teardown."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root, heartbeat_interval=1000, sync="delay:400")
             events: list[Any] = []
             agent.on_event(lambda e: events.append(e))
@@ -588,7 +621,7 @@ class RestartTest(AgentTest):
     async def test_a_restart_keeps_the_object_and_registrations_and_drops_disabled(self) -> None:
         """D-10: the agent object stays the same, `wait_stopped()` does not return, registrations
         survive, and a `disabled` set by `enable` does not: the fresh start rebuilds the spec."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root, caps={"summarize": quick_handler})
             write_file(
                 inbox_dir(root) / f"{rid(1)}.json", cmd_file(rid(1), "enable", {"enabled": False})
@@ -622,7 +655,7 @@ class RestartTest(AgentTest):
     async def test_a_restart_whose_start_fails_ends_wait_stopped(self) -> None:
         """D-10: a restart whose `start` fails ends `wait_stopped()` too, because nobody is left to
         bring the agent back."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root)
             write_file(
                 inbox_dir(root) / f"{rid(1)}.json",
@@ -648,7 +681,7 @@ class RestartTest(AgentTest):
         run would find nothing to do and let the agent come back behind the caller's back. The delay is
         long on purpose, so that load cannot close the window on its own; the base class's leftover check
         is half the test, since a restart still sleeping is still armed."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root)
             write_file(
                 inbox_dir(root) / f"{rid(1)}.json",
@@ -691,7 +724,7 @@ class CommandTest(AgentTest):
         """D2 and *Agent Spec* ("`disabled` … Changed with the `enable` command"): setting it false
         then true follows in `spec.json`, and each change re-announces — the file, the diarium line,
         the announce."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root, heartbeat_interval=1000)
             # The start's announce wrote one line; each `enable` below adds one more.
             self.assertEqual(self._announce_count(root), 1)
@@ -737,7 +770,7 @@ class CommandTest(AgentTest):
                 await asyncio.sleep(0.3)  # the announce file's write is the slow one
             await real_write(path, obj, tmp_dir, provider)
 
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root, heartbeat_interval=1000, announce_delay=0.5)
             self.assertEqual(doc(announce_path(root))["nuntium"], f"agent {AGENT} is active")
             # The start's announce wrote one line; the `enable`'s will be the second.
@@ -766,7 +799,7 @@ class CommandTest(AgentTest):
         """D0: "commands are processed even if the agent is disabled, so that it can be enabled
         again or shut down." With `disabled: true` in the spec, an `enable` back must land and
         clear it; *Callability rules* keeps the command path open for the same reason."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root, heartbeat_interval=1000)
             write_file(
                 inbox_dir(root) / f"{rid(1)}.json", cmd_file(rid(1), "enable", {"enabled": False})
@@ -789,7 +822,7 @@ class CommandTest(AgentTest):
         """D2: "`ping` re-publishes both". Both files are rewritten and the announce is written
         again; the heartbeat is 1000 s out, so the fresh datetime can only be `ping`'s write from
         the ticked clock, not a tick's."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, clock = await self.boot(root, heartbeat_interval=1000)
             spec_before = doc(spec_path(root))["datetime"]
             status_before = doc(status_path(root))["datetime"]
@@ -818,7 +851,7 @@ class CommandTest(AgentTest):
         """D1: "no response file is ever written for `type=\"cmd\"`." After a command, no
         `<rid>.res.json` and no `<rid>.con.json` exist, the envelope is archived (D3), and the
         diarium carries one `inreq` line with `final_status` `completed`."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root, heartbeat_interval=1000)
             r = rid(1)
             write_file(inbox_dir(root) / f"{r}.json", cmd_file(r, "ping", None))
@@ -840,7 +873,7 @@ class CommandTest(AgentTest):
         """D4: a command from a `src` not in `accepts_commands_from` is dropped without touching what
         peers see — `status.json`, `spec.json` and the announce file are **not** touched, and the
         diarium carries the `inreq` line with `final_status` `dropped`."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root, heartbeat_interval=1000)
             status_before = status_path(root).read_bytes()
             spec_before = spec_path(root).read_bytes()
@@ -860,7 +893,7 @@ class CommandTest(AgentTest):
     async def test_on_command_in_both_forms(self) -> None:
         """`on_command(name, handler)` in both frozen forms: the direct call and the decorator. The
         commands are never advertised, so the registration is asserted on the agent's own table."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = self.build(root)
 
             async def direct_handler(params: Any, ctx: Any) -> None:
@@ -880,7 +913,7 @@ class CommandTest(AgentTest):
         """D0: the agent knows "either a protocol-standard command (`stop`, `enable`, `restart`,
         `ping`) or a custom command it implements internally"; the standard four are built-in, so
         `on_command` refuses to shadow them."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = self.build(root)
 
             async def handler(params: Any, ctx: Any) -> None:
@@ -891,7 +924,7 @@ class CommandTest(AgentTest):
                     agent.on_command(name, handler)
 
     async def test_on_command_refuses_a_duplicate(self) -> None:
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = self.build(root)
 
             async def handler(params: Any, ctx: Any) -> None:
@@ -902,7 +935,7 @@ class CommandTest(AgentTest):
                 agent.on_command("my_cmd", handler)
 
     async def test_on_command_needs_an_async_handler(self) -> None:
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = self.build(root)
 
             def sync_handler(params: Any, ctx: Any) -> None:
@@ -920,7 +953,7 @@ class RegistrationTest(AgentTest):
     async def test_a_good_capability_lands_in_the_spec_with_its_schema(self) -> None:
         """A valid capability reaches `spec.json` whole, its `actio.result` schema and all: the
         schema a peer validates against is the one the agent published."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root, caps={"summarize": quick_handler})
             caps = {c["name"]: c for c in doc(spec_path(root))["capabilities"]}
             self.assertIn("summarize", caps)
@@ -930,7 +963,7 @@ class RegistrationTest(AgentTest):
     async def test_a_bad_own_schema_raises_and_leaves_the_registration_unchanged(self) -> None:
         """D-19 (own side): "a failing `check_schema` or an **unknown keyword** is a registration
         error." The `capability` call raises, and the rejected capability is not registered."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = self.build(root)
             broken = cap("broken")
             broken["actio"]["result"] = {"type": "object", "bogusKeyword": True}  # unknown keyword
@@ -942,7 +975,7 @@ class RegistrationTest(AgentTest):
         """D-19 (peer side): "a failing `check_schema`, or an error from the validator itself as
         opposed to a validation result, skips the checks and logs once." The skip is not fatal, and
         the log line is one, not one per call."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root)
             events: list[Any] = []
             agent.on_event(lambda e: events.append(e))
@@ -986,7 +1019,7 @@ class RegistrationTest(AgentTest):
     async def test_registration_before_start_and_while_running_reach_the_spec(self) -> None:
         """A capability registered before `start` is in the spec the start publishes; one registered
         while running reaches `spec.json` on the next rebuild, which a `ping` is."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             the_clock = Clock()
             agent = ActioAgent(
                 id=AGENT,
@@ -995,7 +1028,7 @@ class RegistrationTest(AgentTest):
                 config=config_for(root, the_clock, heartbeat_interval=1000),
             )
             agent.capability(cap("early"), quick_handler)  # before start
-            self.addAsyncCleanup(agent.stop)
+            self.track(agent)
             await agent.start()
             names = [c["name"] for c in doc(spec_path(root))["capabilities"]]
             self.assertIn("early", names)
@@ -1010,7 +1043,7 @@ class RegistrationTest(AgentTest):
     async def test_a_duplicate_capability_name_raises(self) -> None:
         """The code's rule for a duplicate name is a registration-time `ValueError`, not a silent
         single entry: the second `capability` call with a taken name raises, and the first stands."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = self.build(root)
             agent.capability(cap("same"), quick_handler)
             with self.assertRaises(ValueError):
@@ -1025,7 +1058,7 @@ class PeerViewTest(AgentTest):
     async def test_agmen_returns_the_current_view(self) -> None:
         """`agmen()` returns the current view, read-only, keyed by agent id; our own folder is in it
         (a self-call hangs on it, D-18)."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root)
             view = agent.agmen()
             self.assertIn(AGENT, view)
@@ -1034,7 +1067,7 @@ class PeerViewTest(AgentTest):
     async def test_refresh_returns_the_new_view(self) -> None:
         """`refresh()` runs a full scan now and returns the new view — the same mapping `agmen()`
         then returns (a frozen interface: "`refresh()` … it returns the new view")."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root)
             self.assertNotIn(PEER, agent.agmen())
             peer_tree(root)  # beta appears after the start
@@ -1045,7 +1078,7 @@ class PeerViewTest(AgentTest):
     async def test_a_peer_with_a_usable_capability_is_in_the_view(self) -> None:
         """Rule 5.2 and 6: a peer whose capability is usable by us (no `accepts_from`) is in the
         view, with that capability."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root)
             peer_tree(root)  # beta offers `echo` to everyone
             await agent.refresh()
@@ -1056,7 +1089,7 @@ class PeerViewTest(AgentTest):
         """Rule 1: "If agent B's spec has `disabled=true`, agent A will not consider agent B's
         capabilities. Commands can still be sent, so that the agent can be enabled again." A disabled
         peer that accepts our commands stays in the view, with no capabilities."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root)
             peer_tree(
                 root, disabled=True, accepts=[AGENT]
@@ -1070,7 +1103,7 @@ class PeerViewTest(AgentTest):
         """Rule 6: "If the previous filters show that no commands and no capabilities are usable by
         agent A, agent A will discard agent B." A peer that accepts no commands from us and offers no
         capability we may use is not in the view."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root)
             folder = root / "gamma"
             (folder / "inbox").mkdir(parents=True)
@@ -1106,7 +1139,7 @@ class PeerViewTest(AgentTest):
         """Rule 3: "If agent A does not support the security features required by agent B's security
         posture, agent A will not consider agent B's specification." The core profile supports no
         feature, so a peer that requires any posture but `trusted` is not in the view."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root)
             peer_tree(root, peer="delta", posture="untrusted")
             await agent.refresh()
@@ -1121,7 +1154,7 @@ class ScanTest(AgentTest):
         gains beta within the debounce plus a named margin." The assertion is that the view gains beta
         with **no call** at all; a mutant that drops the scan's scheduling fails it. The margin is a
         bound on the wait, not a sleep: the fact asserted is the gain, and it must come for free."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root, nuntium_debounce=0.2)
             self.assertNotIn(PEER, agent.agmen())
             # beta starts afterwards: its folder and its announce land in the tree.
@@ -1153,7 +1186,7 @@ class SelfCallTest(AgentTest):
         other destination." An agent MAY call itself (*Callability rules*: "the protocol does not
         inhibit it"); the request lands in its own inbox, the outcome is `confirmed` with the archive
         intact, and the diarium carries both an `inreq` and an `outreq` line."""
-        with actio_tree() as root:
+        async with self.tree() as root:
             agent, _ = await self.boot(root, caps={"summarize": quick_handler}, confirm_timeout=0.2)
             outcome = await agent.request(AGENT, "summarize", {"text": "hi"}, timeout=5)
             self.assertEqual(outcome.final_status, "confirmed")
@@ -1172,3 +1205,302 @@ class SelfCallTest(AgentTest):
                 timeout=WATCH_SETTLE,
             )
             self.assertIsNone(agent._restart_task)  # the delay is 10 s: it is not merely sleeping
+
+
+class TwoAgentTest(AgentTest):
+    """Two live agents in one tree, talking through the folders.
+
+    Every request test before this one talked to a **fake peer**: it wrote files under `beta/` by
+    hand and no agent ran there. Here both `alpha` and `beta` are live `ActioAgent`s in the same
+    `actio_tree()` root, serving each other's inboxes. `ActioAgent` takes its folder from
+    `config.root` and its own id, so the second agent differs from `build` only in id and defaults;
+    both keep `addAsyncCleanup(agent.stop)`, so the base class' leftover check covers both.
+    """
+
+    def build_peer(
+        self,
+        root: Path,
+        *,
+        caps: dict[str, CapabilityHandler] | None = None,
+        accepts: list[str] | None = None,
+        clock: Clock | None = None,
+        **cfg_over: Any,
+    ) -> tuple[ActioAgent, Clock]:
+        """The second live agent, `beta`, in the same tree. Only `alpha` may command it by default:
+        a `gamma` envelope is the D4 foreign one."""
+        the_clock = clock if clock is not None else Clock()
+        agent = ActioAgent(
+            id=PEER,
+            description="the second live agent",
+            accepts_commands_from=accepts if accepts is not None else [AGENT],
+            config=config_for(root, the_clock, **cfg_over),
+        )
+        for name, handler in (caps or {}).items():
+            agent.capability(cap(name), handler)
+        self.track(agent)
+        return agent, the_clock
+
+    async def _see(self, alpha: ActioAgent, name: str | None = None) -> None:
+        """Wait until `alpha`'s view carries `beta` (and, if named, that capability) — no `refresh`."""
+
+        def there() -> bool:
+            view = alpha.agmen()
+            if PEER not in view:
+                return False
+            return name is None or name in view[PEER].capabilities
+
+        await wait_for(
+            f"alpha's view to gain beta{'' if name is None else f' and {name}'}",
+            there,
+            timeout=WATCH_SETTLE,
+        )
+
+    async def test_a_round_trip_between_two_live_agents(self) -> None:
+        """*Envelope lifecycle* / D-11: `alpha` (no capabilities) requests `echo` from a live `beta`;
+        the outcome is `confirmed` and carries the handler's result, `alpha`'s diarium has an `outreq`
+        line with `final_status: "confirmed"`, `beta`'s an `inreq` line with the same, and `beta`'s
+        inbox is empty again with the forum holding nothing. The `inreq` line is the archive's: it is
+        written when the exchange is archived, so the test waits for it."""
+        async with self.tree() as root:
+            alpha, _ = await self.boot(root, confirm_timeout=0.2)
+            beta, _ = self.build_peer(root, caps={"echo": echo_handler}, confirm_timeout=0.2)
+            await beta.start()
+            await self._see(alpha, "echo")
+            outcome = await alpha.request(PEER, "echo", {"text": "hello"}, timeout=10)
+            self.assertEqual(outcome.final_status, "confirmed")
+            assert outcome.response is not None  # a confirmed outcome carries the response body
+            self.assertEqual(outcome.response["result"], {"echoed": "hello"})
+            # `alpha`'s side: the `outreq` line, `confirmed`.
+            self.assertTrue(
+                any(
+                    line["event"] == "outreq"
+                    and cast(dict[str, Any], line["event_data"])["final_status"] == "confirmed"
+                    for line in lines(root, AGENT)
+                )
+            )
+            # `beta`'s side: the `inreq` line, `confirmed` (the archive lands it; the timeout is short).
+            await wait_for(
+                "beta's confirmed inreq line",
+                lambda: any(
+                    line["event"] == "inreq"
+                    and cast(dict[str, Any], line["event_data"])["final_status"] == "confirmed"
+                    for line in lines(root, PEER)
+                ),
+                timeout=WATCH_SETTLE,
+            )
+            # The exchange is archived: `beta`'s inbox is empty again, and the forum holds nothing.
+            await wait_for(
+                "beta's inbox to empty",
+                lambda: not list(inbox_dir(root, PEER).iterdir()),
+                timeout=WATCH_SETTLE,
+            )
+            self.assertEqual(list((root / "forum").iterdir()), [])
+
+    async def test_d8_busy_and_idle_across_the_wire(self) -> None:
+        """D-8 across the wire: while `beta`'s handler is parked, `beta/status.json` reads `busy`;
+        after it returns, `idle`. Pinned on the file, not on internals: a state change re-evaluates
+        busy and publishes it, so the file flips on the handler's start and end, not on a tick."""
+        async with self.tree() as root:
+            release = asyncio.Event()
+
+            async def parking_handler(params: Any, ctx: Any) -> dict[str, Any]:
+                await release.wait()
+                return {"text": "done"}
+
+            alpha, _ = await self.boot(root)
+            beta, _ = self.build_peer(root, caps={"park": parking_handler})
+            await beta.start()
+            await self._see(alpha, "park")
+            task = asyncio.create_task(alpha.request(PEER, "park", {"n": 1}, timeout=30))
+            # The handler is parked: `beta`'s status is `busy`.
+            await wait_for(
+                "beta's status to read busy while its handler is parked",
+                lambda: (
+                    status_path(root, PEER).exists()
+                    and doc(status_path(root, PEER))["status"] == "busy"
+                ),
+                timeout=WATCH_SETTLE,
+            )
+            release.set()
+            outcome = await task
+            self.assertEqual(outcome.final_status, "confirmed")
+            # After the handler returns, `beta`'s status is `idle` again.
+            await wait_for(
+                "beta's status to read idle after its handler returns",
+                lambda: doc(status_path(root, PEER))["status"] == "idle",
+                timeout=WATCH_SETTLE,
+            )
+
+    async def test_d17_the_view_gains_a_later_live_peer(self) -> None:
+        """D-17 between two agents: `alpha` starts first; `beta` starts and announces; `alpha.agmen()`
+        gains `beta` and its capability **without any `refresh()` call** — `alpha`'s own `nuntium`
+        watch did it. The control is the debounced scan (a body that returns at once) must fail this
+        too. The margin is a bound on the wait under parallel load, not a sleep: the fact asserted is
+        the gain, and it must come for free."""
+        async with self.tree() as root:
+            alpha, _ = await self.boot(root, nuntium_debounce=0.2)
+            self.assertNotIn(PEER, alpha.agmen())
+            beta, _ = self.build_peer(root, caps={"echo": echo_handler})
+            # `beta` starts and announces; `alpha`'s `nuntium` watch triggers the debounced scan.
+            start_beta = asyncio.create_task(beta.start())
+            DEBOUNCE = 0.2  # the configured `nuntium_debounce`
+            MARGIN = 5.0  # the named margin: a bound, so load cannot flip the verdict
+            await wait_for(
+                "alpha's view to gain beta and its echo capability, with no refresh() call",
+                lambda: PEER in alpha.agmen() and "echo" in alpha.agmen()[PEER].capabilities,
+                timeout=DEBOUNCE + MARGIN,
+            )
+            await start_beta
+            self.assertIn(PEER, alpha.agmen())
+            self.assertIn("echo", alpha.agmen()[PEER].capabilities)
+
+    async def test_a_cancellation_across_the_wire(self) -> None:
+        """A cancellation across the wire: `alpha` requests a capability whose handler parks on the
+        cancel flag; `alpha`'s task is cancelled; the handler reports it was cancelled (the point of
+        the row, not a side effect); `beta` answers the cancellation per *Envelope lifecycle*; both
+        diariums end `cancelled`; nothing is armed on either side afterwards. Control: make `beta`
+        ignore a cancellation for a running handler — the handler never wakes, the exchange never
+        ends, and this test times out."""
+        async with self.tree() as root:
+            reported = {"cancelled": False}
+
+            async def cancel_handler(params: Any, ctx: Any) -> dict[str, Any]:
+                await ctx.cancelled.wait()  # park until the cancellation arrives
+                reported["cancelled"] = True  # the handler saw the cancel: that is the row
+                return {"text": "cancelled"}
+
+            alpha, _ = await self.boot(root, confirm_timeout=0.2, cancel_wait_timeout=10.0)
+            beta, _ = self.build_peer(
+                root, caps={"cancel_echo": cancel_handler}, confirm_timeout=0.2
+            )
+            await beta.start()
+            await self._see(alpha, "cancel_echo")
+            task = asyncio.create_task(
+                alpha.request(PEER, "cancel_echo", {"text": "x"}, timeout=30)
+            )
+            # The request is in `beta`'s inbox and the handler is parked.
+            await wait_for(
+                "the request in beta's inbox",
+                lambda: any(p.name.endswith(".json") for p in inbox_dir(root, PEER).iterdir()),
+                timeout=WATCH_SETTLE,
+            )
+            # Cancel `alpha`'s task: the background finisher writes the `.can.json`.
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            # The handler reported that it was cancelled.
+            await wait_for(
+                "the handler to report that it was cancelled",
+                lambda: reported["cancelled"],
+                timeout=WATCH_SETTLE,
+            )
+            # `beta` answered the cancellation; its `inreq` line ends `cancelled`.
+            await wait_for(
+                "beta's inreq line to end cancelled",
+                lambda: any(
+                    line["event"] == "inreq"
+                    and cast(dict[str, Any], line["event_data"])["final_status"] == "cancelled"
+                    for line in lines(root, PEER)
+                ),
+                timeout=WATCH_SETTLE,
+            )
+            # `alpha`'s `outreq` line ends `cancelled`.
+            await wait_for(
+                "alpha's outreq line to end cancelled",
+                lambda: any(
+                    line["event"] == "outreq"
+                    and cast(dict[str, Any], line["event_data"])["final_status"] == "cancelled"
+                    for line in lines(root, AGENT)
+                ),
+                timeout=WATCH_SETTLE,
+            )
+            # Nothing is armed on either side afterwards: the finisher ended, the inbox is empty.
+            await wait_for(
+                "the background finisher to end and beta's inbox to empty",
+                lambda: (
+                    not any(
+                        not t.done() and t.get_name().startswith("actio.out.")
+                        for t in asyncio.all_tasks()
+                    )
+                    and not list(inbox_dir(root, PEER).iterdir())
+                ),
+                timeout=WATCH_SETTLE,
+            )
+
+    async def test_a_command_across_the_wire(self) -> None:
+        """A command across the wire: `alpha` sends `enable` to `beta` through the requestor's command
+        path (not a hand-written file); `beta`'s spec gains `disabled` and then clears it, and `beta`'
+        diarium carries the `inreq` lines with `final_status: "completed"` (D3). A disabled peer that
+        accepts our commands stays in the view (*Callability rules*), so the second command reaches it."""
+        async with self.tree() as root:
+            alpha, _ = await self.boot(root, heartbeat_interval=1000)
+            beta, _ = self.build_peer(root, heartbeat_interval=1000)
+            await beta.start()
+            await self._see(alpha)  # a peer that accepts our commands is in the view
+            # First disable `beta`: its spec gains `disabled: true`.
+            await alpha.command(PEER, "enable", {"enabled": False})
+            await wait_for(
+                "beta's spec to gain disabled",
+                lambda: (
+                    spec_path(root, PEER).exists()
+                    and doc(spec_path(root, PEER)).get("disabled") is True
+                ),
+                timeout=WATCH_SETTLE,
+            )
+            # Then enable it: its spec clears `disabled`.
+            await alpha.command(PEER, "enable", {"enabled": True})
+            await wait_for(
+                "beta's spec to clear disabled",
+                lambda: doc(spec_path(root, PEER)).get("disabled") is not True,
+                timeout=WATCH_SETTLE,
+            )
+            # `beta`'s diarium carries the `completed` `inreq` lines (D3), one per command.
+            self.assertEqual(
+                [
+                    cast(dict[str, Any], line["event_data"])["final_status"]
+                    for line in lines(root, PEER)
+                    if line["event"] == "inreq"
+                ],
+                ["completed", "completed"],
+            )
+
+    async def test_a_foreign_command_is_dropped(self) -> None:
+        """D4 across the wire: a command from a `src` not in `beta`'s `accepts_commands_from` is dropped
+        without touching what peers see — `beta`'s `status.json`, `spec.json` and the announce file are
+        byte-for-byte what they were, and the diarium carries the `inreq` line with `final_status:
+        "dropped". The envelope is written by hand, as a foreign peer would write it."""
+        async with self.tree() as root:
+            alpha, _ = await self.boot(root, heartbeat_interval=1000)
+            # `beta` accepts commands from `alpha` only: `gamma`'s command is the D4 foreign one.
+            beta, _ = self.build_peer(root, accepts=[AGENT], heartbeat_interval=1000)
+            await beta.start()
+            await wait_for(
+                "beta's spec, status and announce to be settled",
+                lambda: (
+                    spec_path(root, PEER).exists()
+                    and status_path(root, PEER).exists()
+                    and announce_path(root, PEER).exists()
+                ),
+                timeout=WATCH_SETTLE,
+            )
+            status_before = status_path(root, PEER).read_bytes()
+            spec_before = spec_path(root, PEER).read_bytes()
+            announce_before = announce_path(root, PEER).read_bytes()
+            # A hand-written command envelope from `gamma` (not in `beta`'s `accepts_commands_from`).
+            r = rid(7)
+            write_file(
+                inbox_dir(root, PEER) / f"{r}.json",
+                cmd_file(r, "enable", {"enabled": False}, src="gamma", dst=PEER),
+            )
+            await wait_for(
+                "the dropped inreq line",
+                lambda: any(
+                    line["event"] == "inreq"
+                    and cast(dict[str, Any], line["event_data"])["final_status"] == "dropped"
+                    for line in lines(root, PEER)
+                ),
+                timeout=WATCH_SETTLE,
+            )
+            self.assertEqual(status_path(root, PEER).read_bytes(), status_before)
+            self.assertEqual(spec_path(root, PEER).read_bytes(), spec_before)
+            self.assertEqual(announce_path(root, PEER).read_bytes(), announce_before)
