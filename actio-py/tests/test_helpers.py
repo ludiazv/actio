@@ -15,6 +15,7 @@ import unittest
 import weakref
 
 import helpers
+from actio._files import io_hop
 
 
 class NoLeftoversTest(unittest.IsolatedAsyncioTestCase):
@@ -25,6 +26,26 @@ class NoLeftoversTest(unittest.IsolatedAsyncioTestCase):
         with helpers.no_leftovers():
             await asyncio.to_thread(lambda: None)
             await asyncio.to_thread(lambda: None)
+
+    async def test_the_file_layer_s_pooled_workers_are_not_leftovers(self) -> None:
+        """`_files.io_hop` parks its workers under `actio-io_<n>`, like asyncio's own `asyncio_<n>`: that
+        pool is the one documented piece of module state, and it is the only name the check excludes
+        besides asyncio's. The exclusion is shown to have something to exclude, and a thread we start
+        ourselves keeps its name and is still found."""
+        with helpers.no_leftovers():
+            await io_hop(lambda: None)  # the first hop creates the pool; its worker parks
+        pooled = {t for t in threading.enumerate() if t.name.startswith("actio-io")}
+        self.assertTrue(pooled)  # the pool is real, so the exclusion is not vacuous
+        self.assertFalse(pooled & helpers.our_threads())
+        hold = threading.Event()
+        try:
+            with self.assertRaises(AssertionError) as got:
+                with helpers.no_leftovers():
+                    threading.Thread(target=hold.wait, name="one-of-ours", daemon=True).start()
+                    await asyncio.sleep(0)
+            self.assertIn("one-of-ours", str(got.exception))
+        finally:
+            hold.set()
 
     async def test_a_thread_still_running_fails(self) -> None:
         hold = threading.Event()

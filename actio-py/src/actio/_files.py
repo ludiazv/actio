@@ -1,10 +1,12 @@
 """The file layer: the only module in `src` that touches the filesystem.
 
-Every whole operation runs in `asyncio.to_thread`, so the loop never blocks on a disk write. There is
-no module state: the sync provider of the agent is passed in, and its hooks are applied here rather
-than in the callers. JSON is written compact (`separators=(",", ":")`, `ensure_ascii=False`,
-`allow_nan=False`) and read with a `parse_constant` that raises, so `NaN` and `Infinity` from a peer
-are an unparsable file, not a value.
+Every whole operation takes one thread hop on the protocol's own executor (`io_hop`), so the loop never
+blocks on a disk write and a user handler's blocking work cannot starve a heartbeat, a response or a
+scan. That pool is the one piece of module state in the package — marked where it is declared, and
+named in the README; everything else is passed in — the sync provider of the agent and its hooks are applied here
+rather than in the callers. JSON is written compact (`separators=(",", ":")`, `ensure_ascii=False`,
+`allow_nan=False`) and read with a `parse_constant` that raises, so `NaN` and `Infinity` from a peer are
+an unparsable file, not a value.
 
 The `delay` provider's pause is awaited **on the loop after the thread returns**, never slept inside
 the thread: a `delay:10000` write would otherwise hold an executor thread for ten seconds, and a
@@ -20,11 +22,37 @@ import json
 import os
 import shutil
 from collections.abc import Callable, Container, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from ._types import SyncProvider
 from ._util import nonce
 from ._validate import LIMIT, malformed_reason
+
+# The protocol's own thread pool, and the only one its I/O takes a hop on: semantics 6 tells a user to
+# put blocking work in `asyncio.to_thread`, and sharing asyncio's default pool with that work makes a
+# peer's answer wait behind a handler's job. Four workers, because these are short filesystem calls.
+IO_WORKERS = 4
+_io_pool: ThreadPoolExecutor | None = None  # module state
+
+
+def _io() -> ThreadPoolExecutor:
+    global _io_pool
+    # On first use only, and from the loop thread: no lock, and no thread at import.
+    if _io_pool is None:
+        _io_pool = ThreadPoolExecutor(max_workers=IO_WORKERS, thread_name_prefix="actio-io")
+    return _io_pool
+
+
+async def io_hop[T](operation: Callable[..., T], *args: Any) -> T:
+    """One thread hop on the pool above — the only way this package takes a thread.
+
+    Its idle workers are the documented exception to "no thread of ours is armed after `stop`": like
+    asyncio's own default pool, they park for reuse instead of dying, and the leftover check in
+    `tests/helpers.py` excludes them by that prefix while every thread an agent starts is still found
+    by identity.
+    """
+    return await asyncio.get_running_loop().run_in_executor(_io(), operation, *args)
 
 
 def _reject_constant(name: str) -> Any:
@@ -98,7 +126,7 @@ def _post_write(target: str, provider: SyncProvider) -> None:
 
 async def _after_write(op: Callable[[], None], provider: SyncProvider) -> None:
     """One disk operation in a thread, then the provider's pause awaited on the loop, not in the thread."""
-    await asyncio.to_thread(op)
+    await io_hop(op)
     if provider.delay_ms > 0:
         await asyncio.sleep(provider.delay_ms / 1000)
 
@@ -134,7 +162,7 @@ async def read_json(path: str) -> Any:
         except (OSError, UnicodeDecodeError, ValueError):
             return None
 
-    return await asyncio.to_thread(_read)
+    return await io_hop(_read)
 
 
 async def write_json_atomic(path: str, obj: Any, tmp_dir: str, provider: SyncProvider) -> None:
@@ -181,13 +209,13 @@ async def read_text(path: str) -> str:
         with open(path, encoding="utf-8") as fh:
             return fh.read()
 
-    return await asyncio.to_thread(_read)
+    return await io_hop(_read)
 
 
 async def mtime_ns(path: str) -> int:
     """A file's mtime in nanoseconds: the dedup key of D-11's once-per-file line. Raises `OSError` when
     the file is gone or unreadable, which is the caller's signal that there is nothing to key."""
-    return (await asyncio.to_thread(os.stat, path)).st_mtime_ns
+    return (await io_hop(os.stat, path)).st_mtime_ns
 
 
 async def read_text_with_mtime(path: str) -> tuple[int, str] | None:
@@ -207,7 +235,7 @@ async def read_text_with_mtime(path: str) -> tuple[int, str] | None:
         except (FileNotFoundError, NotADirectoryError):
             return None
 
-    return await asyncio.to_thread(_read)
+    return await io_hop(_read)
 
 
 async def append_jsonl(path: str, obj: Any, provider: SyncProvider) -> None:
@@ -253,12 +281,12 @@ async def read_bytes(path: str) -> bytes:
         with open(path, "rb") as fh:
             return fh.read()
 
-    return await asyncio.to_thread(_read)
+    return await io_hop(_read)
 
 
 async def list_dir(path: str) -> list[str]:
     """The entry names of a folder; raises `OSError` when it is gone (the caller decides)."""
-    return await asyncio.to_thread(os.listdir, path)
+    return await io_hop(os.listdir, path)
 
 
 # What one publication file came back as: `("text", the text)`, `("missing", "")`, `("unreadable",
@@ -306,7 +334,7 @@ async def scan_tree(
     root: str, files: Sequence[str], reserved: Container[str]
 ) -> dict[str, dict[str, Publication]]:
     """`read_tree` in a thread: the file layer's one hop for a scan of the whole tree."""
-    return await asyncio.to_thread(read_tree, root, files, reserved)
+    return await io_hop(read_tree, root, files, reserved)
 
 
 async def make_dirs(path: str) -> None:
@@ -315,7 +343,7 @@ async def make_dirs(path: str) -> None:
     def _make() -> None:
         os.makedirs(path, exist_ok=True)
 
-    await asyncio.to_thread(_make)
+    await io_hop(_make)
 
 
 async def remove(path: str) -> None:
@@ -329,4 +357,4 @@ async def remove(path: str) -> None:
         else:
             os.remove(path)
 
-    await asyncio.to_thread(_remove)
+    await io_hop(_remove)

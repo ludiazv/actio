@@ -14,7 +14,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import shutil
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any, cast
@@ -1512,6 +1514,49 @@ class TwoAgentTest(AgentTest):
             self.assertEqual(status_path(root, PEER).read_bytes(), status_before)
             self.assertEqual(spec_path(root, PEER).read_bytes(), spec_before)
             self.assertEqual(announce_path(root, PEER).read_bytes(), announce_before)
+
+    # --- semantics 6: the protocol's I/O has a thread pool of its own --------------------------------
+
+    async def test_a_storm_of_blocking_handlers_does_not_delay_a_quiet_request(self) -> None:
+        """semantics 6 tells the user to put blocking work in `asyncio.to_thread`, and that work shares
+        asyncio's default pool. The protocol's own calls take a hop on a pool of their own, so they cannot
+        queue behind a user's jobs: with the default pool full of handlers each asleep 1.5 s, a quiet
+        `echo` round trip still answers in under 0.5 s. Sharing the pool, the same call waits seconds —
+        which is what a peer reads as `degraded`, and then `zombie`."""
+        workers = min(
+            32, (os.cpu_count() or 1) + 4
+        )  # asyncio's own default pool size, by its own formula
+        ground = 1.5
+
+        async def grinding(params: Any, ctx: Any) -> dict[str, Any]:
+            await asyncio.to_thread(time.sleep, ground)  # the blocking work semantics 6 points at
+            return {"text": "ground"}
+
+        async with self.tree() as root:
+            alpha, _ = await self.boot(root)
+            beta, _ = self.build_peer(root, caps={"echo": echo_handler, "grind": grinding})
+            await beta.start()
+            await self._see(alpha, "grind")
+            storm = [
+                asyncio.create_task(alpha.request(PEER, "grind", {}, timeout=0))
+                for _ in range(
+                    workers + 4
+                )  # more jobs than the pool has workers: the queue is certain
+            ]
+            await asyncio.sleep(0.2)  # the handlers are in their threads by now
+            started = time.perf_counter()
+            outcome = await asyncio.wait_for(alpha.request(PEER, "echo", {"n": 1}, timeout=0), 10.0)
+            took = time.perf_counter() - started
+            self.assertEqual(outcome.final_status, "confirmed")
+            self.assertLess(
+                took,
+                0.5,
+                f"a quiet request waited {took:.2f}s behind the storm: the protocol's calls are sharing "
+                "a thread pool with user work",
+            )
+            for task in storm:
+                task.cancel()
+            await asyncio.gather(*storm, return_exceptions=True)
 
     # --- D-22's teardown: an answer that cannot be written ---------------------------------------
 

@@ -27,10 +27,16 @@ def spawn(coro: Coroutine[Any, Any, Any], name: str) -> asyncio.Task[Any]:
     return asyncio.get_running_loop().create_task(coro, name=name)
 
 
+# Two pools park their idle workers instead of letting them die: asyncio's default executor (`asyncio_<n>`,
+# what a user's `to_thread` work runs on) and the file layer's own (`actio-io_<n>`, `_files.io_hop`, the
+# one documented piece of module state). Their idle workers are not leftovers of an agent; every thread an
+# agent starts is still found, because the comparison below is by identity, not by name.
+POOLED = ("asyncio_", "actio-io")
+
+
 def our_threads() -> set[threading.Thread]:
-    """The threads alive now, minus the default executor's workers, which asyncio names `asyncio_<n>`
-    and parks for reuse after a `to_thread` call. Compared by identity, so a name proves nothing."""
-    return {t for t in threading.enumerate() if not t.name.startswith("asyncio_")}
+    """The threads alive now, minus the two pools' idle workers."""
+    return {t for t in threading.enumerate() if not t.name.startswith(POOLED)}
 
 
 def task_names() -> set[str]:

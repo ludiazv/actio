@@ -17,6 +17,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.api import ObservedWatch
 
+from ._files import io_hop
 from ._types import Spawn
 
 type Markers = dict[str, str]
@@ -97,14 +98,14 @@ class Watcher:
             self._unschedule(entry[0])
 
     async def close(self) -> None:
-        """Stop the observer and join it in `to_thread` (`Observer.join` blocks)."""
+        """Stop the observer and join it on the file layer's pool (`Observer.join` blocks)."""
         if self._audit_task is not None:
             self._audit_task.cancel()
             await asyncio.gather(self._audit_task, return_exceptions=True)
             self._audit_task = None
         self._folders.clear()
         self._observer.stop()
-        await asyncio.to_thread(self._observer.join)
+        await io_hop(self._observer.join)
 
     def _unschedule(self, watch: ObservedWatch) -> None:
         try:
@@ -140,7 +141,7 @@ class Watcher:
             await asyncio.sleep(self._audit_seconds)
             for folder, entry in list(self._folders.items()):
                 try:
-                    stat = await asyncio.to_thread(os.stat, folder)
+                    stat = await io_hop(os.stat, folder)
                 except OSError as error:
                     if self._folders.get(folder) is entry:
                         self._lose(folder, error)
@@ -154,9 +155,10 @@ class Watcher:
 
 
 async def scan(folder: str, prev: Markers) -> tuple[list[str], Markers]:
-    """`scan_folder` in a thread: the only place outside `_files.py` allowed to take one, because the
-    scan is a folder read. It raises `OSError` when the folder is gone (D-22's loss)."""
-    return await asyncio.to_thread(scan_folder, folder, prev)
+    """`scan_folder` on the file layer's pool: a folder read is a thread hop, and it is the pool's
+    hop rather than asyncio's default one, so a storm of handlers' own work cannot delay a scan and
+    leave a peer unread (D-22's loss). It raises `OSError` when the folder is gone."""
+    return await io_hop(scan_folder, folder, prev)
 
 
 def scan_folder(folder: str, prev: Markers) -> tuple[list[str], Markers]:
