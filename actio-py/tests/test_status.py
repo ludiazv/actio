@@ -69,6 +69,30 @@ def status_at(state: StatusState) -> Status:
     }
 
 
+def diarium_lines(folders: AgentFolders) -> list[dict[str, Any]]:
+    """The diarium's lines in file order, read straight from the file: the order the rule asserts on."""
+    path = Path(folders.agent) / "diarium.jsonl"
+    if not path.exists():
+        return []
+    return [
+        json.loads(part) for part in path.read_text(encoding="utf-8").splitlines() if part.strip()
+    ]
+
+
+def announce_lines(folders: AgentFolders) -> list[dict[str, Any]]:
+    return [line for line in diarium_lines(folders) if line["event"] == "announce"]
+
+
+async def wait_for_announce_lines(folders: AgentFolders, count: int, timeout: float = 6.0) -> None:
+    """Poll until the diarium carries `count` `announce` lines; the failure names what was waited for."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while len(announce_lines(folders)) < count:
+        if loop.time() > deadline:
+            raise AssertionError(f"timed out waiting for {count} `announce` diarium lines")
+        await asyncio.sleep(0.02)
+
+
 class BuildStatusTest(ActioTestCase):
     def test_it_validates_against_the_schema(self) -> None:
         self.assertIsNone(validate("status", build_status(AGENT, "idle", TS)))
@@ -183,6 +207,57 @@ class PublisherTest(ActioTestCase):
                     "nuntium": "agent is active",
                 },
             )
+
+    async def test_announce_appends_one_line_then_writes_the_file(self) -> None:
+        """D-24: one `announce()` is one `announce` diarium line (`event_data` null), then the
+        `nuntium/<id>.n.json` file. `publish_spec` and `publish_status` append no `announce` line."""
+        with actio_tree() as root:
+            folders = folders_for(root)
+            publisher = StatusPublisher(folders, create_sync_provider("none", spawn=spawn), spawn)
+            spec = load_spec()
+            await publisher.publish_spec(spec)
+            await publisher.publish_status(build_status(AGENT, "idle", TS))
+            # The spec and status writes append no `announce` line.
+            self.assertEqual(announce_lines(folders), [])
+            await publisher.announce(AGENT, "agent is active", TS)
+            lines = announce_lines(folders)
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(lines[0]["event"], "announce")
+            self.assertIsNone(lines[0]["event_data"])
+            # The file is written too, with the same text the line points at.
+            path = Path(folders.nuntium) / f"{AGENT}.n.json"
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["nuntium"], "agent is active"
+            )
+
+    async def test_the_announce_line_lands_before_the_announce_file(self) -> None:
+        """D-24, the order: the line, then the file. The `.n.json` write is slowed, and while it is in
+        flight the diarium already carries the line — the seam that makes the order observable instead
+        of timing-dependent (the two mtimes can land equal)."""
+        import actio._status as status_mod
+
+        real_write = status_mod.write_json_atomic
+
+        async def slow_write(path: str, obj: Any, tmp_dir: str, provider: Any) -> None:
+            if path.endswith(".n.json"):
+                await asyncio.sleep(0.3)  # the announce file's write is the slow one
+            await real_write(path, obj, tmp_dir, provider)
+
+        with actio_tree() as root:
+            folders = folders_for(root)
+            publisher = StatusPublisher(folders, create_sync_provider("none", spawn=spawn), spawn)
+            announce_file = Path(folders.nuntium) / f"{AGENT}.n.json"
+            status_mod.write_json_atomic = slow_write
+            try:
+                task = asyncio.create_task(publisher.announce(AGENT, "agent is active", TS))
+                # The line lands (the append is before the write); the slowed file write is in flight.
+                await wait_for_announce_lines(folders, 1)
+                self.assertFalse(announce_file.exists(), "the file must not precede its line")
+                with no_leftovers():
+                    await task
+            finally:
+                status_mod.write_json_atomic = real_write
+            self.assertTrue(announce_file.exists())
 
     async def test_the_latch_makes_every_later_write_a_no_op(self) -> None:
         with actio_tree() as root:

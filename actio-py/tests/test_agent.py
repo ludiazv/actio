@@ -302,8 +302,9 @@ class AgentTest(ActioTestCase):
 class SpineTest(AgentTest):
     async def test_the_spine_of_one_run(self) -> None:
         """*Workflow* steps 1-5 and C1, once: `start` writes a valid spec, an `idle` status and the
-        announce (status first, with a delay); on exit `inactive` and the announce after it. The
-        diarium carries the status lines. Asserted on the files and the diarium, not internal state."""
+        announce (status first, with a delay); on exit `inactive` and the announce after it. Every
+        announcement writes its diarium line, so the run's diarium is `idle`, `announce`, `inactive`,
+        `announce`. Asserted on the files and the diarium, not internal state."""
         with actio_tree() as root:
             agent, _ = self.build(root)
             async with agent:
@@ -323,7 +324,8 @@ class SpineTest(AgentTest):
                 )
                 # Step 4: the first discovery ran; our own folder is in the view (D-18 hangs on it).
                 self.assertIn(AGENT, agent.agmen())
-                self.assertEqual([line["event_data"] for line in lines(root)], ["idle"])
+                # The `idle` status line and the start's `announce` line, in that order.
+                self.assertEqual([line["event_data"] for line in lines(root)], ["idle", None])
             # `__aexit__` ran C1: `inactive` first, then the announce (it rewrites the same file).
             self.assertEqual(doc(status_path(root))["status"], "inactive")
             self.assertEqual(doc(announce_path(root))["nuntium"], f"agent {AGENT} is inactive")
@@ -331,7 +333,10 @@ class SpineTest(AgentTest):
                 status_path(root).stat().st_mtime_ns,
                 announce_path(root).stat().st_mtime_ns,
             )
-            self.assertEqual([line["event_data"] for line in lines(root)], ["idle", "inactive"])
+            # C1's order: the `inactive` status line, then the `announce` line, then the file.
+            self.assertEqual(
+                [line["event_data"] for line in lines(root)], ["idle", None, "inactive", None]
+            )
 
 
 class StopTest(AgentTest):
@@ -495,9 +500,15 @@ class LifecycleTest(AgentTest):
 
     async def test_fail_sets_error_and_announces(self) -> None:
         """*Agent's status*: `fail` is status `error` plus an announce; there is no recovery, and a
-        second `fail` does not announce again."""
+        second `fail` does not announce again. Every announcement writes its diarium line, so `fail`
+        appends one `announce` line and the no-op second `fail` appends none."""
         with actio_tree() as root:
             agent, _ = await self.boot(root)
+            # The start's announce wrote one line; the `fail`'s will be the second.
+            self.assertEqual(
+                [line["event_data"] for line in lines(root) if line["event"] == "announce"],
+                [None],
+            )
             await agent.fail("the disk is on fire")
             self.assertEqual(doc(status_path(root))["status"], "error")
             self.assertEqual(
@@ -508,14 +519,25 @@ class LifecycleTest(AgentTest):
                 [line["event_data"] for line in lines(root) if line["event"] == "status"],
                 ["idle", "error"],
             )
+            # The `fail` appended one `announce` line: the start's and the fail's.
+            self.assertEqual(
+                [line["event_data"] for line in lines(root) if line["event"] == "announce"],
+                [None, None],
+            )
             mtime = announce_path(root).stat().st_mtime_ns
             await agent.fail("again")  # a no-op: already in error
             self.assertEqual(announce_path(root).stat().st_mtime_ns, mtime)
             self.assertEqual(doc(status_path(root))["status"], "error")
+            # The no-op appended no `announce` line.
+            self.assertEqual(
+                [line["event_data"] for line in lines(root) if line["event"] == "announce"],
+                [None, None],
+            )
 
     async def test_a_lost_own_inbox_is_a_log_event_and_an_error_status(self) -> None:
         """D-22: a lost own inbox is fatal: log it and enter `error`, with the announce. The log is
-        the observability event (the diarium keeps the `status` line), as the reference does."""
+        the observability event (the diarium keeps the `status` line), as the reference does. The `fail`
+        the loss arms writes its `announce` diarium line — exactly one, on top of the start's."""
         with actio_tree() as root:
             agent, _ = await self.boot(root)
             events: list[Any] = []
@@ -530,6 +552,11 @@ class LifecycleTest(AgentTest):
                 lambda: any(isinstance(e, LogEvent) and "watch lost" in e.message for e in events),
             )
             self.assertIn("failed", doc(announce_path(root))["nuntium"])
+            # The `fail` the loss armed wrote one `announce` line: the start's and the fail's.
+            self.assertEqual(
+                sum(1 for line in lines(root) if line["event"] == "announce"),
+                2,
+            )
 
     async def test_a_stop_supersedes_a_fail_armed_by_a_lost_watch(self) -> None:
         """D-22 arms a `fail` task and D-9's step 6 owns it: a `stop()` cancels what the run armed instead
@@ -665,6 +692,8 @@ class CommandTest(AgentTest):
         the announce."""
         with actio_tree() as root:
             agent, _ = await self.boot(root, heartbeat_interval=1000)
+            # The start's announce wrote one line; each `enable` below adds one more.
+            self.assertEqual(self._announce_count(root), 1)
             write_file(
                 inbox_dir(root) / f"{rid(1)}.json", cmd_file(rid(1), "enable", {"enabled": False})
             )
@@ -677,7 +706,7 @@ class CommandTest(AgentTest):
                 ),
                 timeout=WATCH_SETTLE,
             )
-            self.assertEqual(self._announce_count(root), 1)
+            self.assertEqual(self._announce_count(root), 2)
             write_file(
                 inbox_dir(root) / f"{rid(2)}.json", cmd_file(rid(2), "enable", {"enabled": True})
             )
@@ -689,34 +718,50 @@ class CommandTest(AgentTest):
                 ),
                 timeout=WATCH_SETTLE,
             )
-            self.assertEqual(self._announce_count(root), 2)
+            self.assertEqual(self._announce_count(root), 3)
 
     async def test_the_announce_line_is_on_disk_before_the_announce_file(self) -> None:
-        """D2: *"Rewrite `status.json` and/or `spec.json`, append `status`/`announce` events to
-        `diarium.jsonl`, then write the announce file `nuntium/<agent_id>.n.json`"*. The order is the rule,
-        so it is pinned with the announce delay held open: when the line lands, the announce file still
-        carries the previous text."""
+        """D-24: *"append `status`/`announce` events to `diarium.jsonl`, then write the announce file
+        `nuntium/<agent_id>.n.json`"* — the line, then the file, in the one place every announcement goes
+        through. The delay now sits before both writes, so the order is pinned the way the unit pins it:
+        the `.n.json` write is slowed, and while it is in flight the diarium already carries the line. On
+        a real agent, with `enable` and an `announce_delay` large enough that the boot is settled."""
+        import actio._status as status_mod
+
+        real_write = status_mod.write_json_atomic
+
+        async def slow_write(path: str, obj: Any, tmp_dir: str, provider: Any) -> None:
+            if path.endswith(".n.json"):
+                await asyncio.sleep(0.3)  # the announce file's write is the slow one
+            await real_write(path, obj, tmp_dir, provider)
+
         with actio_tree() as root:
             agent, _ = await self.boot(root, heartbeat_interval=1000, announce_delay=0.5)
             self.assertEqual(doc(announce_path(root))["nuntium"], f"agent {AGENT} is active")
-            # `start`'s announce writes the file and no `announce` line — the spine test pins the diarium as
-            # `["idle"]` — while the `D2` command path appends one. The count is the command's, not the run's.
-            write_file(
-                inbox_dir(root) / f"{rid(1)}.json", cmd_file(rid(1), "enable", {"enabled": False})
-            )
-            await wait_for(
-                "the second `announce` diarium line",
-                lambda: self._announce_count(root) == 1,
-                timeout=WATCH_SETTLE,
-            )
-            # The delay is 0.5 s and the poll 0.02 s: the file write cannot have happened yet.
-            self.assertEqual(doc(announce_path(root))["nuntium"], f"agent {AGENT} is active")
-            self.assertTrue(doc(spec_path(root)).get("disabled") is True)
-            await wait_for(
-                "the announce file itself",
-                lambda: doc(announce_path(root))["nuntium"] == f"agent {AGENT} is disabled",
-                timeout=WATCH_SETTLE,
-            )
+            # The start's announce wrote one line; the `enable`'s will be the second.
+            self.assertEqual(self._announce_count(root), 1)
+            status_mod.write_json_atomic = slow_write
+            try:
+                write_file(
+                    inbox_dir(root) / f"{rid(1)}.json",
+                    cmd_file(rid(1), "enable", {"enabled": False}),
+                )
+                # The line lands (the append is before the write); the slowed file write is in flight.
+                await wait_for(
+                    "the `enable`'s `announce` diarium line",
+                    lambda: self._announce_count(root) == 2,
+                    timeout=WATCH_SETTLE,
+                )
+                # While the slowed `.n.json` write is in flight, the file still carries the start's text.
+                self.assertEqual(doc(announce_path(root))["nuntium"], f"agent {AGENT} is active")
+                self.assertTrue(doc(spec_path(root)).get("disabled") is True)
+                await wait_for(
+                    "the announce file itself",
+                    lambda: doc(announce_path(root))["nuntium"] == f"agent {AGENT} is disabled",
+                    timeout=WATCH_SETTLE,
+                )
+            finally:
+                status_mod.write_json_atomic = real_write
 
     async def test_a_command_while_disabled_is_processed(self) -> None:
         """D0: "commands are processed even if the agent is disabled, so that it can be enabled

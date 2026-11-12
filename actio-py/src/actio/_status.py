@@ -15,7 +15,9 @@ import os
 from collections.abc import Awaitable, Callable
 from typing import Any, Final
 
-from ._files import make_dirs, write_json_atomic
+from ._diarium import announce_event, append
+from ._files import make_dirs
+from ._files import write_json_atomic as write_json_atomic  # re-exported: the tests slow the write
 from ._protocol import AgentId, Announce, CapabilityStatusEntry, Spec, Status, StatusState
 from ._types import AgentFolders, Health, Spawn, SyncProvider
 from ._util import format_iso, parse_iso
@@ -129,7 +131,10 @@ class StatusPublisher:
         )
 
     async def announce(self, id: AgentId, text: str, ts: float) -> None:
-        """Write `nuntium/<id>.n.json` (*Announcements*); the diarium line is the agent's to append."""
+        """D-24: the `announce` diarium line, then `nuntium/<id>.n.json`, in the one place every
+        announcement goes through. The line first is the command path's order; a broadcast is not an
+        announcement and writes no line. The append is not latched: C1 announces after `inactive`, and
+        the diarium line belongs to the announce, not to the status."""
         doc: Announce = {
             "id": id,
             "datetime": format_iso(ts),
@@ -137,6 +142,8 @@ class StatusPublisher:
             "nuntium": text,
         }
         _must_validate(f"the announce file for {id!r}", "announce", doc)
+        await make_dirs(self._folders.agent)  # the diarium's folder, for the line that goes first
+        await append(self._folders.agent, announce_event(id, ts), self._provider)
         await make_dirs(self._folders.nuntium)
         await self._publish(os.path.join(self._folders.nuntium, f"{id}.n.json"), doc, latches=False)
 

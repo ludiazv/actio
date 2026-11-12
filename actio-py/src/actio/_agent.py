@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast, overload
 
 from ._config import ActioConfig, load_config
-from ._diarium import announce_event, append, log_event, read_diarium, status_event
+from ._diarium import append, log_event, read_diarium, status_event
 from ._discovery import agent_view as _peer_view
 from ._discovery import scan as _tree_scan
 from ._files import make_dirs as _make_dirs
@@ -769,12 +769,7 @@ class ActioAgent:
         self._enabled_state = not enabled  # D-10: state of the run, not of the options
         self._build_spec_now()
         await run.publisher.publish_spec(self._spec)
-        # D2: the diarium line lands before the announce file it belongs to.
-        await append(
-            cast(AgentFolders, self._folders).agent,
-            announce_event(self._id, self._now()),
-            run.sync,
-        )
+        # The diarium `announce` line is the publisher's to write, with the file it belongs to (D-24).
         await self._reannounce_after_delay(
             run, f"agent {self._id} is {'enabled' if enabled else 'disabled'}"
         )
@@ -787,15 +782,11 @@ class ActioAgent:
         self._build_spec_now()
         await run.publisher.publish_spec(self._spec)
         await run.publisher.publish_status(self._status_for(run, self._state))
-        # D2: the `status` and `announce` diarium lines land before the announce file.
+        # The `status` diarium line is the agent's; the `announce` line is the publisher's, with the
+        # file it belongs to (D-24).
         await append(
             cast(AgentFolders, self._folders).agent,
             status_event(self._id, self._now(), self._state),
-            run.sync,
-        )
-        await append(
-            cast(AgentFolders, self._folders).agent,
-            announce_event(self._id, self._now()),
             run.sync,
         )
         await self._reannounce_after_delay(run, f"agent {self._id} is alive")
