@@ -88,7 +88,12 @@ class Watcher:
         return sub
 
     def unsubscribe(self, sub: FolderWatch) -> None:
-        """Safe twice, after a loss, and after `close`."""
+        """Safe twice, after a loss, and after `close`.
+
+        Dropping a folder's last watch is what unsubscribes the folder, so the watch is the property of
+        whoever is watching: an exchange handed to another task is released by that task when the exchange
+        ends, not by a caller that unwinds early. A caller that released it early would leave the peer's
+        answer arriving nowhere, and the exchange would end as abandoned while it sat on disk."""
         entry = self._folders.get(sub.folder)
         if entry is None:
             return
