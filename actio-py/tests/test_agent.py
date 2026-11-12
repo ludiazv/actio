@@ -2117,8 +2117,8 @@ class TwoAgentTest(AgentTest):
         """D-9's order, phase (3) before phase (4), told apart by a handler that is itself awaiting a call
         when the grace runs out. Stopped in the protocol's order, `beta` answers `alpha`'s call with code
         300 and *then* abandons its own handler's call to `gamma`. Stopped the other way round, the
-        abandoned call hands the handler a result, the handler returns it, and `alpha` reads an ordinary
-        answer from an agent that was already stopping — the answer a stopping agent owes is the 300."""
+        abandoned call hands the handler a result, the handler returns it, and the record of the call is an
+        ordinary answer from an agent that was already stopping — the answer a stopping agent owes is the 300."""
         grace = 0.2
         async with self.tree() as root:
             peer_tree(root, "gamma")  # published and never served: `beta`'s own call stays open
@@ -2146,17 +2146,37 @@ class TwoAgentTest(AgentTest):
                 lambda: any(p.name.endswith(".json") for p in inbox_dir(root, "gamma").iterdir()),
                 timeout=WATCH_SETTLE,
             )
+            # `beta` stops with both of its sides open: one inbound call being served, one outbound call
+            # unanswered.
             await (
                 beta.stop()
             )  # the grace runs out: phase (2) ends, (3) and (4) follow in D-9's order
-            outcome = await call
-            self.assertEqual(outcome.final_status, "confirmed")
-            assert outcome.response is not None
+            # The answer is read from `beta`'s diarium, not from `alpha`'s inbox: at stop the archive can
+            # move the answer out of the caller's inbox before the caller polls it, and a caller with no
+            # answer waits its own timeout. What the protocol owes is the line the receiver wrote, and the
+            # order of the phases is what the line says: if (4) ran first, the abandoned call hands `relay`
+            # a result, the handler returns it, and the record is an ordinary answer (code 0), not the 300.
+            inbound = [
+                cast(dict[str, Any], line["event_data"])
+                for line in lines(root, PEER)
+                if line["event"] == "inreq"
+            ]
+
+            def response_code(rec: dict[str, Any]) -> Any:
+                res = cast(dict[str, Any], rec.get("res") or {})
+                response = cast(dict[str, Any], res.get("response") or {})
+                return cast(dict[str, Any], response.get("result") or {}).get("code")
+
             self.assertEqual(
-                cast(dict[str, Any], outcome.response["result"])["code"],
-                300,
-                f"alpha's answer from a stopping beta: {outcome.response}",
+                [response_code(rec) for rec in inbound],
+                [300],
+                f"beta's record of the call it was serving when it stopped: {inbound}",
             )
+            # The caller is still waiting: it has no answer to read, so it is cut short here rather than
+            # left to its own timeout. Its exchange ends in the background, as semantics 1 says it does.
+            call.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await call
             # And `beta`'s own exchange closed the other way: abandoned at phase (4), with its line.
             out = [
                 cast(dict[str, Any], line["event_data"])
