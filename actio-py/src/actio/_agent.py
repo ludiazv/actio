@@ -17,7 +17,7 @@ import copy
 import inspect
 import os
 import time
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast, overload
 
@@ -476,11 +476,11 @@ class ActioAgent:
                 await asyncio.sleep(GRACE_STEP)
         # (3) The receiver: the accepted and unanswered get code 300, the answered are archived.
         if run.receiver is not None:
-            await run.receiver.stop(force=force)
+            await self._stop_step("receiver", run.receiver.stop(force=force))
         # (4) Last, the outbound side: what is in B2 is abandoned, and every owed `outreq` line is on
         # disk before C1 (D-9).
         if run.requestor is not None:
-            await run.requestor.stop(force=force)
+            await self._stop_step("requestor", run.requestor.stop(force=force))
         # (5) The heartbeat: a slow tick must not land after `inactive`, and none may follow.
         if run.heartbeat is not None:
             with contextlib.suppress(BaseException):
@@ -502,9 +502,18 @@ class ActioAgent:
         # C2: deinit. The in-memory view goes with the run; the provider is closed.
         self._view.clear()
         self._discovered.clear()
-        run.sync.close()
+        run.sync.close()  # a provider that cannot close is the provider's problem, after C1
         if self._restart_task is None:
             self._stopped_for_good.set()  # a restart is in flight: it decides
+
+    async def _stop_step(self, what: str, step: Awaitable[Any]) -> None:
+        """D-9's steps are an order, and every one of them is owed: a step that fails is one `log` line and
+        the steps after it still run, so `inactive` is written and the watcher is closed whatever broke
+        before. Only `Exception` is caught: a caller's cancellation of `stop()` still propagates."""
+        try:
+            await step
+        except Exception as err:
+            self._emit(LogEvent(message=f"stop: {what} failed: {err}"))
 
     # --- discovery (step 4, D-17) ---------------------------------------------------
 

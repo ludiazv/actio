@@ -1506,6 +1506,57 @@ class TwoAgentTest(AgentTest):
             self.assertEqual(spec_path(root, PEER).read_bytes(), spec_before)
             self.assertEqual(announce_path(root, PEER).read_bytes(), announce_before)
 
+    # --- D-22's teardown: an answer that cannot be written ---------------------------------------
+
+    async def test_a_stop_after_losing_its_own_inbox_still_ends_inactive(self) -> None:
+        """D-22 and D-9: `beta`'s inbox is removed while a request is parked in its handler. The code-300
+        answer cannot be written, so the exchange stays unsettled with one `log` line naming its rid, and the
+        teardown goes on to the end: `stop()` returns, `inactive` is on disk, and the unwritable answer raised
+        out of step 3 before, so C1, the requestor, the heartbeat and the watcher's close never ran."""
+        grace = 0.1
+        parked, release = asyncio.Event(), asyncio.Event()
+
+        async def parking(params: Any, ctx: Any) -> dict[str, Any]:
+            parked.set()
+            await release.wait()
+            return {"text": "too late"}
+
+        async with self.tree() as root:
+            messages: list[str] = []
+            beta, _ = self.build_peer(root, caps={"park": parking}, stop_grace=grace)
+            beta.on_event(lambda e: messages.append(e.message) if isinstance(e, LogEvent) else None)
+            await beta.start()
+            alpha, _ = await self.boot(root, stop_grace=grace)
+            await self._see(alpha, "park")
+            call = asyncio.create_task(alpha.request(PEER, "park", {}, timeout=0))
+            await wait_for("beta's handler to start", parked.is_set, timeout=WATCH_SETTLE)
+            (envelope,) = [p.name for p in inbox_dir(root, PEER).glob("*.json")]
+            r = envelope[: -len(".json")]
+            shutil.rmtree(inbox_dir(root, PEER))
+            # D-22: losing its own inbox puts `beta` in `error`, once, and the receiver stays until `stop`.
+            await wait_for(
+                "beta to enter error after losing its inbox",
+                lambda: (
+                    status_path(root, PEER).exists()
+                    and doc(status_path(root, PEER))["status"] == "error"
+                ),
+                timeout=WATCH_SETTLE,
+            )
+            try:
+                await asyncio.wait_for(asyncio.shield(beta.stop()), 10.0)
+                self.assertEqual(doc(status_path(root, PEER))["status"], "inactive")
+                lost = [m for m in messages if "cannot be written" in m]
+                self.assertEqual(len(lost), 1, f"the unwritable answer reported: {lost}")
+                self.assertIn(r, lost[0])
+                # The exchange is unsettled, so no `inreq` line was owed, and the inbox folder is gone:
+                # the tree holds neither envelope nor response of it.
+                self.assertFalse(inbox_dir(root, PEER).exists())
+            finally:
+                # `alpha` waits on a response that will not come: the row ends its own caller.
+                release.set()
+                call.cancel()
+                await asyncio.gather(call, return_exceptions=True)
+
     # --- D-9's bound on the receiver's last phase ---------------------------------------------------
     #
     # A handler that swallows the cancellation `stop()` sends used to hold `stop()` forever: the code-300

@@ -206,8 +206,18 @@ class Receiver:
             if ex.phase == "working" and ex.res is None:
                 if ex.task is not None and not ex.task.done():
                     ex.task.cancel()
-                # D-9: accepted and unanswered → code 300, the single response
-                await self._respond(ex, "error", result=STOPPING_RESULT, forced=True)
+                # D-9: accepted and unanswered → code 300, the single response. D-22: an answer that cannot
+                # be written (our own inbox is gone) leaves the exchange unsettled with one `log` line naming
+                # its rid: the teardown is not where such an error may travel, or C1 never happens.
+                try:
+                    await self._respond(ex, "error", result=STOPPING_RESULT, forced=True)
+                except Exception as err:
+                    self._ctx.emit(
+                        LogEvent(
+                            message=f"the response of {ex.rid} cannot be written: {err}; "
+                            "the exchange stays unsettled (D-22)"
+                        )
+                    )
             elif ex.phase == "accepting" and ex.serve is not None and not ex.serve.done():
                 ex.serve.cancel()
         # (the serve task) -> (the exchange it serves, its handler task), captured now: an exchange can
