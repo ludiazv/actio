@@ -18,6 +18,7 @@ import shutil
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, cast
+from unittest import mock
 
 import referencing
 from jsonschema import Draft202012Validator
@@ -726,9 +727,10 @@ class CommandTest(AgentTest):
         through. The delay now sits before both writes, so the order is pinned the way the unit pins it:
         the `.n.json` write is slowed, and while it is in flight the diarium already carries the line. On
         a real agent, with `enable` and an `announce_delay` large enough that the boot is settled."""
+        import actio._files as files_mod
         import actio._status as status_mod
 
-        real_write = status_mod.write_json_atomic
+        real_write = files_mod.write_json_atomic
 
         async def slow_write(path: str, obj: Any, tmp_dir: str, provider: Any) -> None:
             if path.endswith(".n.json"):
@@ -740,8 +742,7 @@ class CommandTest(AgentTest):
             self.assertEqual(doc(announce_path(root))["nuntium"], f"agent {AGENT} is active")
             # The start's announce wrote one line; the `enable`'s will be the second.
             self.assertEqual(self._announce_count(root), 1)
-            status_mod.write_json_atomic = slow_write
-            try:
+            with mock.patch.object(status_mod, "write_json_atomic", slow_write):
                 write_file(
                     inbox_dir(root) / f"{rid(1)}.json",
                     cmd_file(rid(1), "enable", {"enabled": False}),
@@ -760,8 +761,6 @@ class CommandTest(AgentTest):
                     lambda: doc(announce_path(root))["nuntium"] == f"agent {AGENT} is disabled",
                     timeout=WATCH_SETTLE,
                 )
-            finally:
-                status_mod.write_json_atomic = real_write
 
     async def test_a_command_while_disabled_is_processed(self) -> None:
         """D0: "commands are processed even if the agent is disabled, so that it can be enabled

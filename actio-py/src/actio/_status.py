@@ -16,8 +16,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Final
 
 from ._diarium import announce_event, append
-from ._files import make_dirs
-from ._files import write_json_atomic as write_json_atomic  # re-exported: the tests slow the write
+from ._files import make_dirs, write_json_atomic
 from ._protocol import AgentId, Announce, CapabilityStatusEntry, Spec, Status, StatusState
 from ._types import AgentFolders, Health, Spawn, SyncProvider
 from ._util import format_iso, parse_iso

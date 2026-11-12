@@ -17,6 +17,7 @@ import time
 from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any, cast
+from unittest import mock
 
 from actio._protocol import CapabilityStatusEntry, Spec, Status, StatusState
 from actio._status import (
@@ -234,9 +235,10 @@ class PublisherTest(ActioTestCase):
         """D-24, the order: the line, then the file. The `.n.json` write is slowed, and while it is in
         flight the diarium already carries the line — the seam that makes the order observable instead
         of timing-dependent (the two mtimes can land equal)."""
+        import actio._files as files_mod
         import actio._status as status_mod
 
-        real_write = status_mod.write_json_atomic
+        real_write = files_mod.write_json_atomic
 
         async def slow_write(path: str, obj: Any, tmp_dir: str, provider: Any) -> None:
             if path.endswith(".n.json"):
@@ -247,16 +249,13 @@ class PublisherTest(ActioTestCase):
             folders = folders_for(root)
             publisher = StatusPublisher(folders, create_sync_provider("none", spawn=spawn), spawn)
             announce_file = Path(folders.nuntium) / f"{AGENT}.n.json"
-            status_mod.write_json_atomic = slow_write
-            try:
+            with mock.patch.object(status_mod, "write_json_atomic", slow_write):
                 task = asyncio.create_task(publisher.announce(AGENT, "agent is active", TS))
                 # The line lands (the append is before the write); the slowed file write is in flight.
                 await wait_for_announce_lines(folders, 1)
                 self.assertFalse(announce_file.exists(), "the file must not precede its line")
                 with no_leftovers():
                     await task
-            finally:
-                status_mod.write_json_atomic = real_write
             self.assertTrue(announce_file.exists())
 
     async def test_the_latch_makes_every_later_write_a_no_op(self) -> None:
