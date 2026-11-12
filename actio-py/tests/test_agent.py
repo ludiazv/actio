@@ -30,7 +30,7 @@ from actio import ActioAgent, Capability, CapabilityHandler, CommandHandler, Log
 from actio._config import ActioConfig
 from actio._protocol import DiariumEntry
 from actio._receiver import HANDLER_CANCEL_WAIT
-from actio._types import AgentView
+from actio._types import AgentView, RequestOutcome
 from actio._util import format_iso
 from helpers import ActioTestCase, actio_tree
 
@@ -117,9 +117,9 @@ def cmd_file(
 
 
 def request_file(
-    r: str, name: str = "summarize", *, src: str = PEER, dst: str = AGENT
+    r: str, name: str = "summarize", *, src: str = PEER, dst: str = AGENT, timeout: int = 300
 ) -> dict[str, Any]:
-    """A lane A request envelope, as a peer would write it."""
+    """A lane A request envelope, as a peer would write it. `timeout` 0 is the schema's "no timeout"."""
     return {
         "rid": r,
         "src": src,
@@ -133,9 +133,22 @@ def request_file(
             "signature": None,
             "name": name,
             "parameters": {"text": "a text to summarize"},
-            "timeout": 300,
+            "timeout": timeout,
             "attachments": [],
         },
+    }
+
+
+def confirmation_file(r: str, *, src: str = PEER, dst: str = AGENT) -> dict[str, Any]:
+    """A lane B confirmation, as the caller's library writes one: the request's header, and a body."""
+    return {
+        "rid": r,
+        "src": src,
+        "dst": dst,
+        "datetime": TS_ISO,
+        "type": "req",
+        "actio_version": "0.1",
+        "confirmation": {"ts": int(TS), "nonce": NONCE, "signature": None},
     }
 
 
@@ -175,6 +188,17 @@ def peer_tree(
 
 def write_file(path: Path, doc: dict[str, Any]) -> None:
     path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def result_of(outcome: RequestOutcome) -> Any:
+    """What a caller's answer carried: the capability result, or the error result the peer sent."""
+    response = cast(dict[str, Any], outcome.response or {})
+    return response.get("result")
+
+
+def answers(root: Path, folder: str) -> list[str]:
+    """The response files sitting in a folder's inbox: answers written and not yet archived."""
+    return sorted(p.name for p in inbox_dir(root, folder).glob("*.res.json"))
 
 
 def doc(path: Path) -> dict[str, Any]:
@@ -1396,6 +1420,8 @@ class TwoAgentTest(AgentTest):
     both keep `addAsyncCleanup(agent.stop)`, so the base class' leftover check covers both.
     """
 
+    CALL_BOUND = 10.0  # the row's bound on a caller's wait: real latency here is milliseconds
+
     def build_peer(
         self,
         root: Path,
@@ -2114,11 +2140,12 @@ class TwoAgentTest(AgentTest):
     async def test_an_inbound_caller_is_answered_300_while_the_handler_waits_on_its_own_call(
         self,
     ) -> None:
-        """D-9's order, phase (3) before phase (4), told apart by a handler that is itself awaiting a call
-        when the grace runs out. Stopped in the protocol's order, `beta` answers `alpha`'s call with code
-        300 and *then* abandons its own handler's call to `gamma`. Stopped the other way round, the
-        abandoned call hands the handler a result, the handler returns it, and the record of the call is an
-        ordinary answer from an agent that was already stopping — the answer a stopping agent owes is the 300."""
+        """D-9's order, phase (3) before phase (4), told apart by a handler that is itself awaiting a call when
+        the grace runs out. Stopped in the protocol's order, `beta` answers `alpha`'s call with code 300, waits
+        for `alpha` to confirm it, and only then abandons its own handler's call to `gamma`. Stopped the other
+        way round, the abandoned call hands the handler a result, the handler returns it, and the record of the
+        call is an ordinary answer from an agent that was already stopping — the answer a stopping agent owes is
+        the 300."""
         grace = 0.2
         async with self.tree() as root:
             peer_tree(root, "gamma")  # published and never served: `beta`'s own call stays open
@@ -2151,11 +2178,24 @@ class TwoAgentTest(AgentTest):
             await (
                 beta.stop()
             )  # the grace runs out: phase (2) ends, (3) and (4) follow in D-9's order
-            # The answer is read from `beta`'s diarium, not from `alpha`'s inbox: at stop the archive can
-            # move the answer out of the caller's inbox before the caller polls it, and a caller with no
-            # answer waits its own timeout. What the protocol owes is the line the receiver wrote, and the
-            # order of the phases is what the line says: if (4) ran first, the abandoned call hands `relay`
-            # a result, the handler returns it, and the record is an ordinary answer (code 0), not the 300.
+            # The caller reads the answer it is owed. The response file sits in `beta`'s own inbox, and the
+            # archive that takes it away waits for `alpha`'s confirmation: the 300's exchange "ends as any
+            # other answered request (confirmation, archive as `confirmed` or `completed`)", and the archive
+            # is what deletes the answer.
+            outcome = await self._answered(call, self.CALL_BOUND)
+            self.assertEqual(
+                outcome.final_status,
+                "confirmed",
+                f"alpha's outcome for the call beta answered with the 300: {outcome}",
+            )
+            self.assertEqual(
+                cast(dict[str, Any], result_of(outcome)).get("code"),
+                300,
+                f"the answer of an agent that stopped while serving: {result_of(outcome)}",
+            )
+            # `beta`'s own record of the same exchange: the 300 it owed, and the archive the confirmation ended
+            # (`confirmed`, not `completed`). If phase (4) ran first, the abandoned call hands `relay` a result,
+            # the handler returns it, and the record is an ordinary answer (code 0), not the 300.
             inbound = [
                 cast(dict[str, Any], line["event_data"])
                 for line in lines(root, PEER)
@@ -2168,15 +2208,15 @@ class TwoAgentTest(AgentTest):
                 return cast(dict[str, Any], response.get("result") or {}).get("code")
 
             self.assertEqual(
+                [rec["final_status"] for rec in inbound],
+                ["confirmed"],
+                f"beta's archive waited for the confirmation of the 300: {inbound}",
+            )
+            self.assertEqual(
                 [response_code(rec) for rec in inbound],
                 [300],
                 f"beta's record of the call it was serving when it stopped: {inbound}",
             )
-            # The caller is still waiting: it has no answer to read, so it is cut short here rather than
-            # left to its own timeout. Its exchange ends in the background, as semantics 1 says it does.
-            call.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await call
             # And `beta`'s own exchange closed the other way: abandoned at phase (4), with its line.
             out = [
                 cast(dict[str, Any], line["event_data"])
@@ -2263,3 +2303,146 @@ class TwoAgentTest(AgentTest):
                 f"beta's response file held: {seen}",
             )
             self.assertEqual(doc(status_path(root, PEER))["status"], "inactive")
+
+    async def _answered(self, call: asyncio.Task[RequestOutcome], bound: float) -> RequestOutcome:
+        """A caller's outcome, and never a row that waits longer than `bound` for it. The clock these agents
+        are built with is a `Clock` the row ticks, so a protocol `timeout` is inert in here: an answer that
+        never arrives would be a run that reports nothing, not a row that fails (probed: with the confirmation
+        wait removed, the caller of the code-300 sat in `request()` for over 150 s and printed no count)."""
+        _, pending = await asyncio.wait({call}, timeout=bound)
+        for stuck in pending:
+            stuck.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if pending:
+            raise AssertionError(f"the caller was given no outcome within {bound}s")
+        return call.result()
+
+    async def _stop_and_time(self, agent: ActioAgent, allowed: float) -> float:
+        """`agent.stop()` measured. The guard is not the bound the row asserts: it is the same bound plus
+        slack, so a stop that never returns says so in this row instead of leaving the run with no report —
+        a stop left in flight and then awaited again by the teardown is not a state the library promises
+        (probed: with the confirmation wait removed, 5 of 6 runs hung here rather than failing)."""
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        task = asyncio.create_task(agent.stop())
+        _, pending = await asyncio.wait({task}, timeout=allowed + 5.0)
+        for stuck in pending:
+            stuck.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if pending:
+            raise AssertionError(
+                f"stop() returned nothing within {allowed + 5.0}s: D-9's bound did not hold"
+            )
+        task.result()  # a stop that raised is this row's failure too
+        return loop.time() - t0
+
+    async def test_an_answer_held_by_the_stop_is_read_and_confirmed_by_its_caller(self) -> None:
+        """The other half of phase (3)'s bound. `beta` answers a request whose caller is slow — it reads and
+        confirms only after the stop has begun — so the archive that used to take the answer away meets a
+        caller that has not read it yet. The answer stays in the inbox, the caller confirms it from there, and
+        the exchange lands `confirmed`, as any other answered request does, not `completed`."""
+        grace = 0.2
+        async with self.tree() as root:
+            peer_tree(root, "gamma")  # published, and not booted: the caller here is the row itself
+
+            async def quick(params: dict[str, Any], ctx: Any) -> dict[str, Any]:
+                return {"answered": True}
+
+            beta, _ = self.build_peer(root, caps={"quick": quick}, stop_grace=grace)
+            await beta.start()
+            write_file(
+                inbox_dir(root, PEER) / f"{rid(32)}.json",
+                request_file(rid(32), "quick", src="gamma", dst=PEER, timeout=0),
+            )
+            answer_path = inbox_dir(root, PEER) / f"{rid(32)}.res.json"
+            await wait_for("beta's answer on disk", answer_path.exists, timeout=WATCH_SETTLE)
+            # Nothing will confirm this exchange on its own: its confirmation timer is the config's 120 s, and
+            # its caller is the row, which is about to be slow on purpose.
+            self.assertEqual(
+                cast(dict[str, Any], doc(answer_path)["response"])["result"],
+                {"answered": True},
+                "the answer `beta` wrote",
+            )
+            stop = asyncio.create_task(beta.stop())
+            try:
+                await asyncio.sleep(grace + 0.05)  # past the grace, inside the bound of phase (3)
+                self.assertTrue(
+                    answer_path.exists(),
+                    "the stop archived the answer before its caller had read it: phase (3) does not wait for "
+                    "the confirmation it is owed",
+                )
+                write_file(
+                    inbox_dir(root, PEER) / f"{rid(32)}.con.json",
+                    confirmation_file(rid(32), src="gamma", dst=PEER),
+                )
+            finally:
+                # The row ends the stop it started, whatever its assertions decided: an agent left with one
+                # stop in flight, and the teardown awaiting a second, is a state the library does not promise.
+                _, pending = await asyncio.wait({stop}, timeout=HANDLER_CANCEL_WAIT + 5.0)
+                for stuck in pending:
+                    stuck.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if pending:
+                    raise AssertionError(
+                        f"beta.stop() returned nothing within {HANDLER_CANCEL_WAIT + 5.0}s: "
+                        "D-9's bound of phase (3) did not hold"
+                    )
+                stop.result()
+            self.assertEqual(
+                [
+                    cast(dict[str, Any], line["event_data"])["final_status"]
+                    for line in lines(root, PEER)
+                    if line["event"] == "inreq"
+                ],
+                ["confirmed"],
+                "the confirmation arrived inside the bound, so the archive ended `confirmed`",
+            )
+            self.assertEqual(
+                answers(root, PEER),
+                [],
+                "the archive of a confirmed exchange takes the answer, the request and the confirmation",
+            )
+
+    async def test_an_answer_with_no_caller_to_confirm_costs_the_bound_and_no_more(self) -> None:
+        """The bound's other edge: `beta` answers a request whose caller is never coming — `gamma` is published
+        and not booted — so the confirmation wait is spent once, the archive ends `completed`, and `stop()`
+        returns inside the grace plus the bound plus a named margin. No caller costs one bound, never two."""
+        grace = 0.2
+        MARGIN = 0.8  # the named margin: a bound, so load cannot flip the verdict
+        async with self.tree() as root:
+            peer_tree(root, "gamma")  # published, and never booted: nobody will confirm
+
+            async def quick(params: dict[str, Any], ctx: Any) -> dict[str, Any]:
+                return {"answered": True}
+
+            beta, _ = self.build_peer(root, caps={"quick": quick}, stop_grace=grace)
+            await beta.start()
+            write_file(
+                inbox_dir(root, PEER) / f"{rid(31)}.json",
+                request_file(rid(31), "quick", src="gamma", dst=PEER, timeout=0),
+            )
+            await wait_for(
+                "beta's answer, with no caller to read it",
+                lambda: bool(answers(root, PEER)),
+                timeout=WATCH_SETTLE,
+            )
+            took = await self._stop_and_time(beta, grace + HANDLER_CANCEL_WAIT + MARGIN)
+            self.assertGreaterEqual(
+                took,
+                HANDLER_CANCEL_WAIT,
+                f"stop() took {took:.2f}s: the confirmation wait of phase (3) was not spent",
+            )
+            self.assertLess(
+                took,
+                grace + HANDLER_CANCEL_WAIT + MARGIN,
+                f"stop() took {took:.2f}s: one answer with no caller is the grace plus one bound",
+            )
+            self.assertEqual(
+                [
+                    cast(dict[str, Any], line["event_data"])["final_status"]
+                    for line in lines(root, PEER)
+                    if line["event"] == "inreq"
+                ],
+                ["completed"],
+                "an answer nobody confirmed archives as `completed`, with its line",
+            )
