@@ -36,6 +36,11 @@ src = ["src", "tests"]
 # `ruff format` is the authority, not this number: 100 columns is the project's choice, and it keeps
 # the line counts of the budgets down without ever fighting the formatter.
 line-length = 100
+# A sealed copy has no `.git`, so ruff never reads `.gitignore`, and the 3.13 virtualenv under a name
+# other than `.venv` — `.venv-313`, in the sealed validation — is walked and its `activate_this.py`
+# would fail the format check on a file that is not ours. R2-6: name the pattern, so the seal checks
+# the code and nothing else.
+extend-exclude = [".venv*"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
