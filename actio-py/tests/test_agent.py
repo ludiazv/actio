@@ -25,10 +25,12 @@ from jsonschema import Draft202012Validator
 from actio import ActioAgent, Capability, CapabilityHandler, CommandHandler, LogEvent
 from actio._config import ActioConfig
 from actio._protocol import DiariumEntry
+from actio._types import AgentView
 from actio._util import format_iso
 from helpers import ActioTestCase, actio_tree
 
 SETTLE = 6.0  # watchdog wake + debounce + a handler: a failure, not a timing expectation
+WATCH_SETTLE = 20.0  # a file-event wait under parallel load: the bound, not the expectation
 AGENT = "alpha"
 PEER = "beta"
 NONCE = "52ffe97b3a5e6e2f00a69edb27551465"
@@ -651,6 +653,7 @@ class CommandTest(AgentTest):
                     and doc(spec_path(root)).get("disabled") is True
                     and doc(announce_path(root))["nuntium"] == f"agent {AGENT} is disabled"
                 ),
+                timeout=WATCH_SETTLE,
             )
             self.assertEqual(self._announce_count(root), 1)
             write_file(
@@ -662,6 +665,7 @@ class CommandTest(AgentTest):
                     doc(spec_path(root)).get("disabled") is False
                     and doc(announce_path(root))["nuntium"] == f"agent {AGENT} is enabled"
                 ),
+                timeout=WATCH_SETTLE,
             )
             self.assertEqual(self._announce_count(root), 2)
 
@@ -677,6 +681,7 @@ class CommandTest(AgentTest):
             await wait_for(
                 "the disabled spec",
                 lambda: spec_path(root).exists() and doc(spec_path(root)).get("disabled") is True,
+                timeout=WATCH_SETTLE,
             )
             write_file(
                 inbox_dir(root) / f"{rid(2)}.json", cmd_file(rid(2), "enable", {"enabled": True})
@@ -684,6 +689,7 @@ class CommandTest(AgentTest):
             await wait_for(
                 "the disabled flag cleared by the command that a disabled agent still processes",
                 lambda: doc(spec_path(root)).get("disabled") is False,
+                timeout=WATCH_SETTLE,
             )
 
     async def test_ping_republishes_spec_and_status(self) -> None:
@@ -702,14 +708,17 @@ class CommandTest(AgentTest):
             await wait_for(
                 "ping to re-publish the spec with the fresh datetime",
                 lambda: doc(spec_path(root))["datetime"] == fresh,
+                timeout=WATCH_SETTLE,
             )
             await wait_for(
                 "ping to re-publish the status with the fresh datetime",
                 lambda: doc(status_path(root))["datetime"] == fresh,
+                timeout=WATCH_SETTLE,
             )
             await wait_for(
                 "ping to re-announce",
                 lambda: doc(announce_path(root))["nuntium"] == f"agent {AGENT} is alive",
+                timeout=WATCH_SETTLE,
             )
 
     async def test_a_command_writes_no_response(self) -> None:
@@ -723,6 +732,7 @@ class CommandTest(AgentTest):
             await wait_for(
                 "the command's completed inreq line",
                 lambda: "completed" in self._inreq_final(root),
+                timeout=WATCH_SETTLE,
             )
             inbox = inbox_dir(root)
             self.assertFalse((inbox / f"{r}.res.json").exists())
@@ -730,6 +740,7 @@ class CommandTest(AgentTest):
             await wait_for(
                 "the archived envelope to be gone from the inbox",
                 lambda: not (inbox / f"{r}.json").exists(),
+                timeout=WATCH_SETTLE,
             )
 
     async def test_a_command_from_an_unlisted_src_is_dropped(self) -> None:
@@ -747,6 +758,7 @@ class CommandTest(AgentTest):
             await wait_for(
                 "the dropped inreq line",
                 lambda: "dropped" in self._inreq_final(root),
+                timeout=WATCH_SETTLE,
             )
             self.assertEqual(status_path(root).read_bytes(), status_before)
             self.assertEqual(spec_path(root).read_bytes(), spec_before)
@@ -805,4 +817,265 @@ class CommandTest(AgentTest):
 
             with self.assertRaises(TypeError):
                 agent.on_command("sync_cmd", cast(CommandHandler, sync_handler))
+
+
+class RegistrationTest(AgentTest):
+    """Lane C: the capability registrations and their schemas (D-19), and how they reach
+    `spec.json`. The own side is strict (a bad schema is a registration error); the peer side is
+    lenient (a schema that will not run here skips the check and logs once)."""
+
+    async def test_a_good_capability_lands_in_the_spec_with_its_schema(self) -> None:
+        """A valid capability reaches `spec.json` whole, its `actio.result` schema and all: the
+        schema a peer validates against is the one the agent published."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root, caps={"summarize": quick_handler})
+            caps = {c["name"]: c for c in doc(spec_path(root))["capabilities"]}
+            self.assertIn("summarize", caps)
+            self.assertEqual(caps["summarize"]["actio"]["result"], {"type": "object"})
+            self.assertEqual(caps["summarize"]["parameters"], {"type": "object"})
+
+    async def test_a_bad_own_schema_raises_and_leaves_the_registration_unchanged(self) -> None:
+        """D-19 (own side): "a failing `check_schema` or an **unknown keyword** is a registration
+        error." The `capability` call raises, and the rejected capability is not registered."""
+        with actio_tree() as root:
+            agent, _ = self.build(root)
+            broken = cap("broken")
+            broken["actio"]["result"] = {"type": "object", "bogusKeyword": True}  # unknown keyword
+            with self.assertRaises(ValueError):
+                agent.capability(broken, quick_handler)
+            self.assertNotIn("broken", agent._capabilities)
+
+    async def test_a_peers_bad_capability_is_skipped_and_logged_once(self) -> None:
+        """D-19 (peer side): "a failing `check_schema`, or an error from the validator itself as
+        opposed to a validation result, skips the checks and logs once." The skip is not fatal, and
+        the log line is one, not one per call."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root)
+            events: list[Any] = []
+            agent.on_event(lambda e: events.append(e))
+            broken = cap("echo")
+            broken["actio"]["result"] = {"type": "object", "bogusKeyword": True}
+            view = AgentView(
+                id=PEER,
+                folder=str(root / PEER),
+                # only `spec["datetime"]` is read by `_peer_schema`; the rest satisfies the shape
+                spec={
+                    "id": PEER,
+                    "actio_version": "0.1",
+                    "datetime": TS_ISO,
+                    "description": "a peer under test",
+                    "accepts_commands_from": [],
+                    "capabilities": [],
+                    "security_support": [],
+                    "security_posture": "trusted",
+                },
+                status={"id": PEER, "status": "idle", "datetime": TS_ISO, "capability_status": []},
+                health="healthy",
+                commands=False,
+                capabilities={"echo": broken},
+            )
+            self.assertIsNone(agent._peer_schema(PEER, "echo", view))
+            self.assertEqual(
+                len(
+                    [e for e in events if isinstance(e, LogEvent) and "checks skipped" in e.message]
+                ),
+                1,
+            )
+            # The same key again: the cache holds the null, and nothing is logged a second time.
+            self.assertIsNone(agent._peer_schema(PEER, "echo", view))
+            self.assertEqual(
+                len(
+                    [e for e in events if isinstance(e, LogEvent) and "checks skipped" in e.message]
+                ),
+                1,
+            )
+
+    async def test_registration_before_start_and_while_running_reach_the_spec(self) -> None:
+        """A capability registered before `start` is in the spec the start publishes; one registered
+        while running reaches `spec.json` on the next rebuild, which a `ping` is."""
+        with actio_tree() as root:
+            the_clock = Clock()
+            agent = ActioAgent(
+                id=AGENT,
+                description="the registration test",
+                accepts_commands_from=[AGENT, PEER],
+                config=config_for(root, the_clock, heartbeat_interval=1000),
+            )
+            agent.capability(cap("early"), quick_handler)  # before start
+            self.addAsyncCleanup(agent.stop)
+            await agent.start()
+            names = [c["name"] for c in doc(spec_path(root))["capabilities"]]
+            self.assertIn("early", names)
+            agent.capability(cap("late"), quick_handler)  # while running
+            write_file(inbox_dir(root) / f"{rid(1)}.json", cmd_file(rid(1), "ping", None))
+            await wait_for(
+                "the late registration to reach the spec on the ping's rebuild",
+                lambda: "late" in [c["name"] for c in doc(spec_path(root))["capabilities"]],
+            )
+            self.assertIn("early", [c["name"] for c in doc(spec_path(root))["capabilities"]])
+
+    async def test_a_duplicate_capability_name_raises(self) -> None:
+        """The code's rule for a duplicate name is a registration-time `ValueError`, not a silent
+        single entry: the second `capability` call with a taken name raises, and the first stands."""
+        with actio_tree() as root:
+            agent, _ = self.build(root)
+            agent.capability(cap("same"), quick_handler)
+            with self.assertRaises(ValueError):
+                agent.capability(cap("same"), quick_handler)
+            self.assertEqual(list(agent._capabilities), ["same"])
+
+
+class PeerViewTest(AgentTest):
+    """The peer view: what the callability rules leave usable (*Callability rules* 1-8), read through
+    `agmen()` and `refresh()`. The view is asserted on, never the raw scan."""
+
+    async def test_agmen_returns_the_current_view(self) -> None:
+        """`agmen()` returns the current view, read-only, keyed by agent id; our own folder is in it
+        (a self-call hangs on it, D-18)."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root)
+            view = agent.agmen()
+            self.assertIn(AGENT, view)
+            self.assertEqual(view[AGENT].id, AGENT)
+
+    async def test_refresh_returns_the_new_view(self) -> None:
+        """`refresh()` runs a full scan now and returns the new view — the same mapping `agmen()`
+        then returns (a frozen interface: "`refresh()` … it returns the new view")."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root)
+            self.assertNotIn(PEER, agent.agmen())
+            peer_tree(root)  # beta appears after the start
+            new_view = await agent.refresh()
+            self.assertIn(PEER, new_view)
+            self.assertIn(PEER, agent.agmen())  # the refresh updated the view agmen() reads
+
+    async def test_a_peer_with_a_usable_capability_is_in_the_view(self) -> None:
+        """Rule 5.2 and 6: a peer whose capability is usable by us (no `accepts_from`) is in the
+        view, with that capability."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root)
+            peer_tree(root)  # beta offers `echo` to everyone
+            await agent.refresh()
+            self.assertIn(PEER, agent.agmen())
+            self.assertIn("echo", agent.agmen()[PEER].capabilities)
+
+    async def test_a_disabled_peer_is_in_the_view_without_its_capabilities(self) -> None:
+        """Rule 1: "If agent B's spec has `disabled=true`, agent A will not consider agent B's
+        capabilities. Commands can still be sent, so that the agent can be enabled again." A disabled
+        peer that accepts our commands stays in the view, with no capabilities."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root)
+            peer_tree(
+                root, disabled=True, accepts=[AGENT]
+            )  # beta is disabled, but we may command it
+            await agent.refresh()
+            self.assertIn(PEER, agent.agmen())
+            self.assertEqual(agent.agmen()[PEER].capabilities, {})
+            self.assertTrue(agent.agmen()[PEER].commands)
+
+    async def test_a_peer_with_nothing_usable_is_discarded(self) -> None:
+        """Rule 6: "If the previous filters show that no commands and no capabilities are usable by
+        agent A, agent A will discard agent B." A peer that accepts no commands from us and offers no
+        capability we may use is not in the view."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root)
+            folder = root / "gamma"
+            (folder / "inbox").mkdir(parents=True)
+            # gamma's only capability is restricted to `beta`, and it accepts no commands from us.
+            write_file(
+                folder / "spec.json",
+                {
+                    "id": "gamma",
+                    "actio_version": "0.1",
+                    "datetime": TS_ISO,
+                    "description": "a peer alpha cannot use",
+                    "accepts_commands_from": [],
+                    "capabilities": [
+                        {
+                            "name": "echo",
+                            "description": "only for beta",
+                            "parameters": {"type": "object"},
+                            "actio": {"result": {"type": "object"}, "accepts_from": [PEER]},
+                        }
+                    ],
+                    "security_support": [],
+                    "security_posture": "trusted",
+                },
+            )
+            write_file(
+                folder / "status.json",
+                {"id": "gamma", "status": "idle", "datetime": TS_ISO, "capability_status": []},
+            )
+            await agent.refresh()
+            self.assertNotIn("gamma", agent.agmen())
+
+    async def test_a_foreign_posture_peer_is_discarded(self) -> None:
+        """Rule 3: "If agent A does not support the security features required by agent B's security
+        posture, agent A will not consider agent B's specification." The core profile supports no
+        feature, so a peer that requires any posture but `trusted` is not in the view."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root)
+            peer_tree(root, peer="delta", posture="untrusted")
+            await agent.refresh()
+            self.assertNotIn("delta", agent.agmen())
+
+
+class ScanTest(AgentTest):
+    """D-17: the scan that keeps the view current without any `refresh()` call."""
+
+    async def test_the_view_gains_a_later_peer_without_refresh(self) -> None:
+        """D-17: "alpha runs, beta starts afterwards, and with no `refresh()` anywhere `alpha.agmen()`
+        gains beta within the debounce plus a named margin." The assertion is that the view gains beta
+        with **no call** at all; a mutant that drops the scan's scheduling fails it. The margin is a
+        bound on the wait, not a sleep: the fact asserted is the gain, and it must come for free."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root, nuntium_debounce=0.2)
+            self.assertNotIn(PEER, agent.agmen())
+            # beta starts afterwards: its folder and its announce land in the tree.
+            peer_tree(root)
+            write_file(
+                root / "nuntium" / f"{PEER}.n.json",
+                {
+                    "id": PEER,
+                    "datetime": TS_ISO,
+                    "ts": int(TS),
+                    "nuntium": f"agent {PEER} is active",
+                },
+            )
+            DEBOUNCE = 0.2  # the configured nuntium debounce
+            MARGIN = 2.0  # the named margin: a bound, so load cannot flip the verdict
+            await wait_for(
+                "the view to gain beta without any refresh() call",
+                lambda: PEER in agent.agmen(),
+                timeout=DEBOUNCE + MARGIN,
+            )
+            self.assertIn(PEER, agent.agmen())
+
+
+class SelfCallTest(AgentTest):
+    """D-18: the self-call, served through the same files as any other."""
+
+    async def test_a_self_call_is_served_through_the_own_inbox(self) -> None:
+        """D-18: "A self-call is no special case: it covers its own destination inbox just like any
+        other destination." An agent MAY call itself (*Callability rules*: "the protocol does not
+        inhibit it"); the request lands in its own inbox, the outcome is `confirmed` with the archive
+        intact, and the diarium carries both an `inreq` and an `outreq` line."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root, caps={"summarize": quick_handler}, confirm_timeout=0.2)
+            outcome = await agent.request(AGENT, "summarize", {"text": "hi"}, timeout=5)
+            self.assertEqual(outcome.final_status, "confirmed")
+            self.assertTrue(any(line["event"] == "outreq" for line in lines(root)))
+            # The receiver archives `confirm_timeout` after the response: both sides then carry a line.
+            await wait_for(
+                "the self-call's `inreq` line to land after the confirm timeout",
+                lambda: any(line["event"] == "inreq" for line in lines(root)),
+                timeout=WATCH_SETTLE,
+            )
+            self.assertTrue(any(line["event"] == "inreq" for line in lines(root)))
+            # The exchange is archived: its files are gone from the (own) inbox.
+            await wait_for(
+                "the self-call's archive to empty the inbox",
+                lambda: not list(inbox_dir(root).iterdir()),
+                timeout=WATCH_SETTLE,
+            )
             self.assertIsNone(agent._restart_task)  # the delay is 10 s: it is not merely sleeping

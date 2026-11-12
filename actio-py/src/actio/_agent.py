@@ -97,6 +97,7 @@ class _Run:
     heartbeat: asyncio.Task[Any] | None = None
     nuntium_task: asyncio.Task[Any] | None = None
     scan_task: asyncio.Task[Any] | None = None
+    fail_task: asyncio.Task[Any] | None = None  # a D-22 `fail` the nuntium loop armed
 
 
 class _Ctx:
@@ -415,10 +416,10 @@ class ActioAgent:
         """Drops what a failed `start()` armed: no heartbeat, no nuntium loop, no watchers; `inactive`
         is published if `idle` was, so a half-started agent never looks alive (D-9)."""
         run.stopped.set()
-        for task in (run.heartbeat, run.nuntium_task, run.scan_task):
+        for task in (run.heartbeat, run.nuntium_task, run.scan_task, run.fail_task):
             if task is not None:
                 task.cancel()
-        for task in (run.heartbeat, run.nuntium_task, run.scan_task):
+        for task in (run.heartbeat, run.nuntium_task, run.scan_task, run.fail_task):
             if task is not None:
                 with contextlib.suppress(BaseException):
                     await asyncio.shield(task)
@@ -484,7 +485,12 @@ class ActioAgent:
             with contextlib.suppress(BaseException):
                 await asyncio.shield(run.heartbeat)
             run.heartbeat = None
-        # (6) The nuntium loop; the watcher was closed by the receiver's stop.
+        # (6) The nuntium loop and any D-22 `fail` it armed; the watcher was closed by the receiver's stop.
+        if run.fail_task is not None:
+            run.fail_task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(run.fail_task)
+            run.fail_task = None
         if run.nuntium_task is not None:
             run.nuntium_task.cancel()
             with contextlib.suppress(BaseException):
@@ -539,7 +545,7 @@ class ActioAgent:
             if sub.lost is not None:
                 # D-22: a lost `nuntium` watch is fatal: log it and enter `error`.
                 error, sub.lost = sub.lost, None
-                self._spawn(self._fail_watch(nuntium, error), "actio.fail")
+                run.fail_task = self._spawn(self._fail_watch(nuntium, error), "actio.fail")
             else:
                 self._schedule_scan(run)
             await sub.changed.wait()
