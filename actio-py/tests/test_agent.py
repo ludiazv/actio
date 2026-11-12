@@ -16,8 +16,9 @@ import contextlib
 import json
 import os
 import shutil
+import sys
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 from unittest import mock
@@ -342,6 +343,24 @@ class AgentTest(ActioTestCase):
         await agent.start()
         return agent, the_clock
 
+    @contextlib.contextmanager
+    def restart_sleep_recorder(self, asked: list[float]) -> Iterator[None]:
+        """Replace `asyncio.sleep` with a recorder that answers only `actio._agent._restart`: it notes the
+        seconds the restart asked to sleep and sleeps 10 ms instead. D-10's clamp is a number the agent
+        chooses, and the two rows that use this read the choice instead of waiting out sixty seconds to
+        infer it. Every other sleep in the process is handed to the real one."""
+        real = asyncio.sleep
+
+        async def recording(seconds: float, *args: Any) -> Any:
+            # `sys._getframe(1).f_code.co_name` is the frame awaiting the sleep, which is `_restart`'s.
+            if sys._getframe(1).f_code.co_name == "_restart":
+                asked.append(seconds)
+                seconds = 0.01
+            return await real(seconds, *args)
+
+        with mock.patch.object(asyncio, "sleep", recording):
+            yield
+
 
 class SpineTest(AgentTest):
     async def test_the_spine_of_one_run(self) -> None:
@@ -384,6 +403,82 @@ class SpineTest(AgentTest):
 
 
 class StopTest(AgentTest):
+    async def test_c1_writes_the_inactive_before_the_announce_that_follows_it(self) -> None:
+        """D-9's last phase: C1 is the *status*, then the announce that follows it — an observer that reads
+        `nuntium` must never see an "is inactive" announcement beside a status still claiming `idle`. The
+        writes are recorded, not inferred from the files, because both orders leave the same two files on
+        disk. The seam belongs to the row: it takes the real write from the file layer."""
+        import actio._files as files_mod
+        import actio._status as status_mod
+
+        real_write = files_mod.write_json_atomic
+        during: list[tuple[str, str]] = []
+
+        async def recording(path: str, obj: Any, tmp_dir: str, provider: Any) -> None:
+            during.append((os.path.basename(path), str((obj or {}).get("status", ""))))
+            await real_write(path, obj, tmp_dir, provider)
+
+        async with self.tree() as root:
+            agent, _ = await self.boot(root, heartbeat_interval=1000)
+            await asyncio.sleep(0.1)  # the start's own announce is written before the stop begins
+            with mock.patch.object(status_mod, "write_json_atomic", recording):
+                await agent.stop()
+            statuses = [i for i, (name, _) in enumerate(during) if name == "status.json"]
+            announces = [i for i, (name, _) in enumerate(during) if name == f"{AGENT}.n.json"]
+            self.assertEqual(
+                [name for name, _ in during],
+                ["status.json", f"{AGENT}.n.json"],
+                f"what C1 wrote, in order: {during}",
+            )
+            self.assertLess(statuses[-1], announces[-1], f"C1's order: {during}")
+            self.assertEqual(doc(status_path(root))["status"], "inactive")
+
+    async def test_an_idle_stop_does_not_wait_out_the_grace(self) -> None:
+        """D-9's phase (2) is a wait for in-flight *work*, not a sleep: with nothing inbound running, a
+        graceful stop must return at once. The grace is set to five seconds so that a phase which always
+        waits is visible as a five-second stop, and the row measures the call against a margin — not
+        against the grace the config happens to carry."""
+        async with self.tree() as root:
+            agent, _ = await self.boot(root, stop_grace=5.0)
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            await agent.stop()
+            took = loop.time() - t0
+            self.assertLess(
+                took,
+                1.0,
+                f"an idle agent's stop took {took:.2f}s: D-9's grace ran with no work running",
+            )
+            self.assertEqual(doc(status_path(root))["status"], "inactive")
+
+    async def test_a_stop_waits_for_the_tick_it_stopped(self) -> None:
+        """D-9 ends the stop with *nothing of ours armed*, so the heartbeat is not only cancelled: a tick
+        already in flight is awaited (step 5) before C1. A status write is slowed so a tick is mid-flight
+        when `stop()` is called, and the assertion is made at the moment `stop()` returns — not at the
+        teardown, where a leftover task would have finished on its own and hidden the missing await."""
+        async with self.tree() as root:
+            agent, _ = await self.boot(root, heartbeat_interval=0.05)
+            run = agent._run
+            assert run is not None
+            publisher: Any = run.publisher
+            publish = publisher.publish_status
+
+            async def slow(status: Any) -> None:
+                if status["status"] != "inactive":
+                    await asyncio.sleep(0.3)  # the tick's write is the slow one; C1's is not
+                await publish(status)
+
+            publisher.publish_status = slow
+            await asyncio.sleep(0.1)  # a tick is in flight
+            await agent.stop()
+            armed = {
+                t.get_name()
+                for t in asyncio.all_tasks()
+                if not t.done() and t.get_name().startswith("actio.")
+            }
+            self.assertEqual(armed, set(), f"still armed when stop() returned: {armed}")
+            self.assertEqual(doc(status_path(root))["status"], "inactive")
+
     async def test_three_in_flight_requests_are_abandoned_before_inactive(self) -> None:
         """D-9: what is in B2 is abandoned, and every owed `outreq` line is on disk before C1's
         `inactive` write — the outbound side is stopped (step 4) before the status (C1). The test's
@@ -661,6 +756,80 @@ class RestartTest(AgentTest):
             self.assertFalse(stopped.done())
             await agent.stop()
             await asyncio.wait_for(stopped, SETTLE)
+
+    async def test_the_restart_delay_is_capped_at_the_maximum(self) -> None:
+        """D-10: "*the delay is capped (`RESTART_DELAY_MAX`, 60 s)*". A command may not park an agent out of
+        the tree for an hour: the longest sleep a `restart` may ask for is the cap. The recorder reads what
+        the restart *asked to sleep*, and the restart completing is the other half of the rule."""
+        asked: list[float] = []
+        with self.restart_sleep_recorder(asked):
+            async with self.tree() as root:
+                await self.boot(root)
+                write_file(
+                    inbox_dir(root) / f"{rid(1)}.json",
+                    cmd_file(rid(1), "restart", {"force": False, "delay": 3600.0}),
+                )
+                await wait_for(
+                    "the fresh run's second `idle` line (the restart went through)",
+                    lambda: (
+                        sum(
+                            1
+                            for line in lines(root)
+                            if line["event"] == "status" and line["event_data"] == "idle"
+                        )
+                        >= 2
+                    ),
+                    timeout=WATCH_SETTLE,
+                )
+        self.assertEqual(asked, [60.0], f"the restart asked to sleep {asked}s")
+
+    async def test_a_restart_command_with_a_negative_delay_is_ignored(self) -> None:
+        """*Envelope lifecycle* A6 and D1: a `restart` command's `delay` is a `duration`, and a `duration`
+        is "`minimum: 0`". A negative delay is therefore an invalid envelope: the receiver ignores it — one
+        `log` line naming the file, the file itself left in the inbox — and the agent is never stopped. That
+        is why the clamp's floor is not reachable over the wire, and why the next row goes through the
+        agent's own seam."""
+        async with self.tree() as root:
+            await self.boot(root)
+            name = f"{rid(1)}.json"
+            write_file(
+                inbox_dir(root) / name, cmd_file(rid(1), "restart", {"force": False, "delay": -5.0})
+            )
+            await wait_for(
+                "the `ignored` line for the invalid command",
+                lambda: any(
+                    line["event"] == "log" and str(line["event_data"]).startswith("ignored ")
+                    for line in lines(root)
+                ),
+                timeout=WATCH_SETTLE,
+            )
+            # Ignored, not deleted and not archived: the inbox still holds the file, and nothing was exchanged.
+            self.assertEqual([p.name for p in inbox_dir(root).iterdir()], [name])
+            self.assertFalse(any(line["event"] == "inreq" for line in lines(root)))
+            self.assertEqual(doc(status_path(root))["status"], "idle")
+
+    async def test_a_negative_restart_delay_clamps_to_no_wait(self) -> None:
+        """D-10: "*a negative delay clamps to 0*". The wire cannot bring one (the row above: the schema's
+        `duration` is `minimum: 0`), so the floor is the agent's own protection for whoever else asks it to
+        restart — reached here through the agent's restart seam, with the same recorder as the cap row."""
+        asked: list[float] = []
+        with self.restart_sleep_recorder(asked):
+            async with self.tree() as root:
+                agent, _ = await self.boot(root)
+                agent._schedule_restart(False, -5.0)
+                await wait_for(
+                    "the restart's second `idle` line",
+                    lambda: (
+                        sum(
+                            1
+                            for line in lines(root)
+                            if line["event"] == "status" and line["event_data"] == "idle"
+                        )
+                        >= 2
+                    ),
+                    timeout=WATCH_SETTLE,
+                )
+        self.assertEqual(asked, [0.0], f"the restart asked to sleep {asked}s")
 
     async def test_a_restart_whose_start_fails_ends_wait_stopped(self) -> None:
         """D-10: a restart whose `start` fails ends `wait_stopped()` too, because nobody is left to
@@ -1834,9 +2003,16 @@ class TwoAgentTest(AgentTest):
                         raise  # the test ends its own rogue handler, after the bound was asserted
                     continue  # the bad handler: the cancellation is swallowed
 
-    async def _stop_past_a_handler_that_will_not_stop(self, force: bool) -> None:
+    async def _stop_past_a_handler_that_will_not_stop(
+        self, force: bool, bound: float = HANDLER_CANCEL_WAIT
+    ) -> None:
         """`beta` stops while its handler ignores the cancellation: C1 lands, the handler is named, and the
         exchange is archived like any answered one.
+
+        `bound` is the handler wait the row measures `stop()` against. The rows that pass the module's own
+        constant check that the wait is spent and bounded; the row that passes a literal one checks the
+        constant itself, because a bound read from the code would let a 30-second constant agree with
+        itself and pass.
 
         `confirm_timeout` sits *inside* `HANDLER_CANCEL_WAIT` on purpose: the code 300 is answered at once, so
         its confirmation timer fires during the wait and the exchange archives itself and leaves the receiver's
@@ -1860,7 +2036,7 @@ class TwoAgentTest(AgentTest):
             # breaks reports nothing.
             work = [t for t in asyncio.all_tasks() if t.get_name().startswith("actio.work.")]
             loop = asyncio.get_running_loop()
-            allowed = grace + HANDLER_CANCEL_WAIT + 0.8
+            allowed = grace + bound + 0.8
             t0 = loop.time()
             try:
                 # `shield`: if the bound does not hold, the failure is this row's, and the teardown below
@@ -1873,10 +2049,10 @@ class TwoAgentTest(AgentTest):
                         "did not hold"
                     ) from err
                 took = loop.time() - t0
-                # C1 came, and it came inside the bound it is owed: the grace, then HANDLER_CANCEL_WAIT.
+                # C1 came, and it came inside the bound it is owed: the grace, then the handler wait.
                 self.assertLess(took, allowed, f"stop() took {took:.2f}s: the bound did not hold")
                 self.assertGreaterEqual(
-                    took, HANDLER_CANCEL_WAIT, f"stop() took {took:.2f}s: the bound was not spent"
+                    took, bound, f"stop() took {took:.2f}s: the bound was not spent"
                 )
                 self.assertEqual(doc(status_path(root, PEER))["status"], "inactive")
 
@@ -1921,6 +2097,81 @@ class TwoAgentTest(AgentTest):
 
     async def test_a_forced_stop_reaches_inactive_past_a_handler_that_will_not_stop(self) -> None:
         await self._stop_past_a_handler_that_will_not_stop(force=True)
+
+    async def test_the_handler_bound_is_D9_s_own_second_not_the_constant_in_the_code(self) -> None:
+        """D-9's phase (3) allows *at most* `HANDLER_CANCEL_WAIT` for a cancelled handler, and the plan fixes
+        that bound at one second: `stop()` is a call its caller makes while it waits for the agent to be
+        down, and a lane may not lengthen that wait by editing its own constant. The two rows above measure
+        `stop()` against the constant the code reads, which would let a 30-second constant agree with
+        itself; this one pins the constant, then measures against the literal ceiling."""
+        self.assertLessEqual(
+            HANDLER_CANCEL_WAIT,
+            1.0,
+            f"the handler wait of a stopping agent is {HANDLER_CANCEL_WAIT}s: D-9's bound is one second",
+        )
+        await self._stop_past_a_handler_that_will_not_stop(force=False, bound=1.0)
+
+    async def test_an_inbound_caller_is_answered_300_while_the_handler_waits_on_its_own_call(
+        self,
+    ) -> None:
+        """D-9's order, phase (3) before phase (4), told apart by a handler that is itself awaiting a call
+        when the grace runs out. Stopped in the protocol's order, `beta` answers `alpha`'s call with code
+        300 and *then* abandons its own handler's call to `gamma`. Stopped the other way round, the
+        abandoned call hands the handler a result, the handler returns it, and `alpha` reads an ordinary
+        answer from an agent that was already stopping — the answer a stopping agent owes is the 300."""
+        grace = 0.2
+        async with self.tree() as root:
+            peer_tree(root, "gamma")  # published and never served: `beta`'s own call stays open
+            started = asyncio.Event()
+
+            async def relay(params: Any, ctx: Any) -> dict[str, Any]:
+                started.set()
+                outcome = await beta.request("gamma", "echo", {"n": 1}, timeout=0)
+                return {"outcome": outcome.final_status}
+
+            alpha, _ = await self.boot(root, stop_grace=grace, confirm_timeout=0.2)
+            beta, _ = self.build_peer(
+                root, caps={"relay": relay}, stop_grace=grace, confirm_timeout=0.2
+            )
+            await beta.start()
+            await self._see(alpha, "relay")
+            call = asyncio.create_task(alpha.request(PEER, "relay", {"n": 1}, timeout=30))
+            await wait_for(
+                "beta's handler to begin its own call", started.is_set, timeout=WATCH_SETTLE
+            )
+            # `beta`'s request to `gamma` is on disk and unanswered: the grace runs out with both sides of
+            # `beta` open — one inbound being served, one outbound waiting.
+            await wait_for(
+                "gamma's copy of beta's request",
+                lambda: any(p.name.endswith(".json") for p in inbox_dir(root, "gamma").iterdir()),
+                timeout=WATCH_SETTLE,
+            )
+            await (
+                beta.stop()
+            )  # the grace runs out: phase (2) ends, (3) and (4) follow in D-9's order
+            outcome = await call
+            self.assertEqual(outcome.final_status, "confirmed")
+            assert outcome.response is not None
+            self.assertEqual(
+                cast(dict[str, Any], outcome.response["result"])["code"],
+                300,
+                f"alpha's answer from a stopping beta: {outcome.response}",
+            )
+            # And `beta`'s own exchange closed the other way: abandoned at phase (4), with its line.
+            out = [
+                cast(dict[str, Any], line["event_data"])
+                for line in lines(root, PEER)
+                if line["event"] == "outreq"
+            ]
+            self.assertEqual([o["final_status"] for o in out], ["abandoned"])
+            self.assertEqual(
+                (
+                    cast(dict[str, Any], out[0]["req"])["src"],
+                    cast(dict[str, Any], out[0]["req"])["dst"],
+                ),
+                (PEER, "gamma"),
+                f"the abandoned exchange is not beta's own call: {out[0]}",
+            )
 
     async def test_a_handler_that_ends_late_within_the_bound_answers_once(self) -> None:
         """What the bound leans on: the wait is a bound, not a fixed sleep, and a handler that answers after
