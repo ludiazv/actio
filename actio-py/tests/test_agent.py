@@ -22,9 +22,10 @@ from typing import Any, cast
 import referencing
 from jsonschema import Draft202012Validator
 
-from actio import ActioAgent, Capability, CapabilityHandler, LogEvent
+from actio import ActioAgent, Capability, CapabilityHandler, CommandHandler, LogEvent
 from actio._config import ActioConfig
 from actio._protocol import DiariumEntry
+from actio._util import format_iso
 from helpers import ActioTestCase, actio_tree
 
 SETTLE = 6.0  # watchdog wake + debounce + a handler: a failure, not a timing expectation
@@ -612,4 +613,196 @@ class RestartTest(AgentTest):
             await asyncio.wait_for(stopped, SETTLE)
             self.assertFalse(agent._running())
             self.assertEqual(doc(status_path(root))["status"], "inactive")
+
+
+class CommandTest(AgentTest):
+    """Lane D: the four standard commands, and what they may and may not change (*Commands*, D0-D4).
+
+    A command is a file in the inbox, as a peer would write it; the assertions are on the files, the
+    diarium and the announce, never on the in-memory state. The heartbeat is set far out in the
+    command tests, so a rewritten `status.json` is the command's write, not a tick's.
+    """
+
+    @staticmethod
+    def _announce_count(root: Path) -> int:
+        return sum(1 for line in lines(root) if line["event"] == "announce")
+
+    @staticmethod
+    def _inreq_final(root: Path) -> list[str]:
+        return [
+            cast(dict[str, Any], line["event_data"])["final_status"]
+            for line in lines(root)
+            if line["event"] == "inreq"
+        ]
+
+    async def test_enable_sets_disabled_and_reannounces(self) -> None:
+        """D2 and *Agent Spec* ("`disabled` … Changed with the `enable` command"): setting it false
+        then true follows in `spec.json`, and each change re-announces — the file, the diarium line,
+        the announce."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root, heartbeat_interval=1000)
+            write_file(
+                inbox_dir(root) / f"{rid(1)}.json", cmd_file(rid(1), "enable", {"enabled": False})
+            )
+            await wait_for(
+                "the disabled spec and its re-announce",
+                lambda: (
+                    spec_path(root).exists()
+                    and doc(spec_path(root)).get("disabled") is True
+                    and doc(announce_path(root))["nuntium"] == f"agent {AGENT} is disabled"
+                ),
+            )
+            self.assertEqual(self._announce_count(root), 1)
+            write_file(
+                inbox_dir(root) / f"{rid(2)}.json", cmd_file(rid(2), "enable", {"enabled": True})
+            )
+            await wait_for(
+                "the re-enabled spec and its re-announce",
+                lambda: (
+                    doc(spec_path(root)).get("disabled") is False
+                    and doc(announce_path(root))["nuntium"] == f"agent {AGENT} is enabled"
+                ),
+            )
+            self.assertEqual(self._announce_count(root), 2)
+
+    async def test_a_command_while_disabled_is_processed(self) -> None:
+        """D0: "commands are processed even if the agent is disabled, so that it can be enabled
+        again or shut down." With `disabled: true` in the spec, an `enable` back must land and
+        clear it; *Callability rules* keeps the command path open for the same reason."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root, heartbeat_interval=1000)
+            write_file(
+                inbox_dir(root) / f"{rid(1)}.json", cmd_file(rid(1), "enable", {"enabled": False})
+            )
+            await wait_for(
+                "the disabled spec",
+                lambda: spec_path(root).exists() and doc(spec_path(root)).get("disabled") is True,
+            )
+            write_file(
+                inbox_dir(root) / f"{rid(2)}.json", cmd_file(rid(2), "enable", {"enabled": True})
+            )
+            await wait_for(
+                "the disabled flag cleared by the command that a disabled agent still processes",
+                lambda: doc(spec_path(root)).get("disabled") is False,
+            )
+
+    async def test_ping_republishes_spec_and_status(self) -> None:
+        """D2: "`ping` re-publishes both". Both files are rewritten and the announce is written
+        again; the heartbeat is 1000 s out, so the fresh datetime can only be `ping`'s write from
+        the ticked clock, not a tick's."""
+        with actio_tree() as root:
+            agent, clock = await self.boot(root, heartbeat_interval=1000)
+            spec_before = doc(spec_path(root))["datetime"]
+            status_before = doc(status_path(root))["datetime"]
+            clock.tick(7)
+            fresh = format_iso(clock.value())
+            self.assertNotEqual(fresh, spec_before)
+            self.assertNotEqual(fresh, status_before)
+            write_file(inbox_dir(root) / f"{rid(1)}.json", cmd_file(rid(1), "ping", None))
+            await wait_for(
+                "ping to re-publish the spec with the fresh datetime",
+                lambda: doc(spec_path(root))["datetime"] == fresh,
+            )
+            await wait_for(
+                "ping to re-publish the status with the fresh datetime",
+                lambda: doc(status_path(root))["datetime"] == fresh,
+            )
+            await wait_for(
+                "ping to re-announce",
+                lambda: doc(announce_path(root))["nuntium"] == f"agent {AGENT} is alive",
+            )
+
+    async def test_a_command_writes_no_response(self) -> None:
+        """D1: "no response file is ever written for `type=\"cmd\"`." After a command, no
+        `<rid>.res.json` and no `<rid>.con.json` exist, the envelope is archived (D3), and the
+        diarium carries one `inreq` line with `final_status` `completed`."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root, heartbeat_interval=1000)
+            r = rid(1)
+            write_file(inbox_dir(root) / f"{r}.json", cmd_file(r, "ping", None))
+            await wait_for(
+                "the command's completed inreq line",
+                lambda: "completed" in self._inreq_final(root),
+            )
+            inbox = inbox_dir(root)
+            self.assertFalse((inbox / f"{r}.res.json").exists())
+            self.assertFalse((inbox / f"{r}.con.json").exists())
+            await wait_for(
+                "the archived envelope to be gone from the inbox",
+                lambda: not (inbox / f"{r}.json").exists(),
+            )
+
+    async def test_a_command_from_an_unlisted_src_is_dropped(self) -> None:
+        """D4: a command from a `src` not in `accepts_commands_from` is dropped without touching what
+        peers see — `status.json`, `spec.json` and the announce file are **not** touched, and the
+        diarium carries the `inreq` line with `final_status` `dropped`."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root, heartbeat_interval=1000)
+            status_before = status_path(root).read_bytes()
+            spec_before = spec_path(root).read_bytes()
+            announce_before = announce_path(root).read_bytes()
+            r = rid(9)
+            # `gamma` is not in `accepts_commands_from` (only `alpha` and `beta` are).
+            write_file(inbox_dir(root) / f"{r}.json", cmd_file(r, "ping", None, src="gamma"))
+            await wait_for(
+                "the dropped inreq line",
+                lambda: "dropped" in self._inreq_final(root),
+            )
+            self.assertEqual(status_path(root).read_bytes(), status_before)
+            self.assertEqual(spec_path(root).read_bytes(), spec_before)
+            self.assertEqual(announce_path(root).read_bytes(), announce_before)
+
+    async def test_on_command_in_both_forms(self) -> None:
+        """`on_command(name, handler)` in both frozen forms: the direct call and the decorator. The
+        commands are never advertised, so the registration is asserted on the agent's own table."""
+        with actio_tree() as root:
+            agent, _ = self.build(root)
+
+            async def direct_handler(params: Any, ctx: Any) -> None:
+                return None
+
+            agent.on_command("direct_cmd", direct_handler)
+
+            @agent.on_command("decorated_cmd")
+            async def decorated_handler(params: Any, ctx: Any) -> None:
+                return None
+
+            self.assertIn("direct_cmd", agent._commands)
+            self.assertIn("decorated_cmd", agent._commands)
+            self.assertIs(agent._commands["decorated_cmd"], decorated_handler)
+
+    async def test_on_command_refuses_a_standard_name(self) -> None:
+        """D0: the agent knows "either a protocol-standard command (`stop`, `enable`, `restart`,
+        `ping`) or a custom command it implements internally"; the standard four are built-in, so
+        `on_command` refuses to shadow them."""
+        with actio_tree() as root:
+            agent, _ = self.build(root)
+
+            async def handler(params: Any, ctx: Any) -> None:
+                return None
+
+            for name in ("stop", "enable", "restart", "ping"):
+                with self.assertRaises(ValueError):
+                    agent.on_command(name, handler)
+
+    async def test_on_command_refuses_a_duplicate(self) -> None:
+        with actio_tree() as root:
+            agent, _ = self.build(root)
+
+            async def handler(params: Any, ctx: Any) -> None:
+                return None
+
+            agent.on_command("my_cmd", handler)
+            with self.assertRaises(ValueError):
+                agent.on_command("my_cmd", handler)
+
+    async def test_on_command_needs_an_async_handler(self) -> None:
+        with actio_tree() as root:
+            agent, _ = self.build(root)
+
+            def sync_handler(params: Any, ctx: Any) -> None:
+                return None
+
+            with self.assertRaises(TypeError):
+                agent.on_command("sync_cmd", cast(CommandHandler, sync_handler))
             self.assertIsNone(agent._restart_task)  # the delay is 10 s: it is not merely sleeping
