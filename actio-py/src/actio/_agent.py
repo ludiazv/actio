@@ -18,7 +18,7 @@ import inspect
 import os
 import time
 from collections.abc import Callable, Coroutine, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast, overload
 
 from ._config import ActioConfig, load_config
@@ -97,7 +97,7 @@ class _Run:
     heartbeat: asyncio.Task[Any] | None = None
     nuntium_task: asyncio.Task[Any] | None = None
     scan_task: asyncio.Task[Any] | None = None
-    fail_task: asyncio.Task[Any] | None = None  # a D-22 `fail` the nuntium loop armed
+    fail_tasks: list[asyncio.Task[Any]] = field(default_factory=list)  # the D-22 `fail`s
 
 
 class _Ctx:
@@ -142,7 +142,7 @@ class _ReceiverHooks:
 
     def on_watch_error(self, folder: str, error: BaseException) -> None:
         # D-22: a lost own inbox is fatal: log it and enter `error`.
-        self._agent._spawn(self._agent._fail_watch(folder, error), "actio.fail")
+        self._agent._arm_fail(folder, error)
 
     def peer_spec(self, src: AgentId) -> Spec | None:
         # D-7: code 106 must see the DISCOVERED spec, unfiltered by the callability rules.
@@ -416,13 +416,14 @@ class ActioAgent:
         """Drops what a failed `start()` armed: no heartbeat, no nuntium loop, no watchers; `inactive`
         is published if `idle` was, so a half-started agent never looks alive (D-9)."""
         run.stopped.set()
-        for task in (run.heartbeat, run.nuntium_task, run.scan_task, run.fail_task):
+        for task in (run.heartbeat, run.nuntium_task, run.scan_task):
             if task is not None:
                 task.cancel()
-        for task in (run.heartbeat, run.nuntium_task, run.scan_task, run.fail_task):
+        for task in (run.heartbeat, run.nuntium_task, run.scan_task):
             if task is not None:
                 with contextlib.suppress(BaseException):
                     await asyncio.shield(task)
+        await self._drop_fails(run)
         if run.receiver is not None:
             with contextlib.suppress(BaseException):
                 await run.receiver.stop()  # also closes the shared watcher
@@ -486,11 +487,7 @@ class ActioAgent:
                 await asyncio.shield(run.heartbeat)
             run.heartbeat = None
         # (6) The nuntium loop and any D-22 `fail` it armed; the watcher was closed by the receiver's stop.
-        if run.fail_task is not None:
-            run.fail_task.cancel()
-            with contextlib.suppress(BaseException):
-                await asyncio.shield(run.fail_task)
-            run.fail_task = None
+        await self._drop_fails(run)
         if run.nuntium_task is not None:
             run.nuntium_task.cancel()
             with contextlib.suppress(BaseException):
@@ -545,7 +542,7 @@ class ActioAgent:
             if sub.lost is not None:
                 # D-22: a lost `nuntium` watch is fatal: log it and enter `error`.
                 error, sub.lost = sub.lost, None
-                run.fail_task = self._spawn(self._fail_watch(nuntium, error), "actio.fail")
+                self._arm_fail(nuntium, error)
             else:
                 self._schedule_scan(run)
             await sub.changed.wait()
@@ -860,6 +857,21 @@ class ActioAgent:
 
     def _on_sync_error(self, err: Exception) -> None:
         self._emit(LogEvent(message=f"sync: {err}"))
+
+    def _arm_fail(self, folder: str, error: BaseException) -> None:
+        """D-22: a lost watch is fatal. Both arms come through here, so the task is one the run
+        owns: `stop()` cancels it (D-9's step 6) instead of leaving it armed behind the stop."""
+        run = self._run
+        if run is None:
+            return  # no run to fail: the agent never started or is already torn down
+        run.fail_tasks.append(self._spawn(self._fail_watch(folder, error), "actio.fail"))
+
+    async def _drop_fails(self, run: _Run) -> None:
+        for task in run.fail_tasks:
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(task)
+        run.fail_tasks.clear()
 
     async def _fail_watch(self, folder: str, error: BaseException) -> None:
         self._emit(LogEvent(message=f"watch lost {folder}: {error}"))

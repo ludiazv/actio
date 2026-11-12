@@ -176,10 +176,8 @@ def doc(path: Path) -> dict[str, Any]:
     return cast(dict[str, Any], json.loads(path.read_text(encoding="utf-8")))
 
 
-# The schemas, read straight from the committed copy. They are not read through `actio._validate`
-# here: that module loads them with `importlib.resources`, which imports `actio.schemas` and leaves
-# a public `schemas` attribute on the package — the API surface test detects exactly that, and this
-# file runs before it.
+# The schemas, read straight from the committed copy: the verdict a test asserts on must not come
+# from the module under test. `actio._validate` loads the same bytes for its own registry.
 _SCHEMA_DIR = Path(__file__).resolve().parents[1] / "src" / "actio" / "schemas"
 
 
@@ -533,6 +531,30 @@ class LifecycleTest(AgentTest):
             )
             self.assertIn("failed", doc(announce_path(root))["nuntium"])
 
+    async def test_a_stop_supersedes_a_fail_armed_by_a_lost_watch(self) -> None:
+        """D-22 arms a `fail` task and D-9's step 6 owns it: a `stop()` cancels what the run armed instead
+        of leaving it armed behind the stop, and the run ends at C1's `inactive`. The sync provider holds
+        each write, so the `fail` is still in flight when `stop()` runs. The base class's leftover check is
+        the other half: an untracked `actio.fail` is still armed at teardown."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root, heartbeat_interval=1000, sync="delay:400")
+            events: list[Any] = []
+            agent.on_event(lambda e: events.append(e))
+            inbox_dir(root).rmdir()  # D-22: the own inbox is gone
+            await wait_for(
+                "the watch-lost log event",
+                lambda: any(isinstance(e, LogEvent) and "watch lost" in e.message for e in events),
+                timeout=WATCH_SETTLE,
+            )
+            run = agent._run
+            assert run is not None
+            armed = list(run.fail_tasks)
+            self.assertEqual(len(armed), 1)  # the arm is the run's, not a loose end
+            await agent.stop()
+            self.assertTrue(all(task.done() for task in armed))
+            self.assertEqual(run.fail_tasks, [])
+            self.assertEqual(doc(status_path(root))["status"], "inactive")  # C1 supersedes
+
 
 class RestartTest(AgentTest):
     async def test_a_restart_keeps_the_object_and_registrations_and_drops_disabled(self) -> None:
@@ -668,6 +690,33 @@ class CommandTest(AgentTest):
                 timeout=WATCH_SETTLE,
             )
             self.assertEqual(self._announce_count(root), 2)
+
+    async def test_the_announce_line_is_on_disk_before_the_announce_file(self) -> None:
+        """D2: *"Rewrite `status.json` and/or `spec.json`, append `status`/`announce` events to
+        `diarium.jsonl`, then write the announce file `nuntium/<agent_id>.n.json`"*. The order is the rule,
+        so it is pinned with the announce delay held open: when the line lands, the announce file still
+        carries the previous text."""
+        with actio_tree() as root:
+            agent, _ = await self.boot(root, heartbeat_interval=1000, announce_delay=0.5)
+            self.assertEqual(doc(announce_path(root))["nuntium"], f"agent {AGENT} is active")
+            # `start`'s announce writes the file and no `announce` line — the spine test pins the diarium as
+            # `["idle"]` — while the `D2` command path appends one. The count is the command's, not the run's.
+            write_file(
+                inbox_dir(root) / f"{rid(1)}.json", cmd_file(rid(1), "enable", {"enabled": False})
+            )
+            await wait_for(
+                "the second `announce` diarium line",
+                lambda: self._announce_count(root) == 1,
+                timeout=WATCH_SETTLE,
+            )
+            # The delay is 0.5 s and the poll 0.02 s: the file write cannot have happened yet.
+            self.assertEqual(doc(announce_path(root))["nuntium"], f"agent {AGENT} is active")
+            self.assertTrue(doc(spec_path(root)).get("disabled") is True)
+            await wait_for(
+                "the announce file itself",
+                lambda: doc(announce_path(root))["nuntium"] == f"agent {AGENT} is disabled",
+                timeout=WATCH_SETTLE,
+            )
 
     async def test_a_command_while_disabled_is_processed(self) -> None:
         """D0: "commands are processed even if the agent is disabled, so that it can be enabled
