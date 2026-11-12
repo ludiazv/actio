@@ -244,8 +244,9 @@ class Receiver:
                 if handler is not None and not handler.done():
                     self._ctx.emit(
                         LogEvent(
-                            message=f"stop: the handler of {ex.rid} outlived {HANDLER_CANCEL_WAIT}s "
-                            f"of D-9's bound; it is left to end on its own"
+                            message=f"stop: the handler of {ex.rid} outlived "
+                            f"{self._handler_cancel_wait}s of D-9's bound; "
+                            "it is left to end on its own"
                         )
                     )
         for ex in list(self._exchanges.values()):

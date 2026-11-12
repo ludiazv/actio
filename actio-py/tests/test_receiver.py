@@ -1217,6 +1217,9 @@ class StopTest(ReceiverTest):
                 named = [e.message for e in ctx.events if isinstance(e, LogEvent)]
                 self.assertEqual(len(named), 1, f"the bound reported: {named}")
                 self.assertIn(r, named[0])
+                # The line names the bound that was actually spent: the one this receiver was built with,
+                # not the module's default. A log line that quotes a number nobody waited is a lie about
+                # how long the stop took.
             finally:
                 # The row ends its own rogue handler — `leave` only opens its `raise` branch, which a
                 # cancellation then takes. A hung suite reports nothing.
