@@ -2192,6 +2192,18 @@ class TwoAgentTest(AgentTest):
                 (PEER, "gamma"),
                 f"the abandoned exchange is not beta's own call: {out[0]}",
             )
+            # Which of the two lines came first is the only outside sign of the phase order: answered and
+            # abandoned each look the same on their own, so a stop that gave up `beta`'s own call before it
+            # answered `alpha` would leave these two lines the other way round.
+            self.assertEqual(
+                [
+                    line["event"]
+                    for line in lines(root, PEER)
+                    if line["event"] in ("inreq", "outreq")
+                ],
+                ["inreq", "outreq"],
+                "D-9's phase (3) before phase (4): the answered call is on disk before the abandoned one's line",
+            )
 
     async def test_a_handler_that_ends_late_within_the_bound_answers_once(self) -> None:
         """What the bound leans on: the wait is a bound, not a fixed sleep, and a handler that answers after
