@@ -55,12 +55,15 @@ class _Outbound:
     response_body: ResponseBody | None = None
     attachments: list[str] = field(default_factory=list)
     cancelled: bool = False
+    # A caller that went away: the exchange task ends the exchange anyway (semantics 1), and B4 is its way
+    # of saying so to the peer.
+    give_up: bool = False
     cancel_deadline: float | None = None
     done: bool = False
     outcome: RequestOutcome | None = None
     task: asyncio.Task[RequestOutcome] | None = None
     # The one settlement, created with the agent's `Spawn` and awaited through `shield` by everyone who
-    # wants the outcome: the caller, the background finisher, and `stop()`.
+    # wants the outcome: the exchange task, and `stop()`.
     settling: asyncio.Task[RequestOutcome] | None = None
     # D-11 dedup, bounded: one entry per distinct (path, mtime) this exchange saw; it dies with it.
     ignored: set[tuple[str, int]] = field(default_factory=set)
@@ -100,31 +103,56 @@ class Requestor:
         attachments: Sequence[str] = (),
         cancel: asyncio.Event | None = None,
     ) -> RequestOutcome:
-        """One exchange, end to end. Raises `OSError` for a write that failed, never for a peer's error."""
-        inbox = self._dst_inbox(dst)
-        sub = self._watch.subscribe(inbox)  # D-18: before the write
-        ex = _Outbound(ulid(), dst, name, inbox)
+        """One exchange, end to end. Raises `OSError` for a write that failed, never for a peer's error.
+
+        B1 through B5 run as one exchange task, created with the agent's `Spawn`; this call only awaits it,
+        through a shield (D-18). A caller's cancellation therefore cannot interrupt protocol code: the
+        write, the attachment copies, the subscription and the settlement are the task's from end to end.
+        """
+        ex = _Outbound(ulid(), dst, name, self._dst_inbox(dst))
+        ex.task = self._spawn(
+            self._exchange(ex, params, timeout, list(attachments), cancel), f"actio.out.{ex.rid}"
+        )
         try:
-            ex.req = await self._begin_outbound(ex, name, params, timeout, list(attachments))
-        except BaseException:
-            self._watch.unsubscribe(sub)
+            return await asyncio.shield(ex.task)
+        except asyncio.CancelledError:
+            if ex.settling is not None:
+                # Not the caller's doing alone: the lane went down and settled the exchange. Its outcome is
+                # owed to whoever was waiting, and the settlement is already the exchange's one record (D-9).
+                return await asyncio.shield(ex.settling)
+            # Semantics 1: the caller is gone, the exchange is not. It ends in the background — B4 asks the
+            # peer to stop, and the `outreq` line lands when it settles — with the same subscription it has
+            # held since before the request was written (D-18).
+            ex.give_up = True
             raise
+
+    async def _exchange(
+        self,
+        ex: _Outbound,
+        params: Any,
+        timeout: float,
+        attachment_paths: list[str],
+        cancel: asyncio.Event | None,
+    ) -> RequestOutcome:
+        """B1 to B5, one task, one subscription: `sub` is taken before the write and released when the
+        exchange settles, whoever is waiting for it (D-18). Nothing here is interruptible by the caller: a
+        cancellation reaches it only through `ex.give_up`."""
+        # The table knows the exchange before its first write, so `stop()` can reach one whose B1 is still
+        # in flight (D-9's step 4 reaches everything owed).
         self._exchanges[ex.rid] = ex
-        self._hooks.on_state_change()
-        watching = True  # whose hands the subscription is in: mine, or the finisher's
+        sub = self._watch.subscribe(ex.inbox)  # D-18: before the write
         try:
+            ex.req = await self._begin_outbound(ex, ex.name, params, timeout, attachment_paths)
+            self._hooks.on_state_change()
             return await self._loop(ex, sub, timeout, cancel)
-        except (asyncio.CancelledError, TimeoutError):
-            # The caller is gone; the exchange still ends correctly in the background (semantics 1).
-            # The exchange holds the task, so the finisher stays referenced while it is live — and it
-            # takes the subscription with it: the answer it waits for is in the folder that
-            # subscription watches (D-18), so releasing it here would leave the finisher blind.
-            watching = False
-            ex.task = self._spawn(self._finish(ex, sub, timeout, cancel), f"actio.out.{ex.rid}")
+        except BaseException:
+            # B1 refused the call (an attachment clash, an invalid envelope): nothing reached the peer and
+            # no line is owed, so the exchange leaves the table with the exception.
+            if self._exchanges.get(ex.rid) is ex:
+                del self._exchanges[ex.rid]
             raise
         finally:
-            if watching:
-                self._watch.unsubscribe(sub)
+            self._watch.unsubscribe(sub)
 
     async def command(self, dst: AgentId, name: str, params: Any = None) -> Rid:
         """Write the command and return its rid: a command is never answered and is not tracked."""
@@ -153,17 +181,25 @@ class Requestor:
         """End what is outstanding, in D-9's order; nothing is left armed afterwards."""
         live = list(self._exchanges.values())
         for ex in live:
-            if ex.task is not None:
-                if not ex.task.done():
-                    ex.task.cancel()
-                with contextlib.suppress(BaseException):
-                    await ex.task
-        for ex in live:
+            if ex.req is None:
+                # B1 never wrote: the peer has nothing, and no line is owed.
+                self._exchanges.pop(ex.rid, None)
+                continue
             await self._settle(
                 ex, "abandoned", None
             )  # an exchange leaves the table only when settled,
         # so a settlement already in flight is still here, and `shield` waits for it (D-9: every owed
         # `outreq` line is on disk before the agent publishes `inactive`)
+        # The lines are down; now the waits may go. An exchange task cancelled here is the lane's own doing,
+        # which is why the caller above takes the settlement as the outcome rather than a cancellation.
+        for ex in live:
+            task = ex.task
+            if task is None:
+                continue
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
 
     # -- the envelopes ----------------------------------------------------
 
@@ -216,22 +252,29 @@ class Requestor:
                 raise ValueError(f"attachments clash on a forum name: {other!r} and {path!r}")
             by_name[base] = path
         copied: list[str] = []
+        path = os.path.join(ex.inbox, f"{ex.rid}.json")
         try:
             forum = ctx.folders.forum
-            for base, path in by_name.items():
-                await copy_file(path, os.path.join(forum, base), ctx.folders.agent, ctx.sync)
+            for base, src in by_name.items():
+                await copy_file(src, os.path.join(forum, base), ctx.folders.agent, ctx.sync)
                 copied.append(base)
+            ex.attachments.extend(by_name)
+            req = self._envelope(ex.rid, ex.dst, name, params, timeout, list(by_name))
+            reason = validate("request", req)
+            if reason is not None:
+                raise ValueError(
+                    f"requestor: built an invalid request for {ex.dst}/{name}: {reason}"
+                )
+            await write_json_atomic(path, req, ctx.folders.agent, ctx.sync)
         except BaseException:
-            await self._remove_from_forum(copied)
+            # B1 did not finish, and the copies it made are owed an owner. A torn write is not a cancelled
+            # one: `write_json_atomic` runs in a thread that no cancellation stops, so the request may be at
+            # the peer after all — then its attachments stay for the peer to read, and D-16's forum sweep
+            # clears what an exchange never finished. With no request at the peer, nothing may stay.
+            if await _peek(path) is None:
+                await self._remove_from_forum(copied)
+                ex.attachments.clear()
             raise
-        ex.attachments.extend(by_name)
-        req = self._envelope(ex.rid, ex.dst, name, params, timeout, list(by_name))
-        reason = validate("request", req)
-        if reason is not None:
-            await self._remove_from_forum(copied)  # the call is refused: nothing stays in forum
-            raise ValueError(f"requestor: built an invalid request for {ex.dst}/{name}: {reason}")
-        path = os.path.join(ex.inbox, f"{ex.rid}.json")
-        await write_json_atomic(path, req, ctx.folders.agent, ctx.sync)
         return req
 
     async def _remove_from_forum(self, names: list[str]) -> None:
@@ -241,24 +284,12 @@ class Requestor:
 
     # -- B2 ---------------------------------------------------------------
 
-    async def _finish(
-        self, ex: _Outbound, sub: FolderWatch, timeout: float, cancel: asyncio.Event | None
-    ) -> RequestOutcome:
-        """An exchange whose caller went away, ended in the background: the same B2 loop with `give_up`
-        set, and the subscription released only when it settles (D-18: the destination inbox stays
-        watched until the exchange ends, whoever is watching it)."""
-        try:
-            return await self._loop(ex, sub, timeout, cancel, give_up=True)
-        finally:
-            self._watch.unsubscribe(sub)
-
     async def _loop(
         self,
         ex: _Outbound,
         sub: FolderWatch,
         timeout: float,
         cancel: asyncio.Event | None,
-        give_up: bool = False,
     ) -> RequestOutcome:
         clock = self._ctx.config.clock
         deadline = clock() + timeout if timeout > 0 else None
@@ -273,7 +304,7 @@ class Requestor:
                 self._hooks.on_watch_error(ex.inbox, sub.lost)
                 return await self._settle(ex, "abandoned", None)
             due = (
-                give_up
+                ex.give_up
                 or (cancel is not None and cancel.is_set())
                 or (deadline is not None and clock() >= deadline)
             )

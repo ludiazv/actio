@@ -401,12 +401,12 @@ class CancelledCallerTest(RequestorTestCase):
         background — and to end it, whoever is watching must still be watching the destination inbox
         (D-18: subscribed before the write, and the folder stays watched until the exchange ends). A peer
         that answers the cancellation after the caller is gone ends the exchange `cancelled` with its
-        response on the line; the finisher is released from the watch only then, so the watcher holds no
+        response on the line; the exchange task leaves the watch only then, so the watcher holds no
         folder afterwards.
 
         The cancel-wait timeout is deliberately long here: the loop re-polls the folder when it expires, so
-        with the default the answer would be found by polling and the test would pass on a finisher that
-        watches nothing. At 8 s the answer has to arrive on a wake-up."""
+        with the default the answer would be found by polling and the test would pass on an exchange
+        task that watches nothing. At 8 s the answer has to arrive on a wake-up."""
         # the config is frozen: a copy with a long cancel wait (see the docstring: no polling rescue)
         self.ctx.config = replace(self.ctx.config, cancel_wait_timeout=8.0)
         t = asyncio.create_task(self.requestor.request("summarizer", "summarize", timeout=0))
@@ -417,7 +417,8 @@ class CancelledCallerTest(RequestorTestCase):
             await t
         await self._wait_for_files(self.peer_inbox, 2)  # our request, then our cancellation
         ex = self.requestor._exchanges[rid]
-        self.assertIsNotNone(ex.task)  # the finisher is the one watching the inbox now
+        # The exchange task is still the one watching the inbox.
+        self.assertIsNotNone(ex.task)
         assert ex.task is not None  # for mypy: the line above already failed if it was
         self.assertFalse(ex.task.done())
         await asyncio.sleep(0.1)  # one pass, then it sleeps in the watch: the answer must wake it
@@ -430,7 +431,8 @@ class CancelledCallerTest(RequestorTestCase):
         lines = self._outreq_lines()
         self.assertEqual([d["final_status"] for d in lines], ["cancelled"])
         self.assertTrue(lines[0]["res"]["response"]["cancellation"])
-        self.assertEqual(self.watcher._folders, {})  # the finisher released the folder it watched
+        # The exchange task released the folder it watched.
+        self.assertEqual(self.watcher._folders, {})
 
     async def test_a_live_caller_releases_the_folder_it_watched(self) -> None:
         """The other half: an exchange the caller *waited for* releases its subscription too, so the
@@ -581,7 +583,7 @@ class SettlementTest(RequestorTestCase):
         ]
 
     def _armed(self) -> set[str]:
-        # the lane's own tasks: the finisher and the settlement. The watcher's audit task is the
+        # the lane's own tasks: the exchanges and the settlements. The watcher's audit task is the
         # watcher's, and the test closes it.
         return {n for n in task_names() if n.startswith(("actio.out.", "actio.settle."))}
 
@@ -592,7 +594,7 @@ class SettlementTest(RequestorTestCase):
         caller.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await caller
-        # The background finisher does B4, waits out the cancel, and is inside the append by now.
+        # The exchange task went on without its caller: B4, the cancel wait, and inside the append now.
         await asyncio.wait_for(self.disk.appending.wait(), WAKE)
         await self.requestor.stop()
         self.assertEqual(await self._statuses_on_disk(), ["abandoned"])

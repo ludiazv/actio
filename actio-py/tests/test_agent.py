@@ -226,6 +226,13 @@ def announce_files(root: Path, agent: str = AGENT) -> list[Path]:
     return sorted((root / "nuntium").glob(f"{agent}.*.json"))
 
 
+def _record_rid(line: DiariumEntry) -> str | None:
+    """The rid of the exchange a diarium line records (`req.rid`), or None for a line that records none."""
+    data = line["event_data"]
+    req = data.get("req") if isinstance(data, dict) else None
+    return req.get("rid") if isinstance(req, dict) else None
+
+
 def lines(root: Path, agent: str = AGENT) -> list[DiariumEntry]:
     """The diarium's lines in file order: the order the rules assert on is the file's order."""
     path = root / agent / "diarium.jsonl"
@@ -394,7 +401,7 @@ class StopTest(AgentTest):
             with contextlib.suppress(BaseException):
                 await asyncio.gather(*tasks, return_exceptions=True)
             await wait_for(
-                "the background finishers to end",
+                "the background exchange tasks to end",
                 lambda: (
                     not any(
                         not t.done() and t.get_name().startswith("actio.out.")
@@ -1385,7 +1392,7 @@ class TwoAgentTest(AgentTest):
                 lambda: any(p.name.endswith(".json") for p in inbox_dir(root, PEER).iterdir()),
                 timeout=WATCH_SETTLE,
             )
-            # Cancel `alpha`'s task: the background finisher writes the `.can.json`.
+            # Cancel `alpha`'s task: its exchange task writes the `.can.json` (semantics 1).
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
@@ -1415,9 +1422,9 @@ class TwoAgentTest(AgentTest):
                 ),
                 timeout=WATCH_SETTLE,
             )
-            # Nothing is armed on either side afterwards: the finisher ended, the inbox is empty.
+            # Nothing is armed on either side afterwards: the exchange task ended, the inbox is empty.
             await wait_for(
-                "the background finisher to end and beta's inbox to empty",
+                "the exchange task to end and beta's inbox to empty",
                 lambda: (
                     not any(
                         not t.done() and t.get_name().startswith("actio.out.")
@@ -1556,6 +1563,146 @@ class TwoAgentTest(AgentTest):
                 release.set()
                 call.cancel()
                 await asyncio.gather(call, return_exceptions=True)
+
+    # --- D-18: the exchange is one task, whoever cancels the caller --------------------------------
+
+    async def test_a_caller_cancelled_inside_the_request_s_write_still_ends_the_exchange(
+        self,
+    ) -> None:
+        """D-18 and semantics 1: B1 through B5 run as one exchange task, so a caller's cancellation cannot
+        land inside the request's write, nor cut the wait for the answer short. Cancelled before the write,
+        in the middle of it, just after it, and after the answer: every request `beta` served leaves exactly
+        one `outreq` line in `alpha`'s diarium, `beta`'s inbox is empty again, and `alpha`'s forum holds
+        nothing — the attachment included. The offsets and the attachment are the probe's shape; the slow
+        write is the test's seam, not a hook in the library."""
+        for offset in (0.0, 0.0002, 0.005, None):
+            with self.subTest(offset=offset):
+                await self._cancelled_caller_round(offset)
+
+    async def _cancelled_caller_round(self, offset: float | None) -> None:
+        """One round of the row above: the caller of one exchange is cancelled `offset` into the request's
+        write, or after the answer for `None`."""
+        import actio._files as files_mod
+        import actio._requestor as requestor_mod
+
+        real_write = files_mod.write_json_atomic
+
+        def served(line: DiariumEntry, r: str) -> bool:
+            data = cast("dict[str, Any]", line["event_data"])
+            req = data.get("req")
+            return isinstance(req, dict) and req.get("rid") == r
+
+        async with self.tree() as root:
+            alpha, _ = await self.boot(root)
+            beta, _ = self.build_peer(root, caps={"echo": echo_handler})
+            await beta.start()
+            await self._see(alpha, "echo")
+            attach = root / "attach.txt"
+            attach.write_bytes(b"an attachment of a request whose caller goes away")
+            started: list[str] = []
+
+            async def slow_request_write(path: str, obj: Any, tmp_dir: str, provider: Any) -> None:
+                name = Path(path).name
+                if Path(path).parent == inbox_dir(root, PEER) and name.count(".") == 1:
+                    started.append(name[: -len(".json")])
+                    await asyncio.sleep(0.02)  # the request's write is slow: cancel inside it
+                await real_write(path, obj, tmp_dir, provider)
+
+            with mock.patch.object(requestor_mod, "write_json_atomic", slow_request_write):
+                call = asyncio.create_task(
+                    alpha.request(PEER, "echo", {"n": 1}, timeout=0, attachments=[str(attach)])
+                )
+                await wait_for(
+                    "alpha's request to reach beta's inbox",
+                    lambda: bool(started),
+                    timeout=WATCH_SETTLE,
+                )
+                r = started[0]
+                if offset is None:
+                    # The caller goes away after the answer: only the line is outstanding.
+                    await wait_for(
+                        "beta's inreq line for the request",
+                        lambda: self._served(lines(root, PEER), "inreq", r),
+                        timeout=WATCH_SETTLE,
+                    )
+                else:
+                    await asyncio.sleep(offset)
+                call.cancel()
+                await asyncio.gather(call, return_exceptions=True)
+            # The request reached `beta` whatever the offset, and `beta` served it: the caller's
+            # cancellation cannot interrupt B1, which is what the offsets are there to show.
+            await wait_for(
+                "beta's inreq line for the request",
+                lambda: self._served(lines(root, PEER), "inreq", r),
+                timeout=WATCH_SETTLE,
+            )
+            await wait_for(
+                "alpha's outreq line for the request",
+                lambda: self._served(lines(root), "outreq", r),
+                timeout=WATCH_SETTLE,
+            )
+            await asyncio.sleep(0.3)  # a settlement that ran twice would have added its line by now
+            self.assertEqual(self._count(lines(root), "outreq", r), 1)
+            # Nothing is left behind: `beta`'s inbox is empty again, `alpha`'s forum holds nothing.
+            await wait_for(
+                "beta's inbox empty again",
+                lambda: not list(inbox_dir(root, PEER).glob(f"{r}*")),
+                timeout=WATCH_SETTLE,
+            )
+            self.assertEqual(list((root / "forum").iterdir()), [])
+
+    @staticmethod
+    def _served(entries: list[DiariumEntry], event: str, r: str) -> bool:
+        return any(line["event"] == event and _record_rid(line) == r for line in entries)
+
+    @staticmethod
+    def _count(entries: list[DiariumEntry], event: str, r: str) -> int:
+        return sum(1 for line in entries if line["event"] == event and _record_rid(line) == r)
+
+    async def test_a_stop_while_the_request_is_still_written_owes_no_line(self) -> None:
+        """D-9 (4) and D-18: the agent stops while a request's write is still in flight. The exchange
+        reached no peer, so no `outreq` line is owed and none is written; `alpha` still publishes
+        `inactive`, its forum keeps nothing, and the request never reaches `beta`."""
+        import actio._files as files_mod
+        import actio._requestor as requestor_mod
+
+        real_write = files_mod.write_json_atomic
+        started, release = [], asyncio.Event()
+
+        async with self.tree() as root:
+            alpha, _ = await self.boot(root)
+            beta, _ = self.build_peer(root, caps={"echo": echo_handler})
+            await beta.start()
+            await self._see(alpha, "echo")
+            attach = root / "attach.txt"
+            attach.write_bytes(b"an attachment whose request never arrives")
+
+            async def held_write(path: str, obj: Any, tmp_dir: str, provider: Any) -> None:
+                name = Path(path).name
+                if Path(path).parent == inbox_dir(root, PEER) and name.count(".") == 1:
+                    started.append(name[: -len(".json")])
+                    await release.wait()  # the write is still in flight when `stop()` comes
+                await real_write(path, obj, tmp_dir, provider)
+
+            with mock.patch.object(requestor_mod, "write_json_atomic", held_write):
+                call = asyncio.create_task(
+                    alpha.request(PEER, "echo", {"n": 1}, timeout=0, attachments=[str(attach)])
+                )
+                await wait_for(
+                    "the request's write to start", lambda: bool(started), timeout=WATCH_SETTLE
+                )
+                try:
+                    await asyncio.wait_for(asyncio.shield(alpha.stop()), 10.0)
+                finally:
+                    release.set()
+                    await asyncio.gather(call, return_exceptions=True)
+            self.assertEqual(doc(status_path(root))["status"], "inactive")
+            # Nothing was owed for a request that never reached its peer, and nothing was written.
+            self.assertEqual(
+                [line["event"] for line in lines(root) if line["event"] == "outreq"], []
+            )
+            self.assertEqual(self._count(lines(root, PEER), "inreq", started[0]), 0)
+            self.assertEqual(list((root / "forum").iterdir()), [])
 
     # --- D-9's bound on the receiver's last phase ---------------------------------------------------
     #
