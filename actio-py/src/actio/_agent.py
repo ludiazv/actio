@@ -222,6 +222,7 @@ class ActioAgent:
         self._lifecycle_task: asyncio.Task[Any] | None = None
         self._restart_task: asyncio.Task[Any] | None = None
         self._stopping_restart = False  # the restart's own stop must not cancel the restart
+        self._stop_wanted = False  # a caller's `stop`, recorded before the step queues (D-9, D-10)
         self._stopped_for_good = asyncio.Event()
         self._tasks: set[asyncio.Task[Any]] = set()  # the strong references of `_spawn`
 
@@ -314,6 +315,9 @@ class ActioAgent:
 
     async def stop(self, *, force: bool = False) -> None:
         """D-9's order; after it nothing of ours is armed: no task, timer, watcher or thread."""
+        # The intent goes in before the step is queued. The lifecycle chain can put this step behind a
+        # restart's own teardown, and a restart in flight must not outrank a caller who asked to stop.
+        self._stop_wanted = True
         await asyncio.shield(self._lifecycle(self._stop_impl(force), "actio.stop"))
 
     async def wait_stopped(self) -> None:
@@ -349,6 +353,7 @@ class ActioAgent:
         # Steps 1-5 in the protocol's order: folders, spec, status, diarium, inbox, announce,
         # then the watchers and the first scan. A failure drops what it armed (D-9).
         config = self._config_option if self._config_option is not None else load_config()
+        self._stop_wanted = False  # a fresh run: the previous run's stop request is spent
         folders = AgentFolders(
             root=config.root,
             agent=os.path.join(config.root, self._id),  # D-1: the folder name is the id
@@ -731,9 +736,19 @@ class ActioAgent:
         self._stopped_for_good.clear()
         try:
             self._stopping_restart = True
-            await self.stop(force=force)
+            # The restart's own teardown: the same lifecycle step as `stop()`, but not a caller's stop,
+            # which is what `_stop_wanted` is for; going through `stop()` would record one here.
+            await asyncio.shield(self._lifecycle(self._stop_impl(force), "actio.stop"))
             self._stopping_restart = False
+            if self._stop_wanted:
+                # D-9: nothing of ours is armed when a caller's `stop()` returns, so a restart does not
+                # sleep or start behind that caller's back, whichever phase of it the call landed in.
+                self._stopped_for_good.set()
+                return
             await asyncio.sleep(min(max(0.0, delay_seconds), RESTART_DELAY_MAX))
+            if self._stop_wanted:
+                self._stopped_for_good.set()
+                return
             await self.start()
         except BaseException:
             self._stopped_for_good.set()

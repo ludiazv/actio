@@ -589,16 +589,17 @@ class RestartTest(AgentTest):
             self.assertFalse(agent._running())
 
     async def test_a_stop_during_a_restart_delay_cancels_the_restart(self) -> None:
-        """D-10: *"a `stop` during the delay cancels the restart and ends `wait_stopped()`"*. The delay
-        window is after the restart's own `inactive` and before the fresh start, and its run is already
-        stopped — so a `stop` that looked only at the run would find nothing to do and let the agent come
-        back behind the caller's back. The base class's leftover check is half of this test: a restart task
-        still sleeping is still armed."""
+        """D-10: *"a `stop` during the delay cancels the restart and ends `wait_stopped()`"*. The window
+        opens inside the restart's own teardown — its `inactive` is on disk before the sleep — and closes
+        when the fresh `start` begins, and the run is stopped throughout. A `stop` that looked only at the
+        run would find nothing to do and let the agent come back behind the caller's back. The delay is
+        long on purpose, so that load cannot close the window on its own; the base class's leftover check
+        is half the test, since a restart still sleeping is still armed."""
         with actio_tree() as root:
             agent, _ = await self.boot(root)
             write_file(
                 inbox_dir(root) / f"{rid(1)}.json",
-                cmd_file(rid(1), "restart", {"force": False, "delay": 0.4}),
+                cmd_file(rid(1), "restart", {"force": False, "delay": 10.0}),
             )
             await wait_for(
                 "the restart's stop: `inactive` on disk, the delay running",
@@ -609,7 +610,6 @@ class RestartTest(AgentTest):
             stopped = asyncio.create_task(agent.wait_stopped())
             await agent.stop()
             await asyncio.wait_for(stopped, SETTLE)
-            # Longer than the delay: the cancelled restart must not start anything.
-            await asyncio.sleep(0.8)
             self.assertFalse(agent._running())
             self.assertEqual(doc(status_path(root))["status"], "inactive")
+            self.assertIsNone(agent._restart_task)  # the delay is 10 s: it is not merely sleeping
