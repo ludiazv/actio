@@ -111,15 +111,20 @@ class Requestor:
             raise
         self._exchanges[ex.rid] = ex
         self._hooks.on_state_change()
+        watching = True  # whose hands the subscription is in: mine, or the finisher's
         try:
-            return await self._drive(ex, sub, timeout, cancel)
+            return await self._loop(ex, sub, timeout, cancel)
         except (asyncio.CancelledError, TimeoutError):
             # The caller is gone; the exchange still ends correctly in the background (semantics 1).
-            # The exchange holds the task, so the finisher stays referenced while it is live.
-            ex.task = self._spawn(
-                self._drive(ex, sub, timeout, cancel, give_up=True), f"actio.out.{ex.rid}"
-            )
+            # The exchange holds the task, so the finisher stays referenced while it is live — and it
+            # takes the subscription with it: the answer it waits for is in the folder that
+            # subscription watches (D-18), so releasing it here would leave the finisher blind.
+            watching = False
+            ex.task = self._spawn(self._finish(ex, sub, timeout, cancel), f"actio.out.{ex.rid}")
             raise
+        finally:
+            if watching:
+                self._watch.unsubscribe(sub)
 
     async def command(self, dst: AgentId, name: str, params: Any = None) -> Rid:
         """Write the command and return its rid: a command is never answered and is not tracked."""
@@ -236,17 +241,14 @@ class Requestor:
 
     # -- B2 ---------------------------------------------------------------
 
-    async def _drive(
-        self,
-        ex: _Outbound,
-        sub: FolderWatch,
-        timeout: float,
-        cancel: asyncio.Event | None,
-        give_up: bool = False,
+    async def _finish(
+        self, ex: _Outbound, sub: FolderWatch, timeout: float, cancel: asyncio.Event | None
     ) -> RequestOutcome:
-        """The B2 loop and its tail, ending with the unsubscribe; `give_up` says the caller went away."""
+        """An exchange whose caller went away, ended in the background: the same B2 loop with `give_up`
+        set, and the subscription released only when it settles (D-18: the destination inbox stays
+        watched until the exchange ends, whoever is watching it)."""
         try:
-            return await self._loop(ex, sub, timeout, cancel, give_up)
+            return await self._loop(ex, sub, timeout, cancel, give_up=True)
         finally:
             self._watch.unsubscribe(sub)
 
