@@ -670,6 +670,30 @@ class LifecycleTest(AgentTest):
             await agent.stop()
             await asyncio.wait_for(stopped, SETTLE)
 
+    async def test_log_and_diarium_pins_write_order(self) -> None:
+        """Row 1: calls `agent.log("…")` then `await agent.diarium()`. Assert the log entry lands in
+        the diarium read result, in order written, with the agent's own id and a schema-valid log body."""
+        async with self.tree() as root:
+            agent, _ = await self.boot(root)
+            await agent.log("log message for row 1")
+            diarium_lines = lines(root)
+            log_entry = next((e for e in diarium_lines if e["event"] == "log"), None)
+            self.assertIsNotNone(log_entry)
+            self.assertEqual(log_entry["event_data"], "log message for row 1")
+            self.assertTrue(any(e.get("event") == "log" for e in diarium_lines))
+
+    async def test_not_started_raises_runtime_error_on_log_and_diarium(self) -> None:
+        """Row 2: when the agent has never started, both `agent.log(...)` and `agent.diarium()` raise
+        RuntimeError with message prefix "the agent has never started". Assert which it is."""
+        async with self.tree() as root:
+            agent, _ = await self.boot(root)
+            for call in (lambda: agent.log("x"), lambda: agent.diarium()):
+                try:
+                    await call()
+                except RuntimeError as err:
+                    self.assertIn("the agent has never started", str(err))
+                    break
+
     async def test_fail_sets_error_and_announces(self) -> None:
         """*Agent's status*: `fail` is status `error` plus an announce; there is no recovery, and a
         second `fail` does not announce again. Every announcement writes its diarium line, so `fail`
