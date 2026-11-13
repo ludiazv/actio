@@ -287,7 +287,7 @@ def inreq_line(read: DiariumRead, rid: str) -> dict[str, Any]:
 class E2ETest(ActioTestCase):
     """Two live agents in one temporary tree, talking through the folders.
 
-    The tree outlives its agents (P-15's form here is `addAsyncCleanup(agent.stop)`): every
+    The tree outlives its agents — `addAsyncCleanup(agent.stop)` is the form here: every
     agent a row started is stopped before the temporary root is removed, and a second `stop()`
     is a no-op, so a row that stopped its agents already loses nothing. The inbox recorder is
     the same way: started by the row, stopped by `assert_exchange` (or the teardown if the row
