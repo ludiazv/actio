@@ -1589,15 +1589,19 @@ class E2ETest(ActioTestCase):
                 CALL_BOUND,
                 "the restart command",
             )
-            # (1) the archive, before the shutdown: the `inreq` line `completed`, the file gone
+            # (1) the archive, before the shutdown: the `inreq` line `completed`, and the file gone. D3
+            # does both and does not say which happens first — the record lands and the deletions follow,
+            # so both are waited for under one bound instead of the second being asserted off the first.
+            # Slow every deletion on disk by 50 ms and the asserted form fails while the waited form
+            # does not: that is how this line was written wrong the first time, and it is what the gate's
+            # slow-disk row exists to catch.
             await until(
-                "the restart to be archived",
-                lambda: inreq_final(root, BETA, cmd_rid) == "completed",
+                "the restart to be archived: its record, and the envelope deleted",
+                lambda: (
+                    inreq_final(root, BETA, cmd_rid) == "completed"
+                    and not (root / BETA / "inbox" / f"{cmd_rid}.json").exists()
+                ),
                 CALL_BOUND,
-            )
-            self.assertFalse(
-                (root / BETA / "inbox" / f"{cmd_rid}.json").exists(),
-                "the archived command file is gone",
             )
             # (2) inactive, with its announce: the status first, then the announce line, then
             # the file (C1's order, the line before the file)

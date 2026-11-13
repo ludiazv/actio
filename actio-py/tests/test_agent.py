@@ -1175,8 +1175,13 @@ class CommandTest(AgentTest):
                 seen, [(r, PEER, {"a": 1})], "the handler got the envelope it was sent"
             )
             self.assertEqual(self._inreq_final(root), ["completed"])
-            self.assertFalse(
-                (inbox_dir(root) / f"{r}.json").exists(), "D3: the envelope is archived"
+            # D3 does two things and does not fix their order: the record lands first and the deletions
+            # follow, so the envelope's disappearance is waited for, not assumed. Slow the deletions and an
+            # assertion written against the line would see the file still there.
+            await wait_for(
+                "the envelope's deletion, which D3 does after the record",
+                lambda: not (inbox_dir(root) / f"{r}.json").exists(),
+                timeout=WATCH_SETTLE,
             )
 
     async def test_a_custom_command_registered_before_start_runs_too(self) -> None:
