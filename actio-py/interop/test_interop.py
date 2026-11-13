@@ -153,8 +153,8 @@ class _Child:
             with _suppress():
                 stream.close()
 
-    def stop(self) -> tuple[str, str]:
-        """SIGTERM, then SIGKILL at the bound; return the drained stdout/stderr."""
+    def stop(self) -> tuple[int, str, str]:
+        """SIGTERM, then SIGKILL at the bound; return the exit code and the drained stdout/stderr."""
         self.proc.terminate()
         try:
             self.proc.wait(timeout=STOP_BOUND)
@@ -163,7 +163,7 @@ class _Child:
             self.proc.wait(timeout=STOP_BOUND)
         self._t_out.join(timeout=DRAIN_BOUND)
         self._t_err.join(timeout=DRAIN_BOUND)
-        return "".join(self._out), "".join(self._err)
+        return self.proc.returncode, "".join(self._out), "".join(self._err)
 
 
 class _suppress:
@@ -219,13 +219,17 @@ class InteropTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        ts_out, ts_err = cls.ts.stop()
-        py_out, py_err = cls.py.stop()
-        # a child that dies mid-run leaves its noise on its pipes: check both sides
-        for name, text in (
-            (TS_AGENT, ts_out + ts_err),
-            (PY_AGENT, py_out + py_err),
+        ts_code, ts_out, ts_err = cls.ts.stop()
+        py_code, py_out, py_err = cls.py.stop()
+        # `examples/echo_agent.py:5`: SIGINT/SIGTERM is "graceful … then exits 0" on either side. A child
+        # that came back any other way died, and the reason is on its pipes — not in the row that killed it,
+        # which is why this is checked where the children are reaped, at the end.
+        for name, code, text in (
+            (TS_AGENT, ts_code, ts_out + ts_err),
+            (PY_AGENT, py_code, py_out + py_err),
         ):
+            assert code == 0, f"{name} exited {code}, not 0: {text[-400:]!r}"
+            # a child that dies mid-run leaves its noise on its pipes: check both sides
             for needle in NOISE:
                 assert needle not in text, f"noise {needle!r} in {name}: {text[:300]!r}"
         import shutil
