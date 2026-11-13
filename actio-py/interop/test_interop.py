@@ -563,8 +563,10 @@ class InteropTest(unittest.TestCase):
             )
         # the two `ignored` lists name the same files: the protocol makes the *path* visible (a
         # file that is there and wrong), so the paths are compared. The *reason* wording is not
-        # compared — this side carries the parser's error (D-15) and the reference a flat string,
-        # and which wording the protocol fixes is an open question — so it is reported, not asserted.
+        # compared: `../actio-ts/src/diarium.ts:68` documents its ignored reasons as `"not valid
+        # JSON"` or the first schema error, while this side carries the parser's own message (the
+        # same one-line rule as D-15). Which wording the protocol fixes is open, so the reasons are
+        # printed, not asserted.
         self.assertEqual(
             sorted(i["path"] for i in py["ignored"]),
             sorted(i["path"] for i in ts["ignored"]),
