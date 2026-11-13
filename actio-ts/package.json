@@ -2,19 +2,44 @@
   "name": "actio-ts",
   "version": "0.1.0",
   "description": "TypeScript implementation of the Actio protocol v0.1, core conformance profile",
+  "license": "BSD-3-Clause",
   "type": "module",
   "private": true,
+  "author": "ldiaz",
+  "keywords": [
+    "actio",
+    "agent-protocol",
+    "multi-agent",
+    "orchestration",
+    "file-based",
+    "typescript"
+  ],
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "CONFORMANCE.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "gen": "tsx scripts/gen-schemas.ts",
-    "typecheck": "npm run gen && tsc --noEmit",
-    "test": "npm run gen && node --import tsx --test \"test/**/*.test.ts\"",
-    "check": "npm run gen && tsc --noEmit && node --import tsx --test \"test/**/*.test.ts\"",
+    "gen:check": "tsx scripts/gen-schemas.ts --check",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "npm run gen:check && tsc --noEmit",
+    "test": "npm run gen:check && node --import tsx --test \"test/**/*.test.ts\"",
+    "check": "npm run gen:check && tsc --noEmit && node --import tsx --test \"test/**/*.test.ts\"",
+    "check:publish": "npm run check && npm run blackbox && npm run build && node scripts/pack-smoke.mjs",
+    "prepublishOnly": "npm run check:publish",
     "actio": "tsx src/cli.ts",
     "echo": "tsx examples/echo-agent.ts",
     "blackbox": "node test/blackbox/blackbox.mjs"

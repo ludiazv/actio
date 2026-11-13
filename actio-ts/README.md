@@ -4,17 +4,29 @@ A simple TypeScript implementation of the [Actio protocol](../doc/actio_protocol
 
 Actio is a file-based agent coordination protocol: a team of agents (*agmen*) shares one `.actio` directory. Each agent publishes `spec.json` and `status.json`, announces in `nuntium/`, and exchanges request/response envelopes (`<rid>.json`, `.can.json`, `.res.json`, `.con.json`) through its `inbox/`. Everything is JSON files on a watchable file system — no broker, no sockets.
 
+## The protocol is public — and it is still a draft
+
+- **Public by design.** The 11 JSON Schemas of the core profile are embedded **verbatim** in `src/generated/schemas.ts`, so this package *is* the wire format: fields, enums, id patterns, envelope names and error codes — and with `src/io.ts`, the whole file layout too. Anyone who installs it can build an interoperable implementation. Published copies are permanent (registry, mirrors, everyone's `node_modules`). The revision of record is the **SHA-256 list in that file's header**, which pins the exact `doc/schemas/` files implemented.
+- **The security layer is unspecified, not merely unimplemented.** `doc/actio_protocol.md` §*Security* reads *PENDING SPECIFICATION OF THE CRYPTOGRAPHIC PROTOCOL*: no keys, no signing, no certificate issuer, no codes 200–299. This profile is `security_posture: "trusted"` with `signature: null` — **every envelope is unsigned and unauthenticated**. Write access to the shared `.actio` root *is* peer authority: never put untrusted agents in one root, and never feed a capability `description` authored by an untrusted peer into an LLM planner — it is untrusted text by design, with no isolation in this profile.
+- **The schemas are shapes, not the spec.** The normative rules the schemas cannot express — one header per exchange except `datetime`, cancellation `name` equals request `name`, capability names unique per agent, `result`/`parameters` validated against the *receiver's* `spec.json`, announce agent-ID equals its writer — and the whole lifecycle semantics live in the prose spec, which is not part of this package.
+
 ## Install & requirements
 
 - **Node.js ≥ 22** (npm). `npm ci` installs the dependencies (runtime: only `ajv`; dev: `typescript`, `json-schema-to-typescript`, `tsx`, `@types/node`).
-- The schemas drive the code: `src/generated/` (schemas + interfaces) is **generated** from `../doc/schemas/` and is git-ignored — every build/test/typecheck runs `npm run gen` first.
+- The schemas drive the code: `src/generated/` (schemas + interfaces) is **generated** from `../doc/schemas/` and **committed** — a published package cannot regenerate it (the generator reads a directory outside the package and needs devDependencies). The ordinary commands only *verify* it (`npm run gen:check`, byte-exact); `npm run gen` is the explicit "I intend to regenerate" step.
+- Import `actio-ts` (the package entry is the compiled `dist/index.js` + `dist/index.d.ts`); `src/` ships as source for readable traces.
 
 ```sh
-npm ci          # install
-npm run gen     # regenerate src/generated from ../doc/schemas (deterministic)
-npm run check   # gen + tsc --noEmit + the full test suite
-npm run blackbox # the independent black-box run (echo agent as a child process, envelopes by hand)
+npm ci            # install
+npm run check     # gen:check + tsc --noEmit + the full test suite
+npm run blackbox  # the independent black-box run (echo agent as a child process, envelopes by hand)
+npm run build     # dist/: ESM + .d.ts + source maps — the entry of the published package
+npm run check:publish  # the release gate: check, blackbox, build, and the tarball smoke below
 ```
+
+`scripts/pack-smoke.mjs` (run by `check:publish`) packs the tarball, installs it into a temp directory with
+`--omit=dev` — exactly what a consumer gets — and drives it from **plain Node**: no tsx, no jiti, no path
+into this repository. It is the check that catches "works in the repo, broken when installed".
 
 `test/blackbox/blackbox.mjs` imports no actio-ts code: it writes the protocol files by hand and validates every file the agent produces with its own Ajv built from `../doc/schemas/`. Run it after any change to protocol behavior.
 
@@ -183,4 +195,23 @@ Implementation rules: **I-1** the mutagen `onError` hook; **I-2** every written 
 
 ## Regenerating the schemas
 
-`npm run gen` re-embeds `../doc/schemas/*.schema.json` into `src/generated/schemas.ts` (unmodified, keyed by `$id`, with a SHA-256 header) and regenerates `src/generated/types.ts` via json-schema-to-typescript with fixed interface names. The generator compiles every schema with Ajv `strict: true` first — a schema that fails strict mode fails the build. The output is deterministic (byte-identical across runs); `src/generated/` is never hand-edited.
+`npm run gen` re-embeds `../doc/schemas/*.schema.json` into `src/generated/schemas.ts` (unmodified, keyed by `$id`, with a SHA-256 header) and regenerates `src/generated/types.ts` via json-schema-to-typescript with fixed interface names. The generator compiles every schema with Ajv `strict: true` first — a schema that fails strict mode fails the build. The output is deterministic (byte-identical across runs); `src/generated/` is never hand-edited, and `npm run gen:check` exits non-zero if the committed files drift from `doc/schemas/` (it is also how `pack-smoke` proves the *published* schemas are the current ones).
+
+## Packaging & publishing
+
+`npm run check:publish` is the whole gate, in order: `gen:check` → typecheck → 330 tests → the black-box run
+→ build → tarball smoke. It must be green, from this monorepo layout, under `orchestra/env.sh` (real Node —
+the Bun shim cannot run the suite). `package.json` `files` is an allowlist (`dist`, `src`, README,
+CONFORMANCE, CHANGELOG, LICENSE): with no allowlist npm publishes *anything not gitignored*, including the
+whole test tree and its protocol vectors. `private` stays `true` until the publish commit itself: publishing
+is a human act, and `prepublishOnly` re-runs the gate one last time. See `npm-publish-proposal.md` for the
+full runbook and the decisions behind it.
+
+## License
+
+BSD 3-Clause — see `LICENSE`. It covers the code **and** the protocol schemas embedded verbatim in
+`src/generated/schemas.ts`, which are part of the published artifact. Two gaps worth knowing for a
+protocol rather than a library: BSD-3-Clause has **no explicit patent grant**, and its third clause only
+bars others from using the copyright holder's name to *endorse* derivatives — it reserves nothing about the
+name **Actio** itself. If the protocol name matters, that has to be handled separately (trademark, and a
+specification license for the schema data with an attribution statement).

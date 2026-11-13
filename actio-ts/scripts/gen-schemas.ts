@@ -218,7 +218,22 @@ let typesTs = header(
 );
 for (const name of order) typesTs += `${declarations.get(name)}\n`;
 
-fs.mkdirSync(outDir, { recursive: true });
-fs.writeFileSync(path.join(outDir, "schemas.ts"), schemasTs);
-fs.writeFileSync(path.join(outDir, "types.ts"), typesTs);
-console.error(`gen: wrote schemas.ts (${files.length} schemas) and types.ts (${order.length} declarations)`);
+// `--check` verifies without writing: `src/generated/` is committed (a published package cannot
+// regenerate itself — the schemas live in ../doc/schemas and the generator needs devDependencies), so the
+// ordinary build must never rewrite it. Generation is deterministic, so this is a byte comparison.
+const outputs: [string, string][] = [
+  [path.join(outDir, "schemas.ts"), schemasTs],
+  [path.join(outDir, "types.ts"), typesTs],
+];
+if (process.argv.includes("--check")) {
+  const drift = outputs.filter(([f, text]) => !fs.existsSync(f) || fs.readFileSync(f, "utf8") !== text);
+  if (drift.length > 0) {
+    for (const [f] of drift) console.error(`gen:check: DRIFT in ${path.relative(projectDir, f)} — run \`npm run gen\``);
+    process.exit(1);
+  }
+  console.error(`gen:check: up to date — ${files.length} schemas, ${order.length} declarations, SHAs match ${schemasDir}`);
+} else {
+  fs.mkdirSync(outDir, { recursive: true });
+  for (const [f, text] of outputs) fs.writeFileSync(f, text);
+  console.error(`gen: wrote schemas.ts (${files.length} schemas) and types.ts (${order.length} declarations)`);
+}
