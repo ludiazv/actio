@@ -1,7 +1,8 @@
 """The end-to-end suite, scenarios E1–E9: the request scenarios, on real temporary `.actio` roots.
 
 Two live `ActioAgent`s in one tree (alpha on the requestor side, beta on the receiver side),
-through the public API only — no `actio._*` import, no patched internals. Every scenario asserts
+through the public API only — no `actio._*` import beyond the `ulid()` generator for the
+hand-written ids, no patched internals. Every scenario asserts
 the four standing properties: (a) the order of the files that appeared in the receiver's inbox,
 (b) the inbox empty when the exchange is archived, (c) every diarium line of both agents
 validates and the `inreq`/`outreq` `final_status` values, (d) attachments cleaned per *Envelope
@@ -36,6 +37,7 @@ from actio import (
     load_config,
     read_diarium,
 )
+from actio._util import ulid
 from helpers import ActioTestCase, InboxRecorder, actio_tree, bounded, until
 
 ALPHA = "alpha"
@@ -211,7 +213,7 @@ def write_request(
 ) -> str:
     """One request file into `dst`'s inbox, fresh `ts` by default: the answer must be the A0
     code, not 108. Returns the `rid`."""
-    rid = "01JB7Q3W8K2M4N6P8R0S2T4V" + f"{secrets.randbelow(256):02X}"
+    rid = ulid()
     req = {
         "rid": rid,
         "src": src,
@@ -366,7 +368,7 @@ def write_command(
 
     `malformed` drops the body's `name`: the file then fails the request schema (*Strict format*)
     and is ignored before any gate — E11's third sub-row. Returns the `rid`."""
-    rid = "01JB7Q3W8K2M4N6P8R0S2T4V" + f"{secrets.randbelow(256):02X}"  # a valid Crockford ULID
+    rid = ulid()  # a valid Crockford ULID
     body: dict[str, Any] = {
         "ts": int(time.time()),
         "nonce": secrets.token_hex(16),
@@ -1783,10 +1785,10 @@ class E2ETest(ActioTestCase):
                 )
 
             # (1) a file that is not valid JSON at all
-            rid = "01JB7Q3W8K2M4N6P8R0S2T4V" + f"{secrets.randbelow(256):02X}"
+            rid = ulid()
             await ignored(rid, f'{{"rid": "{rid}", "request": {{')
             # (2) a schema-valid envelope whose body is the encrypted (base64) form
-            rid2 = "01JB7Q3W8K2M4N6P8R0S2T4V" + f"{secrets.randbelow(256):02X}"
+            rid2 = ulid()
             await ignored(
                 rid2,
                 json.dumps(
