@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import secrets
+import shutil
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -319,6 +320,22 @@ def inreq_final(root: Path, agent: str, rid: str) -> str | None:
     on disk: the monotonic seam the rows wait on (a line, once written, stays)."""
     for line in diarium_lines(root, agent):
         if line["event"] != "inreq":
+            continue
+        data = line["event_data"]
+        if (
+            isinstance(data, dict)
+            and isinstance(data.get("req"), dict)
+            and data["req"].get("rid") == rid
+        ):
+            return str(data["final_status"])
+    return None
+
+
+def outreq_final(root: Path, agent: str, rid: str) -> str | None:
+    """The `final_status` of one agent's `outreq` line for `rid`, None while it is not on disk:
+    the requestor side of the same seam `inreq_final` reads on the receiver's."""
+    for line in diarium_lines(root, agent):
+        if line["event"] != "outreq":
             continue
         data = line["event_data"]
         if (
@@ -1703,4 +1720,210 @@ class E2ETest(ActioTestCase):
             # `inreq` `completed`, the `outreq` `sent`, no attachments
             await self.assert_command_exchanges(
                 root, BETA, rec, [(ALPHA, cmd_rid, "completed", "sent")]
+            )
+
+    # --- E14 ------------------------------------------------------------------------
+
+    async def test_e14_invalid_and_encrypted_material_is_ignored_with_a_log_line(self) -> None:
+        """E14: material the strict format refuses — a file that is not valid JSON at all, and
+        an envelope whose body is the encrypted (base64 string) form — is *ignored*, not
+        answered (*Strict format*, `doc/actio_protocol.md:26`: a non-conforming file is
+        "invalid and ignored"; the strict format "is a precondition, not a workflow branch",
+        `:835`): no response file for that `rid`, no `inreq` line, the file stays in the inbox,
+        and one `log` line names it (*Diarium* `log`, `:722`). A peer folder whose `spec.json`
+        is garbage is not in the view at all — there is no specification for the callability
+        rules (`A0`/`D0` preconditions, `:853`, `:866`) to apply."""
+        with actio_tree() as root:
+            sleep_calls: list[bool] = []
+            handlers = full_handlers(sleep_calls, asyncio.Event(), [])
+            alpha, beta = await self.pair(root, handlers=handlers)
+
+            def log_lines_naming(name: str) -> list[dict[str, Any]]:
+                """The `log` lines of beta's diarium that mention `name`."""
+                return [
+                    line
+                    for line in diarium_lines(root, BETA)
+                    if line["event"] == "log" and name in json.dumps(line)
+                ]
+
+            async def ignored(rid: str, content: str) -> None:
+                """One file the strict format refuses: the `log` line naming it is the fact the
+                row waits for; after it, the file has been judged, so the rest are stable."""
+                write_atomic(root / BETA / "inbox" / f"{rid}.json", content)
+                await until(
+                    f"the log line naming {rid}.json",
+                    lambda: bool(log_lines_naming(f"{rid}.json")),
+                    SCAN_SETTLE,
+                )
+                self.assertEqual(
+                    len(log_lines_naming(f"{rid}.json")),
+                    1,
+                    "one log line names the ignored file",
+                )
+                self.assertFalse(
+                    (root / BETA / "inbox" / f"{rid}.res.json").exists(),
+                    "no response file for ignored material",
+                )
+                self.assertIsNone(
+                    inreq_final(root, BETA, rid),
+                    "no `inreq` line for ignored material (never accepted, never archived)",
+                )
+                self.assertTrue(
+                    (root / BETA / "inbox" / f"{rid}.json").exists(),
+                    "an ignored file stays in the inbox",
+                )
+
+            # (1) a file that is not valid JSON at all
+            rid = "01JB7Q3W8K2M4N6P8R0S2T4V" + f"{secrets.randbelow(256):02X}"
+            await ignored(rid, f'{{"rid": "{rid}", "request": {{')
+            # (2) a schema-valid envelope whose body is the encrypted (base64) form
+            rid2 = "01JB7Q3W8K2M4N6P8R0S2T4V" + f"{secrets.randbelow(256):02X}"
+            await ignored(
+                rid2,
+                json.dumps(
+                    {
+                        "rid": rid2,
+                        "src": ALPHA,
+                        "dst": BETA,
+                        "datetime": iso_now(),
+                        "type": "req",
+                        "actio_version": "0.1",
+                        "request": "aGVsbG8=",  # base64: the schema's encrypted form
+                    }
+                ),
+            )
+            # (3) a peer folder whose `spec.json` is garbage: not in the view
+            gamma = root / GAMMA
+            (gamma / "inbox").mkdir(parents=True)
+            write_atomic(gamma / "spec.json", '{"id": "gamma", "actio_version": "0.1", ')
+            write_atomic(
+                gamma / "status.json",
+                json.dumps(
+                    {
+                        "id": GAMMA,
+                        "status": "idle",
+                        "datetime": iso_now(),
+                        "capability_status": [],
+                    }
+                ),
+            )
+            await alpha.refresh()
+            self.assertNotIn(GAMMA, alpha.agmen(), "a garbage spec.json is not a spec")
+
+    # --- E16 ------------------------------------------------------------------------
+
+    async def test_e16_a_request_attachment_is_copied_at_b1_and_removed_at_b5(self) -> None:
+        """E16: a request attachment on the normal `confirmed` path (*Envelope lifecycle*,
+        `doc/actio_protocol.md:625`: created by the requestor at `B1`, in `forum`; deleted by
+        the requestor at `B5`) — an E1-shaped exchange carrying one attachment: the file is in
+        `forum` while the work runs, and gone once the `confirmed` archive has landed
+        (`B5`, `:862`). The archive is the record first, the deletions after, and D3 fixes no
+        order between them (`:628`), so the row waits on the record and the deletion together —
+        it never asserts a deletion it did not wait for."""
+        with actio_tree() as root:
+            sleep_calls: list[bool] = []
+            handlers = full_handlers(sleep_calls, asyncio.Event(), [])
+            alpha, beta = await self.pair(root, handlers=handlers)
+            rec = InboxRecorder(root / BETA / "inbox")
+            rec.start()
+            self.addAsyncCleanup(rec.stop)
+            att = root / ALPHA / "att.txt"
+            att.write_text("attachment payload", encoding="utf-8")
+            forum_att = root / "forum" / "att.txt"
+            call = asyncio.ensure_future(
+                alpha.request(BETA, "sleep", {"seconds": 1.0}, attachments=[str(att)])
+            )
+            # B1 copies the attachment into the forum before the request file is written;
+            # the 1 s of work keeps the window open, and the wait is the fact
+            await until(
+                "the attachment to reach the forum (B1)",
+                lambda: forum_att.exists(),
+                CALL_BOUND,
+            )
+            out = await bounded(call, CALL_BOUND, "the confirmed outcome")
+            self.assertEqual(out.final_status, "confirmed")
+            self.assertIsNotNone(out.response)
+            rid = rec.rids()[0]
+            # B5: the `confirmed` record and the attachment's deletion are one fact here —
+            # the record lands first, the deletions follow, and the wait takes both
+            await until(
+                "the confirmed archive and the attachment's deletion (B5)",
+                lambda: (
+                    inreq_final(root, BETA, rid) == "confirmed"
+                    and outreq_final(root, ALPHA, rid) == "confirmed"
+                    and not forum_att.exists()
+                ),
+                SETTLE,
+            )
+            await self.assert_exchange(
+                root,
+                ALPHA,
+                BETA,
+                rid,
+                rec,
+                inbox_order=("req", "res", "con"),
+                in_final="confirmed",
+                out_final="confirmed",
+                attachments=("att.txt",),
+            )
+
+    # --- E21 ------------------------------------------------------------------------
+
+    async def test_e21_a_deleted_destination_inbox_abandons_the_request(self) -> None:
+        """E21: the destination inbox deleted while the request is in `B2` — "no response after
+        a cancellation before the requestor timeout expires (e.g. the receiver is inactive) →
+        the requestor gives up, appends an `outreq` event (`final_status="abandoned"`) and
+        deletes its request attachments" (`B2`, `doc/actio_protocol.md:859`): the requestor
+        watches the *destination* inbox, and a lost watch is a give-up. No confirmation is
+        written (the `outreq` record's `con` stays `null`), and the receiver — whose own inbox
+        is gone — reaches the `error` status (*Agent's status*, `:350`; the `error` status is
+        "reached from any node", `:823`)."""
+        with actio_tree() as root:
+            sleep_calls: list[bool] = []
+            handlers = full_handlers(sleep_calls, asyncio.Event(), [])
+            alpha, beta = await self.pair(root, handlers=handlers)
+            rec = InboxRecorder(root / BETA / "inbox")
+            rec.start()
+            self.addAsyncCleanup(rec.stop)
+            call = asyncio.ensure_future(alpha.request(BETA, "sleep", {"seconds": 1.0}))
+            await until(
+                "the request file to land in beta's inbox (the request is in B2)",
+                lambda: bool(inbox_plain(root, BETA)),
+                SETTLE,
+            )
+            rid = rec.rids()[0]
+            # the scenario: the destination inbox folder goes away while the request is
+            # in flight
+            shutil.rmtree(root / BETA / "inbox")
+            out = await bounded(call, CALL_BOUND, "the abandoned outcome")
+            self.assertEqual(out.final_status, "abandoned")
+            self.assertIsNone(out.response, "no response was ever received")
+            # the `outreq` record: `abandoned`, no response, and no confirmation written
+            sent = await read_diarium(str(root / ALPHA))
+            data = None
+            for entry in sent.lines:
+                if entry["event"] != "outreq":
+                    continue
+                d = entry["event_data"]
+                if (
+                    isinstance(d, dict)
+                    and isinstance(d.get("req"), dict)
+                    and d["req"].get("rid") == rid
+                ):
+                    data = cast("dict[str, Any]", d)
+            self.assertIsNotNone(data, "the abandon was recorded")
+            assert data is not None
+            self.assertEqual(data["final_status"], "abandoned")
+            self.assertIsNone(data["res"])
+            self.assertIsNone(data["con"], "no confirmation was written")
+            # the receiver lost its own inbox too: `error` is the scenario's other half
+            await until(
+                "beta's status to be `error` (its own inbox is gone)",
+                lambda: state_of(root, BETA) == "error",
+                SETTLE,
+            )
+            self.assertEqual(
+                rec.appeared(rid),
+                ["req"],
+                "the destination inbox saw the request and nothing else",
             )

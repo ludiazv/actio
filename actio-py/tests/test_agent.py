@@ -160,11 +160,15 @@ def peer_tree(
     accepts: list[str] | None = None,
     namespaces: list[str | None] | None = None,
     posture: str = "trusted",
+    status: str = "idle",
+    status_datetime: str | None = None,
 ) -> None:
-    """A peer folder with a valid spec and an `idle` status: enough for discovery to rate it. The peer
-    never answers: the tests that use it are about the view and the local refusal, not the exchange."""
+    """A peer folder with a valid spec and a status (default `idle`, at `TS_ISO`): enough for
+    discovery to rate it. The peer never answers: the tests that use it are about the view and
+    the local refusal, not the exchange. `status` and `status_datetime` let a row age the peer
+    (a zombie) or stop it (an `inactive`/`error` peer)."""
     folder = root / peer
-    (folder / "inbox").mkdir(parents=True)
+    (folder / "inbox").mkdir(parents=True, exist_ok=True)
     spec: dict[str, Any] = {
         "id": peer,
         "actio_version": "0.1",
@@ -182,7 +186,12 @@ def peer_tree(
     write_file(folder / "spec.json", spec)
     write_file(
         folder / "status.json",
-        {"id": peer, "status": "idle", "datetime": TS_ISO, "capability_status": []},
+        {
+            "id": peer,
+            "status": status,
+            "datetime": status_datetime if status_datetime is not None else TS_ISO,
+            "capability_status": [],
+        },
     )
 
 
@@ -1510,6 +1519,55 @@ class PeerViewTest(AgentTest):
             peer_tree(root, peer="delta", posture="untrusted")
             await agent.refresh()
             self.assertNotIn("delta", agent.agmen())
+
+    async def test_a_peer_we_share_no_namespace_with_is_not_considered(self) -> None:
+        """Rule 2: "If agents A and B do not share at least one namespace (an agent in the `"*"`
+        namespace shares a namespace with every agent), agent A will not consider agent B's
+        specification." Our spec carries no `namespaces`, so it is in the `null` namespace: a peer
+        in `["ns1"]` is not in the view, while the same peer in `[null]` or `["*"]` is.
+        (*Callability rules*, `doc/actio_protocol.md:332`.)"""
+        async with self.tree() as root:
+            agent, _ = await self.boot(root)
+            peer_tree(root, namespaces=["ns1"])
+            await agent.refresh()
+            self.assertNotIn(PEER, agent.agmen())
+            peer_tree(root, namespaces=[None])
+            await agent.refresh()
+            self.assertIn(PEER, agent.agmen())
+            peer_tree(root, namespaces=["*"])
+            await agent.refresh()
+            self.assertIn(PEER, agent.agmen())
+
+    async def test_a_peer_that_will_not_respond_is_filtered_from_the_view(self) -> None:
+        """Rule 7: "Agent A checks agent B's status and filters out agents with status 'inactive'
+        or 'error', as they will not respond." A peer whose `status.json` is `inactive` — and one
+        that is `error` — is out of the view, its capability otherwise usable.
+        (*Callability rules*, `doc/actio_protocol.md:339`.)"""
+        async with self.tree() as root:
+            agent, _ = await self.boot(root)
+            peer_tree(root, status="inactive")
+            await agent.refresh()
+            self.assertNotIn(PEER, agent.agmen())
+            peer_tree(root, status="error")
+            await agent.refresh()
+            self.assertNotIn(PEER, agent.agmen())
+
+    async def test_a_zombie_peer_is_flagged_not_filtered(self) -> None:
+        """Rule 8: agents whose health is "degraded" (more than 100 s since the last status update)
+        or "zombie" (more than 600 s) are flagged, not filtered out: "The protocol does not impose
+        any restriction on them." A peer whose `status.json` is 700 s old is in the view, with
+        `health` `zombie` — the assertion is presence, not absence.
+        (*Callability rules*, `doc/actio_protocol.md:340`.)"""
+        async with self.tree() as root:
+            agent, _ = await self.boot(root)
+            stale = TS - 700.0  # 700 s before the suite's fixed clock: past the 600 s zombie bound
+            peer_tree(
+                root,
+                status_datetime=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stale)),
+            )
+            await agent.refresh()
+            self.assertIn(PEER, agent.agmen())
+            self.assertEqual(agent.agmen()[PEER].health, "zombie")
 
 
 class ScanTest(AgentTest):
