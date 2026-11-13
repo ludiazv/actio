@@ -505,10 +505,10 @@ class InteropTest(unittest.TestCase):
     # -- row 7: ls, both ways ------------------------------------------------
 
     def test_10_ls_both_ways(self) -> None:
-        # The two `ignored` lists are NOT compared: for a folder that published nothing this
-        # side records one IgnoredFile per missing publication, the reference says nothing
-        # (../actio-ts/src/discovery.ts continues on kind == "missing"). The measured counts
-        # are reported, not asserted.
+        # The two `ignored` lists are compared and must agree: a folder that has not published
+        # both files is neither an agent nor an ignored file (the reference's silence), so `ignored`
+        # holds only files that are there and wrong, and both CLIs list the same ones with the same
+        # reasons (both are pointed at one tree, so the paths are the same strings).
         py = json.loads(self.cli("py", "ls", "--json").stdout)
         ts = json.loads(self.cli("ts", "ls", "--json").stdout)
         by_id = {a["id"]: a for a in py["agents"]}
@@ -531,6 +531,13 @@ class InteropTest(unittest.TestCase):
                 [(c["name"], c["disabled"], c["accepts_from"]) for c in b["capabilities"]],
                 f"{agent} capability details differ",
             )
+        # the two `ignored` lists agree: same paths and same reasons (sorted, so order is not the
+        # claim; both CLIs read one tree, so a listed path is the same string on both sides)
+        self.assertEqual(
+            sorted(py["ignored"], key=lambda i: i["path"]),
+            sorted(ts["ignored"], key=lambda i: i["path"]),
+            "the two `ignored` lists differ",
+        )
 
     # -- row 8: the diarium, both ways ---------------------------------------
 

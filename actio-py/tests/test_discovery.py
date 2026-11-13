@@ -138,22 +138,18 @@ class ScanTest(unittest.IsolatedAsyncioTestCase):
             [
                 str(tree / "bad-spec/spec.json"),
                 str(tree / "bad-status/status.json"),
-                str(tree / "missing-spec/spec.json"),
-                str(tree / "missing-status/status.json"),
                 str(tree / "unreadable/spec.json"),
             ],
         )
         self.assertEqual(
-            [p.reason for p in result.ignored[:4]],
+            [p.reason for p in result.ignored[:2]],
             [
                 "/id must be of type string",
                 "/status must be one of 'inactive', 'idle', 'busy', 'error'",
-                "missing spec.json",
-                "missing status.json",
             ],
         )
         # the unreadable file: D-15's one line, the error text and no value of the peer's
-        unreadable_reason = result.ignored[4].reason
+        unreadable_reason = result.ignored[2].reason
         self.assertTrue(unreadable_reason.startswith("unreadable: "))
         self.assertLessEqual(len(unreadable_reason), 200)
         self.assertNotIn("\n", unreadable_reason)
@@ -170,17 +166,14 @@ class ScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.duplicates, [])
         self.assertEqual(result.ignored, [])
 
-    async def test_a_folder_missing_both_files_reports_both(self) -> None:
+    async def test_a_folder_missing_a_publication_is_neither_agent_nor_ignored(self) -> None:
+        # step 2: a folder that has not published both files is not an agent, and it is not an
+        # ignored file either — `ignored` holds files that are there and wrong, not a missing file
         with actio_tree() as tree:
             (tree / "empty").mkdir()
             result = await scan(str(tree))
-        self.assertEqual(
-            [(p.path, p.reason) for p in result.ignored],
-            [
-                (str(tree / "empty/spec.json"), "missing spec.json"),
-                (str(tree / "empty/status.json"), "missing status.json"),
-            ],
-        )
+        self.assertEqual(result.agents, [])  # not an agent
+        self.assertEqual(result.ignored, [])  # not an ignored file
 
     async def test_an_unparsable_publication_gets_the_malformed_reason(self) -> None:
         with actio_tree() as tree:

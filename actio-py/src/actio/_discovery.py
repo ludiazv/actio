@@ -11,7 +11,7 @@ reading treats absent, `null` and `[]` as the null namespace, and `"*"` shares w
 
 `DiscoveredAgent.status` is typed `Status | None` in the frozen `_types.py`, but the scan never produces
 `None`: a folder without a `status.json` is not an agent (*Announcement and Discovery* step 2) and is
-reported in `ignored` instead.
+skipped, not reported: `ignored` holds files that are there and wrong, never a missing publication.
 """
 
 from __future__ import annotations
@@ -70,12 +70,8 @@ async def _scan(root: str) -> ScanResult:
         status_path = os.path.join(folder, "status.json")
         spec_pub, status_pub = rows[name]["spec.json"], rows[name]["status.json"]
         if spec_pub[0] == "missing" or status_pub[0] == "missing":
-            # step 2: a folder that has not published both files is not an agent
-            for path, pub in ((spec_path, spec_pub), (status_path, status_pub)):
-                if pub[0] == "missing":
-                    ignored.append(
-                        IgnoredFile(path=path, reason=f"missing {os.path.basename(path)}")
-                    )
+            # step 2: a folder that has not published both files is neither an agent nor an ignored
+            # file: `ignored` holds files that are there and wrong, not a missing publication
             continue
         spec_doc, spec_reason = _document(spec_pub)
         if spec_doc is None:
