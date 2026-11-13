@@ -20,7 +20,7 @@ Actio is a file-based agent coordination protocol: a team of agents (*agmen*) sh
 npm ci            # install
 npm run check     # gen:check + tsc --noEmit + the full test suite
 npm run blackbox  # the independent black-box run (echo agent as a child process, envelopes by hand)
-npm run build     # dist/: ESM + .d.ts + source maps — the entry of the published package
+npm run build     # dist/: ESM + .d.ts, no maps — the entry of the published package
 npm run check:publish  # the release gate: check, blackbox, build, and the tarball smoke below
 ```
 

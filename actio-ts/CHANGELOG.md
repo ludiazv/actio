@@ -15,8 +15,9 @@ First publishable release.
   `src/generated/schemas.ts` (validator input at runtime), and `src/generated/` is now **committed** — a
   published package cannot regenerate it, since the generator reads `../doc/schemas/` and needs
   devDependencies. `npm run gen:check` gates drift in the monorepo.
-- **Entry point**: compiled `dist/` (ESM + `.d.ts` + source maps) via `npm run build`; `src/` ships as
-  source for readable stack traces and for tools that load TypeScript.
+- **Entry point**: compiled `dist/` (ESM + `.d.ts`, **no maps** — `build` starts with `rm -rf dist`, and the
+  tarball carries code, types and source rather than three copies of each) via `npm run build`.
+  `src/` ships as source for tools that load TypeScript.
 - **Revision of record** — SHA-256 (first 12 hex) of each source schema in `doc/schemas/`:
   `actio` `42878a1f7f68` · `announce` `2691e326edf2` · `cancellation` `cd52565378d6` ·
   `common` `d63b38915805` · `confirmation` `a4c32d859e58` · `diarium` `6dec1d475331` ·
