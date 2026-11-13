@@ -808,6 +808,8 @@ class E2ETest(ActioTestCase):
                 self.assertEqual(first_out.final_status, "confirmed")
                 rids[107] = [rec.rids()[-1]]  # the rejected one; the first confirmed below too
             with self.subTest(code=108):
+                # This sub-row tests expiry itself: the stamp is 100 s past the 5 s `timeout`,
+                # so the 108 is the expected answer, not a margin to avoid.
                 rids[108] = [
                     write_request(
                         root, ALPHA, BETA, "echo", {"text": "x"}, timeout=5, ts_offset=-100
@@ -1088,7 +1090,13 @@ class E2ETest(ActioTestCase):
             rec.start()
             self.addAsyncCleanup(rec.stop)
             out = await bounded(
-                alpha.request(BETA, "sleep", {"seconds": 30}, timeout=1.0),
+                # 2.0, not 1.0: the envelope's `ts` is a whole second, so A0's expiry check
+                # (`ts + timeout < now`; *Acceptance errors* 108, `../doc/actio_protocol.md:582`,
+                # the reference checks the same at `../actio-ts/src/receiver.ts:610`) can refuse
+                # a 1 s request as expired when acceptance reads it late in its second. 2 s
+                # leaves the truncation at most half, and the 30 s handler still loses to the
+                # cancellation through B4.
+                alpha.request(BETA, "sleep", {"seconds": 30}, timeout=2.0),
                 CALL_BOUND,
                 "the timed-out request",
             )
