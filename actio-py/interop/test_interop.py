@@ -27,11 +27,10 @@ drained; every wait is bounded and named; and the whole output is searched for i
 noise (``Exception ignored``, ``was never awaited``, …). The runtime that ran is printed
 (``node`` version and the bun tell), so "interop green" is never read as "tested on Node".
 
-The ``ls`` row compares the two ``ignored`` lists by *path* — a file that is there and wrong is
-named the same on both sides, both CLIs reading one tree. The *reason* wording is reported, not
-asserted: this side carries the parser's error (D-15) and the reference a flat string, and which
-wording the protocol fixes is an open question. Cite the protocol, never a process id, in this
-file.
+The ``ls`` row compares the two ``ignored`` lists by *path* and *reason* — a file that is there
+and wrong is named the same on both sides, with the same words, both CLIs reading one tree: the
+reference's scan says ``not valid JSON`` flat (``../actio-ts/src/discovery.ts:101``) and this
+side matches it. Cite the protocol, never a process id, in this file.
 """
 
 from __future__ import annotations
@@ -223,6 +222,25 @@ class InteropTest(unittest.TestCase):
             [sys.executable, "-X", "dev", "-W", "error", str(PY_EXAMPLE)],
             str(PY_ROOT),
             env_py,
+        )
+        # a folder that published a broken spec: not an agent, and its spec.json is the one ignored
+        # file both CLIs must name with the same reason — `not valid JSON`, flat, as the
+        # reference's scan is (`../actio-ts/src/discovery.ts:101`). A valid status.json sits next to
+        # it: a folder missing a publication is silent, so both files must be there for the broken
+        # one to be named.
+        broken = Path(cls.root) / "broken"
+        broken.mkdir()
+        (broken / "spec.json").write_text('{"id": ', encoding="utf-8")
+        (broken / "status.json").write_text(
+            json.dumps(
+                {
+                    "id": "broken",
+                    "status": "idle",
+                    "datetime": "2025-10-09T08:53:20Z",
+                    "capability_status": [],
+                }
+            ),
+            encoding="utf-8",
         )
         # a second root for the sync-provider rows: their children carry ACTIO_SYNC in their env,
         # so the module pair's fixed env cannot serve them
@@ -561,16 +579,16 @@ class InteropTest(unittest.TestCase):
                 [(c["name"], c["disabled"], c["accepts_from"]) for c in b["capabilities"]],
                 f"{agent} capability details differ",
             )
-        # the two `ignored` lists name the same files: the protocol makes the *path* visible (a
-        # file that is there and wrong), so the paths are compared. The *reason* wording is not
-        # compared: `../actio-ts/src/diarium.ts:68` documents its ignored reasons as `"not valid
-        # JSON"` or the first schema error, while this side carries the parser's own message (the
-        # same one-line rule as D-15). Which wording the protocol fixes is open, so the reasons are
-        # printed, not asserted.
+        # the two `ignored` lists agree on the files *and* the reasons: a folder that has not
+        # published both files is neither an agent nor an ignored file (the reference's silence),
+        # so `ignored` holds only files that are there and wrong, and both CLIs list the same ones
+        # with the same reasons (both are pointed at one tree, so the paths are the same strings,
+        # and the unparsable-publication reason is the flat `not valid JSON` on both sides —
+        # `../actio-ts/src/discovery.ts:101`, matched here by `_discovery.py`/`_files.py`)
         self.assertEqual(
-            sorted(i["path"] for i in py["ignored"]),
-            sorted(i["path"] for i in ts["ignored"]),
-            "the two `ignored` lists name different files",
+            sorted((i["path"], i["reason"]) for i in py["ignored"]),
+            sorted((i["path"], i["reason"]) for i in ts["ignored"]),
+            "the two `ignored` lists disagree on a file or on the reason for it",
         )
         for i in py["ignored"]:
             print(f"interop ls ignored (py): {i['path']}: {i['reason']}")

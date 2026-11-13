@@ -27,7 +27,7 @@ from typing import Any
 
 from ._types import SyncProvider
 from ._util import nonce
-from ._validate import LIMIT, malformed_reason
+from ._validate import LIMIT, flat_reason
 
 # The protocol's own thread pool, and the only one its I/O takes a hop on: semantics 6 tells a user to
 # put blocking work in `asyncio.to_thread`, and sharing asyncio's default pool with that work makes a
@@ -291,8 +291,8 @@ async def list_dir(path: str) -> list[str]:
 
 # What one publication file came back as: `("text", the text)`, `("missing", "")`, `("unreadable",
 # the reason)` or `("unparsable", the reason)`. A reason is one line and never a value of the peer's
-# (D-15); a file that is readable but not UTF-8 is unparsable, which is the parser's message, not this
-# module's, because the read itself succeeded.
+# (D-15); a file that is readable but not UTF-8 is unparsable, and its reason is the flat one — the
+# read itself succeeded, so the decoder's message stays out of a peer's file's report (I-9).
 Publication = tuple[str, str]
 
 
@@ -307,8 +307,8 @@ def read_publication(path: str) -> Publication:
         return "unreadable", unreadable_reason(err)
     try:
         return "text", data.decode()
-    except UnicodeDecodeError as err:
-        return "unparsable", malformed_reason(err)
+    except UnicodeDecodeError:
+        return "unparsable", flat_reason()
 
 
 def read_tree(

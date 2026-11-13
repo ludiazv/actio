@@ -175,7 +175,7 @@ class ScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.agents, [])  # not an agent
         self.assertEqual(result.ignored, [])  # not an ignored file
 
-    async def test_an_unparsable_publication_gets_the_malformed_reason(self) -> None:
+    async def test_an_unparsable_publication_gets_the_reference_s_reason(self) -> None:
         with actio_tree() as tree:
             (tree / "broken").mkdir()
             (tree / "broken/spec.json").write_text('{"id": ', encoding="utf-8")
@@ -184,8 +184,45 @@ class ScanTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.agents, [])
         self.assertEqual(len(result.ignored), 1)
         self.assertEqual(result.ignored[0].path, str(tree / "broken/spec.json"))
-        self.assertTrue(result.ignored[0].reason.startswith("malformed JSON: "))
+        self.assertEqual(
+            result.ignored[0].reason,
+            "not valid JSON",
+            "the scan says the reference's flat words, not the inbox's detail",
+        )
         self.assertLessEqual(len(result.ignored[0].reason), 200)
+
+    async def test_a_non_utf8_publication_in_a_scan_reads_not_valid_json(self) -> None:
+        # Pins the split: a file that is readable but not UTF-8 is unparsable at the read, and its
+        # reason is the flat one too — the decoder's message never reaches a peer's file's report.
+        with actio_tree() as tree:
+            (tree / "binary").mkdir()
+            (tree / "binary/spec.json").write_bytes(b'{"id": "caf\xe9"}')  # not UTF-8
+            write(tree, "binary/status.json", status("idle", 10.0) | {"id": "binary"})
+            result = await scan(str(tree))
+        self.assertEqual(result.agents, [])
+        self.assertEqual(len(result.ignored), 1)
+        self.assertEqual(result.ignored[0].path, str(tree / "binary/spec.json"))
+        self.assertEqual(
+            result.ignored[0].reason,
+            "not valid JSON",
+            "a non-UTF-8 publication reads the flat reason, not the decoder's message",
+        )
+
+    async def test_an_unreadable_publication_still_reads_unreadable(self) -> None:
+        # Pins the split from the other side: the I/O rejections keep their own wording; only the
+        # unparsable arm went flat.
+        with actio_tree() as tree:
+            (tree / "locked").mkdir()
+            (tree / "locked/spec.json").mkdir()  # a directory where a file should be
+            write(tree, "locked/status.json", status("idle", 10.0) | {"id": "locked"})
+            result = await scan(str(tree))
+        self.assertEqual(result.agents, [])
+        self.assertEqual(len(result.ignored), 1)
+        self.assertEqual(result.ignored[0].path, str(tree / "locked/spec.json"))
+        self.assertTrue(
+            result.ignored[0].reason.startswith("unreadable: "),
+            f"an unreadable publication keeps its own wording: {result.ignored[0].reason!r}",
+        )
 
     async def test_a_broken_actio_json_is_ignored(self) -> None:
         with actio_tree() as tree:

@@ -309,4 +309,5 @@ class ReadTreeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows["broken"]["spec.json"][0], "unreadable")
         self.assertTrue(rows["broken"]["spec.json"][1].startswith("unreadable: "))
         self.assertEqual(rows["broken"]["status.json"][0], "unparsable")
-        self.assertTrue(rows["broken"]["status.json"][1].startswith("malformed JSON:"))
+        self.assertEqual(rows["broken"]["status.json"][1], "not valid JSON")  # the flat reason: a
+        # peer's publication is named, not quoted (the parser's detail belongs to the inbox)

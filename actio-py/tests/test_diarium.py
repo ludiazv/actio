@@ -175,7 +175,11 @@ class ReadDiariumTest(ActioTestCase):
             self.assertEqual(result.lines, [good])
             self.assertEqual(len(result.ignored), 2)
             self.assertEqual(result.ignored[0].line, 2)
-            self.assertTrue(result.ignored[0].reason)
+            self.assertEqual(
+                result.ignored[0].reason,
+                "not valid JSON",
+                "an unparsable diarium line reads the flat reason, not the parser's detail",
+            )
             self.assertEqual(result.ignored[1].line, 3)
             self.assertTrue(result.ignored[1].reason)
 

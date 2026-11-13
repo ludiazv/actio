@@ -181,10 +181,9 @@ class LsTest(CliTest):
             lines = out_txt.splitlines()
             self.assertIn(f"duplicate agent id: {root / 'twin'}", lines)
             self.assertIn(
-                f"ignored: {junk / 'spec.json'}: malformed JSON: "
-                "Expecting property name enclosed in double quotes: line 1 column 3 (char 2)",
+                f"ignored: {junk / 'spec.json'}: not valid JSON",
                 lines,
-            )
+            )  # the ls line carries the scan's flat reason, not the inbox's detail
 
 
 class DiariumTest(CliTest):
@@ -459,6 +458,26 @@ class ValidateTest(CliTest):
             self.assertEqual(out_txt, "")
             self.assertEqual(len(err_txt.splitlines()), 1)
             self.assertTrue(err_txt.startswith("request: "), err_txt)
+
+    async def test_a_file_that_is_not_json_keeps_the_parser_s_detail_in_the_message(self) -> None:
+        # Pins the split from the message side: `validate` on a file that is not JSON at all prints
+        # the parser's own message — the detail lives in the messages (and in the inbox's ignored
+        # reason), never in a scan's reason, which is the flat `not valid JSON`.
+        with actio_tree() as root:
+            (root / "junk.json").write_text("{ not json", encoding="utf-8")
+            with no_leftovers():
+                code, out_txt, err_txt = await self.run_cli(
+                    "validate", str(root / "junk.json"), root=root
+                )
+            self.assertEqual(code, 1)
+            self.assertEqual(out_txt, "")
+            self.assertTrue(
+                err_txt.startswith(
+                    f"{root / 'junk.json'}: not valid JSON: "
+                    "Expecting property name enclosed in double quotes"
+                ),
+                f"the message keeps the parser's detail: {err_txt!r}",
+            )
 
     async def test_a_diarium_reports_the_offending_line(self) -> None:
         with actio_tree() as root:

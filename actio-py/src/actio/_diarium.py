@@ -20,7 +20,7 @@ from ._protocol import (
 )
 from ._types import DiariumRead, IgnoredLine, SyncProvider
 from ._util import format_iso
-from ._validate import malformed_reason, validate
+from ._validate import flat_reason, validate
 
 
 def _line(id: AgentId, ts: float, event: str, event_data: object) -> DiariumEntry:
@@ -88,8 +88,8 @@ def _read_lines(raw: str) -> DiariumRead:
             continue  # a blank line carries no event
         try:
             entry = loads(text)
-        except ValueError as err:
-            ignored.append(IgnoredLine(line=i + 1, reason=malformed_reason(err)))
+        except ValueError:
+            ignored.append(IgnoredLine(line=i + 1, reason=flat_reason()))
             continue
         reason = validate("diarium", entry)
         if reason is None:

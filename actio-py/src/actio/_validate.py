@@ -181,6 +181,14 @@ def malformed_reason(error: BaseException) -> str:
     return f"malformed JSON: {error}"
 
 
+def flat_reason() -> str:
+    """The flat reason: an unparsable publication in a scan, and an unparsable diarium line —
+    `not valid JSON`, without the parser's detail. The detail belongs to the inbox, where the
+    file is one of the exchange's own (`malformed_reason`); a peer's file is named, not quoted
+    (../actio-ts/src/discovery.ts:101, ../actio-ts/src/diarium.ts:100)."""
+    return "not valid JSON"
+
+
 def envelope_kind(value: Any) -> EnvelopeKind | None:
     """Which exchange envelope a decoded object is, by its single **body key** (*Requests*) — never its name.
 

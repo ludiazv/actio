@@ -23,7 +23,7 @@ from ._files import Publication, loads, scan_tree
 from ._protocol import AgentId, Capability, Spec
 from ._status import health
 from ._types import AgentView, DiscoveredAgent, IgnoredFile, ScanResult
-from ._validate import malformed_reason, unique_capability_names, validate
+from ._validate import flat_reason, unique_capability_names, validate
 
 # *Announcement and Discovery* step 1: the reserved folders are never agents.
 _RESERVED: frozenset[str] = frozenset({"tools", "forum", "nuntium"})
@@ -39,8 +39,8 @@ def _document(pub: Publication) -> tuple[Any, str]:
         return None, pub[1]
     try:
         return loads(pub[1]), ""
-    except ValueError as err:
-        return None, malformed_reason(err)
+    except ValueError:
+        return None, flat_reason()
 
 
 async def _scan(root: str) -> ScanResult:
