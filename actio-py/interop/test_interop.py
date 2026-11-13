@@ -604,10 +604,12 @@ class InteropTest(unittest.TestCase):
 
     # -- row 9: the sync providers, E1 under each (E20) -----------------------
 
-    def _sync_pair(self, provider: str, mutagen_bin: Path | None = None) -> None:
+    def _sync_pair(self, provider: str, mutagen_bin: dict[str, Path] | None = None) -> None:
         """One Python and one TS agent in the sync root, with ``ACTIO_SYNC=<provider>`` in the
-        child's environment; the mutagen arm points ``ACTIO_MUTAGEN_BIN`` at a fake binary that
-        records its arguments. The children are registered for reaping in ``tearDownClass``."""
+        child's environment; the mutagen arm points each child's ``ACTIO_MUTAGEN_BIN`` at its own
+        fake binary, which records its arguments into its own log — one log per side, because the
+        row is about each implementation flushing and a shared log lets one side answer for the
+        other. The children are registered for reaping in ``tearDownClass``."""
         env_ts = {
             **os.environ,
             "ACTIO_DIR": self.sync_root,
@@ -624,8 +626,8 @@ class InteropTest(unittest.TestCase):
             "PYTHONPATH": str(PY_SRC),
         }
         if mutagen_bin is not None:
-            env_ts["ACTIO_MUTAGEN_BIN"] = str(mutagen_bin)
-            env_py["ACTIO_MUTAGEN_BIN"] = str(mutagen_bin)
+            env_ts["ACTIO_MUTAGEN_BIN"] = str(mutagen_bin[TS_AGENT])
+            env_py["ACTIO_MUTAGEN_BIN"] = str(mutagen_bin[PY_AGENT])
         ts = _Child(TS_AGENT, [NODE, "--import", "tsx", str(TS_EXAMPLE)], str(TS_ROOT), env_ts)
         py = _Child(
             PY_AGENT,
@@ -676,28 +678,40 @@ class InteropTest(unittest.TestCase):
         self._sync_echo("fsync+delay:20")
 
     def test_15_sync_mutagen(self) -> None:
-        # the reference's fake binary: a #!/bin/sh script that appends "$@" to a log in the tree;
-        # the provider reads ACTIO_MUTAGEN_BIN at run time
-        log = Path(self.sync_root) / "mutagen.log"
-        bin_path = Path(self.sync_root) / "mutagen-fake"
-        bin_path.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\n', encoding="utf-8")
-        bin_path.chmod(0o755)
-        self._sync_pair("mutagen:robustness", mutagen_bin=bin_path)
+        # one fake binary and one log per side. The row is about each implementation flushing, and
+        # a shared log lets one side answer for the other: a broken flush on one side would be
+        # masked by the other's writes. ACTIO_MUTAGEN_BIN is per child — our provider reads it at
+        # run time, and the reference honors it too. Each fake binary is the reference's pattern:
+        # a #!/bin/sh script that appends "$@" to its own log in the tree.
+        logs: dict[str, Path] = {}
+        bins: dict[str, Path] = {}
+        for agent in (PY_AGENT, TS_AGENT):
+            log = Path(self.sync_root) / f"mutagen-{agent}.log"
+            bin_path = Path(self.sync_root) / f"mutagen-fake-{agent}"
+            bin_path.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\n', encoding="utf-8")
+            bin_path.chmod(0o755)
+            logs[agent] = log
+            bins[agent] = bin_path
+        self._sync_pair("mutagen:robustness", mutagen_bin=bins)
         self._sync_echo("mutagen:robustness")
-        # the debounced flush (200 ms after the last write) reached the fake binary: at least one
-        # `sync flush <session>`. The bound is the row's, named in the failure; the flush has no
-        # protocol deadline, only the agent's clock.
+        # the debounced flush (200 ms after the last write) reached each side's own fake binary:
+        # at least one `sync flush <session>` in EACH log. The bound is the row's, named in the
+        # failure; the flush has no protocol deadline, only the agent's clock.
         flush_bound = 10.0
         end = time.monotonic() + flush_bound
         while time.monotonic() < end:
-            if log.is_file() and "sync flush robustness" in log.read_text():
+            if all(
+                log.is_file() and "sync flush robustness" in log.read_text()
+                for log in logs.values()
+            ):
                 break
             time.sleep(0.1)
-        self.assertTrue(
-            log.is_file() and "sync flush robustness" in log.read_text(),
-            f"the mutagen fake binary never logged a flush within {flush_bound}s: "
-            f"{log.read_text() if log.is_file() else '(missing)'}",
-        )
+        for agent, log in logs.items():
+            self.assertTrue(
+                log.is_file() and "sync flush robustness" in log.read_text(),
+                f"the {agent} mutagen fake binary never logged a flush within {flush_bound}s: "
+                f"{log.read_text() if log.is_file() else '(missing)'}",
+            )
 
 
 if __name__ == "__main__":
