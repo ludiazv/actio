@@ -670,29 +670,48 @@ class LifecycleTest(AgentTest):
             await agent.stop()
             await asyncio.wait_for(stopped, SETTLE)
 
-    async def test_log_and_diarium_pins_write_order(self) -> None:
-        """Row 1: calls `agent.log("…")` then `await agent.diarium()`. Assert the log entry lands in
-        the diarium read result, in order written, with the agent's own id and a schema-valid log body."""
+    async def test_the_agent_writes_and_reads_its_own_diarium(self) -> None:
+        """`log` appends a `log` entry to this agent's diarium and `diarium()` reads that file back: the
+        entry carries this agent's id and the message as its body, and the read returns the lines in the
+        file's order. Both methods are public API, so the row calls the methods, not the file layer."""
         async with self.tree() as root:
             agent, _ = await self.boot(root)
-            await agent.log("log message for row 1")
-            diarium_lines = lines(root)
-            log_entry = next((e for e in diarium_lines if e["event"] == "log"), None)
-            self.assertIsNotNone(log_entry)
-            self.assertEqual(log_entry["event_data"], "log message for row 1")
-            self.assertTrue(any(e.get("event") == "log" for e in diarium_lines))
+            try:
+                await agent.log("the first message")
+                await agent.log("the second message")
+                read = await agent.diarium()
+            finally:
+                await agent.stop()
+            mine = [e for e in read.lines if e["event"] == "log"]
+            self.assertEqual(
+                [(e["id"], e["event_data"]) for e in mine],
+                [(AGENT, "the first message"), (AGENT, "the second message")],
+                "log appends this agent's id and its message, and diarium() returns them in file order",
+            )
+            self.assertEqual(read.ignored, [], "the lines a running agent writes are all valid")
+            self.assertEqual(
+                [e["event_data"] for e in mine],
+                [e["event_data"] for e in lines(root) if e["event"] == "log"],
+                "diarium() reads the same file the diarium helper reads, in the same order",
+            )
 
-    async def test_not_started_raises_runtime_error_on_log_and_diarium(self) -> None:
-        """Row 2: when the agent has never started, both `agent.log(...)` and `agent.diarium()` raise
-        RuntimeError with message prefix "the agent has never started". Assert which it is."""
+    async def test_log_and_diarium_refuse_an_agent_that_never_started(self) -> None:
+        """`log` and `diarium()` before `start()` raise `RuntimeError`, because there is no run to write
+        with and no folder to read: the message says which case it is, for both methods."""
         async with self.tree() as root:
-            agent, _ = await self.boot(root)
-            for call in (lambda: agent.log("x"), lambda: agent.diarium()):
-                try:
+            agent, _ = self.build(root)
+            for name, call in (("log", lambda: agent.log("x")), ("diarium", agent.diarium)):
+                with self.assertRaises(RuntimeError) as got:
                     await call()
-                except RuntimeError as err:
-                    self.assertIn("the agent has never started", str(err))
-                    break
+                self.assertEqual(
+                    str(got.exception),
+                    "the agent has never started",
+                    f"{name} before start says the agent never started",
+                )
+                self.assertFalse(
+                    (root / AGENT / "diarium.jsonl").exists(),
+                    f"{name} before start wrote nothing into a folder that was never made",
+                )
 
     async def test_fail_sets_error_and_announces(self) -> None:
         """*Agent's status*: `fail` is status `error` plus an announce; there is no recovery, and a
