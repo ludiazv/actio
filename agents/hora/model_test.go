@@ -19,7 +19,7 @@ import (
 func mkGate(name, mark string) gate {
 	return gate{
 		name:  name,
-		state: func(prompt, capContext string) ai.JsonObject { return ai.JsonObject{"mark": mark} },
+		state: func(prompt string, caps []capInfo) ai.JsonObject { return ai.JsonObject{"mark": mark} },
 	}
 }
 
@@ -50,7 +50,7 @@ func TestFindGate(t *testing.T) {
 			if !ok {
 				return
 			}
-			if mark := got.state("", "")["mark"]; mark != row.wantMark {
+			if mark := got.state("", nil)["mark"]; mark != row.wantMark {
 				t.Fatalf("findGate(%q) returned the gate marked %v, want %v", row.query, mark, row.wantMark)
 			}
 		})
@@ -243,7 +243,7 @@ func TestDecide(t *testing.T) {
 			DecisionURL:   srv.URL,
 			DecisionGate:  "v1",
 		})
-		got, err := m.decide(context.Background(), "call backup every day at 13:00", "dest: backup-agent; capabilities: backup, echo", []string{"backup", "echo"})
+		got, err := m.decide(context.Background(), "call backup every day at 13:00", []capInfo{{Name: "backup"}, {Name: "echo"}})
 		if err != nil {
 			t.Fatalf("decide: %v", err)
 		}
@@ -254,8 +254,14 @@ func TestDecide(t *testing.T) {
 		if !ok {
 			t.Fatalf("state = %T, want an object", rec.body["state"])
 		}
-		if len(state) != 3 || state["request"] == nil || state["destination"] == nil || state["modes"] == nil {
-			t.Fatalf("state keys = %v, want exactly request, destination, modes", keys(state))
+		if len(state) != 1 || state["request"] == nil {
+			t.Fatalf("state keys = %v, want exactly the single request field", keys(state))
+		}
+		reqText, _ := state["request"].(string)
+		for _, sub := range []string{"call backup every day at 13:00", "- backup", "- echo"} {
+			if !strings.Contains(reqText, sub) {
+				t.Fatalf("state request lacks %q: %s", sub, reqText)
+			}
 		}
 		questions, ok := rec.body["questions"].(map[string]any)
 		if !ok {
@@ -288,7 +294,7 @@ func TestDecide(t *testing.T) {
 			DecisionURL:   srv.URL,
 			DecisionGate:  "v1",
 		})
-		got, err := m.decide(context.Background(), "call echo every 5 minutes", "dest: echo-agent; capabilities: echo", []string{"echo"})
+		got, err := m.decide(context.Background(), "call echo every 5 minutes", []capInfo{{Name: "echo"}})
 		if err != nil {
 			t.Fatalf("decide: %v", err)
 		}
@@ -315,7 +321,7 @@ func TestDecide(t *testing.T) {
 			DecisionURL:   srv.URL,
 			DecisionGate:  "v1",
 		})
-		got, err := m.decide(context.Background(), "run the scan on 2026-12-01 at 09:30", "dest: ops; capabilities: backup, echo, scan", []string{"backup", "echo", "scan"})
+		got, err := m.decide(context.Background(), "run the scan on 2026-12-01 at 09:30", []capInfo{{Name: "backup"}, {Name: "echo"}, {Name: "scan"}})
 		if err != nil {
 			t.Fatalf("decide: %v", err)
 		}
@@ -354,7 +360,7 @@ func TestDecide(t *testing.T) {
 			DecisionURL:   srv.URL,
 			DecisionGate:  "v1",
 		})
-		if _, err := m.decide(context.Background(), "call echo every 5 minutes", "dest: echo-agent; capabilities: echo", []string{"echo"}); err != nil {
+		if _, err := m.decide(context.Background(), "call echo every 5 minutes", []capInfo{{Name: "echo"}}); err != nil {
 			t.Fatalf("decide: %v", err)
 		}
 		questions, ok := rec.body["questions"].(map[string]any)
@@ -400,7 +406,7 @@ func TestDecide(t *testing.T) {
 			t.Fatalf("resolveKey: %v", err)
 		}
 		m := newModels(cfg)
-		if _, err := m.decide(context.Background(), "call backup every day at 13:00", "dest: backup-agent; capabilities: backup, echo", []string{"backup", "echo"}); err != nil {
+		if _, err := m.decide(context.Background(), "call backup every day at 13:00", []capInfo{{Name: "backup"}, {Name: "echo"}}); err != nil {
 			t.Fatalf("decide: %v", err)
 		}
 		if rec.path != "/v1/systemone" {
@@ -425,7 +431,7 @@ func TestDecide(t *testing.T) {
 		}
 		cfg.DecisionAPIKey, _ = resolveKey(cfg.DecisionEnvAPIKey, "decision_env_apikey")
 		m := newModels(cfg)
-		if _, err := m.decide(context.Background(), "call backup every day at 13:00", "dest: backup-agent; capabilities: backup, echo", []string{"backup", "echo"}); err != nil {
+		if _, err := m.decide(context.Background(), "call backup every day at 13:00", []capInfo{{Name: "backup"}, {Name: "echo"}}); err != nil {
 			t.Fatalf("decide: %v", err)
 		}
 		if rec.path != "/v1/systemone" {
@@ -452,6 +458,7 @@ func TestV1Verdict(t *testing.T) {
 	rows := []struct {
 		name      string
 		answers   ai.ClassifierAnswers
+		prompt    string
 		caps      []string
 		wantOK    bool
 		wantScore float64
@@ -462,37 +469,49 @@ func TestV1Verdict(t *testing.T) {
 		{
 			name:    "P(valid) 0.49 rejects",
 			answers: ai.ClassifierAnswers{boolEntry("valid", 0.49), choiceEntry("type", "cron")},
+			prompt:  "call backup every day at 13:00",
 			caps:    []string{"backup", "echo"},
 			wantOK:  false, wantScore: 0.49,
 		},
 		{
 			name:    "P(valid) 0.5 accepts",
 			answers: ai.ClassifierAnswers{boolEntry("valid", 0.5), choiceEntry("type", "cron"), choiceEntry("capability", "backup")},
+			prompt:  "call backup every day at 13:00",
 			caps:    []string{"backup", "echo"},
 			wantOK:  true, wantScore: 0.5, wantType: "cron", wantCap: "backup",
 		},
 		{
 			name:    "the hints carry the chosen type and capability",
 			answers: ai.ClassifierAnswers{boolEntry("valid", 0.94), choiceEntry("type", "periodic"), choiceEntry("capability", "echo")},
+			prompt:  "call echo every 5 minutes",
 			caps:    []string{"backup", "echo"},
 			wantOK:  true, wantScore: 0.94, wantType: "periodic", wantCap: "echo",
 		},
 		{
 			name:    "one capability: the hint is that capability, no answer needed",
 			answers: ai.ClassifierAnswers{boolEntry("valid", 0.9), choiceEntry("type", "one-shot")},
+			prompt:  "do something tomorrow at noon",
 			caps:    []string{"solo"},
 			wantOK:  true, wantScore: 0.9, wantType: "one-shot", wantCap: "solo",
 		},
 		{
+			name:    "two capabilities, none named in the request: rejects",
+			answers: ai.ClassifierAnswers{boolEntry("valid", 0.95), choiceEntry("type", "cron"), choiceEntry("capability", "backup")},
+			prompt:  "do something every hour",
+			caps:    []string{"backup", "echo"},
+			wantOK:  false, wantScore: 0.95,
+		},
+		{
 			name:    "a missing valid answer is an error, not a panic",
 			answers: ai.ClassifierAnswers{choiceEntry("type", "cron")},
+			prompt:  "call backup every day at 13:00",
 			caps:    []string{"backup", "echo"},
 			wantErr: true,
 		},
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
-			got, err := g.verdict(row.answers, row.caps)
+			got, err := g.verdict(row.answers, row.prompt, row.caps)
 			if row.wantErr {
 				if err == nil {
 					t.Fatalf("verdict = %+v, want an error", got)
@@ -526,8 +545,8 @@ func TestDecideUsesConfiguredGate(t *testing.T) {
 	saved := gates
 	gates = append(gates, gate{
 		name: "testgate",
-		state: func(prompt, capContext string) ai.JsonObject {
-			return ai.JsonObject{"tag": "testgate-state", "prompt": prompt, "caps": capContext}
+		state: func(prompt string, caps []capInfo) ai.JsonObject {
+			return ai.JsonObject{"tag": "testgate-state", "prompt": prompt, "ncaps": len(caps)}
 		},
 		questions: func(capNames []string) ai.ClassifierQuestions {
 			return ai.ClassifierQuestions{{ID: "ok", Question: ai.ClassifierBoolQuestion{
@@ -535,7 +554,7 @@ func TestDecideUsesConfiguredGate(t *testing.T) {
 				Criteria:     ai.ClassifierBoolCriteria{True: "yes", False: "no"},
 			}}}
 		},
-		verdict: func(a ai.ClassifierAnswers, capNames []string) (gateVerdict, error) {
+		verdict: func(a ai.ClassifierAnswers, prompt string, capNames []string) (gateVerdict, error) {
 			return gateVerdict{Gate: "testgate", OK: true, Score: 0.77, Hints: hints{Type: "from-testgate"}}, nil
 		},
 	})
@@ -548,7 +567,7 @@ func TestDecideUsesConfiguredGate(t *testing.T) {
 		DecisionURL:   srv.URL,
 		DecisionGate:  "testgate",
 	})
-	got, err := m.decide(context.Background(), "a prompt", "a cap context", []string{"a"})
+	got, err := m.decide(context.Background(), "a prompt", []capInfo{{Name: "a"}})
 	if err != nil {
 		t.Fatalf("decide: %v", err)
 	}

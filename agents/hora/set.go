@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"actio-go"
+	"github.com/MichaelKinsy/PiG/ai"
 )
 
 // hora is the agent: its config, the Actio agent, the store, the runner, the
@@ -63,23 +64,22 @@ func (h *hora) set(ctx context.Context, params json.RawMessage, call *actio.Call
 // scheduleFor is the pipeline: the decision, the two rounds, the write order. It takes the destination's view data and
 // a logf for the diarium lines, never the agent (R1, answer to question 5).
 func (h *hora) scheduleFor(ctx context.Context, dest actio.AgentID, prompt string, view actio.AgentView, logf func(format string, args ...any)) (any, error) {
-	capNames := make([]string, 0, len(view.Capabilities))
-	for n := range view.Capabilities {
-		capNames = append(capNames, n)
+	caps := make([]capInfo, 0, len(view.Capabilities))
+	for n, c := range view.Capabilities {
+		caps = append(caps, capInfo{Name: n, Description: c.Description, Parameters: string(c.Parameters)})
 	}
-	sort.Strings(capNames)
-	capCtx := destCapContext(dest, view)
+	sort.Slice(caps, func(i, j int) bool { return caps[i].Name < caps[j].Name })
 
 	// Step 4: the decision, through the configured gate (D-9). A failure or
 	// an errored verdict goes on to round 1 without hints.
 	var hints hints
 	if h.models.hasDecision() {
-		verdict, err := h.models.decide(ctx, prompt, capCtx, capNames)
+		verdict, err := h.models.decide(ctx, prompt, caps)
 		if err != nil {
-			logf("gate %s: failed: %v", h.cfg.DecisionGate, err)
+			logf("gate %s: failed: %v time=%s", h.cfg.DecisionGate, err, verdict.t)
 		} else {
-			logf("gate %s: ok=%v score=%.3f type=%s capability=%s",
-				verdict.Gate, verdict.OK, verdict.Score, verdict.Hints.Type, verdict.Hints.Capability)
+			logf("gate %s: ok=%v score=%.3f type=%s capability=%s time=%s",
+				verdict.Gate, verdict.OK, verdict.Score, verdict.Hints.Type, verdict.Hints.Capability, verdict.t)
 			if !verdict.OK {
 				return rejectedAnswer(dest, "not a scheduling request")
 			}
@@ -87,22 +87,37 @@ func (h *hora) scheduleFor(ctx context.Context, dest actio.AgentID, prompt strin
 		}
 	}
 
-	// Steps 5–7: round 1, D-6's validation, and round 2 as a fresh request.
-	system := h.systemPrompt(capCtx, hints)
-	runRound := func(user string) (scheduleAnswer, string, []string) {
-		reply, err := h.models.complete(ctx, system, user)
-		if err != nil {
-			return scheduleAnswer{}, reply, []string{"model error: " + err.Error()}
-		}
-		ans, reasons := h.validateReply(reply, view)
-		return ans, reply, reasons
+	// Steps 5–7: round 1, D-6's validation, and round 2 as a conversation
+	// continuation: the model sees its own first reply as an assistant
+	// message before a new user message with the validation errors.
+	system := extractSystem(caps)
+	user := h.extractUser(prompt, caps, hints)
+	reply, err := h.models.complete(ctx, system, user)
+	if err != nil {
+		reply = ""
 	}
-	ans, reply, reasons := runRound(prompt)
+	if len(caps) == 1 {
+		reply = injectDestCap(reply, caps[0].Name)
+	}
+	ans, reasons := h.validateReply(reply, view)
+	if err != nil {
+		reasons = append(reasons, "model error: "+err.Error())
+	}
 	if len(reasons) > 0 {
-		round2 := "Original prompt: " + prompt +
-			"\nPrevious reply: " + reply +
-			"\nIt failed validation: " + strings.Join(reasons, "; ")
-		ans, _, reasons = runRound(round2)
+		feedback := "Your previous reply failed validation: " + strings.Join(reasons, "; ") +
+			"\nReply again with the corrected JSON object only."
+		second, err := h.models.completeChat(ctx, system, []ai.Message{
+			ai.UserMessage{Content: ai.UserText(user)},
+			ai.AssistantMessage{Content: []ai.AssistantContentBlock{ai.TextContent{Text: reply}}},
+			ai.UserMessage{Content: ai.UserText(feedback)},
+		})
+		if err != nil {
+			return rejectedAnswer(dest, "invalid answer: model error: "+err.Error())
+		}
+		if len(caps) == 1 {
+			second = injectDestCap(second, caps[0].Name)
+		}
+		ans, reasons = h.validateReply(second, view)
 	}
 	if len(reasons) > 0 {
 		return rejectedAnswer(dest, "invalid answer: "+strings.Join(reasons, "; "))
@@ -177,46 +192,92 @@ func (h *hora) validateReply(reply string, view actio.AgentView) (scheduleAnswer
 	return ans, reasons
 }
 
-// systemPrompt is D-7's extraction prompt: the JSON-only rule with exactly
-// the four keys, the three modes and their expression formats, the current
-// time in UTC and in the config zone, cap_context, and the decision's hints.
-func (h *hora) systemPrompt(capCtx string, hints hints) string {
+// extractSystem is the static extraction system prompt: role, the JSON
+// contract, the three modes and their expression formats, the capability
+// rules, and three examples. It carries no per-request data (cacheable).
+// With a single capability the contract drops dest_capability, which the
+// pipeline fills in.
+func extractSystem(caps []capInfo) string {
+	if len(caps) == 1 {
+		return `You are a scheduling assistant that turns a user's request into a precise schedule definition.
+
+Reply with JSON only: one object with exactly the keys sched_type, sched_expression, capability_parameters. No prose, no code fences.
+
+sched_type is one of: one-shot, cron, periodic.
+- one-shot: sched_expression is an RFC 3339 UTC time with whole seconds, after now, like 2026-12-01T09:30:00Z.
+- cron: sched_expression is six fields (sec min hour dom month dow), optionally prefixed "CRON_TZ=<zone> "; without a prefix it is read in the config zone.
+- periodic: sched_expression is "@every <duration>", whole seconds, at least 1s, like @every 30m.
+
+capability_parameters must be an object matching the capability's parameter schema; use {} if it takes none.
+
+Examples:
+{"sched_type":"one-shot","sched_expression":"2026-12-01T09:30:00Z","capability_parameters":{"profile":"fast"}}
+{"sched_type":"cron","sched_expression":"0 0 13 * * *","capability_parameters":{}}
+{"sched_type":"periodic","sched_expression":"@every 30m","capability_parameters":{"text":"ping"}}`
+	}
+	return `You are a scheduling assistant that turns a user's request into a precise schedule definition.
+
+Reply with JSON only: one object with exactly the keys sched_type, sched_expression, dest_capability, capability_parameters. No prose, no code fences.
+
+sched_type is one of: one-shot, cron, periodic.
+- one-shot: sched_expression is an RFC 3339 UTC time with whole seconds, after now, like 2026-12-01T09:30:00Z.
+- cron: sched_expression is six fields (sec min hour dom month dow), optionally prefixed "CRON_TZ=<zone> "; without a prefix it is read in the config zone.
+- periodic: sched_expression is "@every <duration>", whole seconds, at least 1s, like @every 30m.
+
+dest_capability must be exactly one of the capability names listed in the request.
+capability_parameters must be an object matching the capability's parameter schema; use {} if it takes none.
+
+Examples:
+{"sched_type":"one-shot","sched_expression":"2026-12-01T09:30:00Z","dest_capability":"scan","capability_parameters":{"profile":"fast"}}
+{"sched_type":"cron","sched_expression":"0 0 13 * * *","dest_capability":"backup","capability_parameters":{}}
+{"sched_type":"periodic","sched_expression":"@every 30m","dest_capability":"echo","capability_parameters":{"text":"ping"}}`
+}
+
+// extractUser is the per-request extraction user message: the current time,
+// the capability list with parameter schemas, the decision's hints, and the
+// request verbatim last.
+func (h *hora) extractUser(prompt string, caps []capInfo, hints hints) string {
 	now := h.now()
 	var b strings.Builder
-	b.WriteString("Reply with JSON only: one object with exactly the keys sched_type, sched_expression, dest_capability, capability_parameters.\n")
-	b.WriteString("sched_type is one of: one-shot, cron, periodic.\n")
-	b.WriteString("one-shot: sched_expression is an RFC 3339 UTC time with whole seconds, after now, like 2026-12-01T09:30:00Z.\n")
-	b.WriteString("cron: sched_expression is six fields (sec min hour dom month dow), optionally prefixed CRON_TZ=<zone> ; a cron without a prefix is read in the config zone.\n")
-	b.WriteString("periodic: sched_expression is @every <duration>, whole seconds of at least 1s, like @every 30m.\n")
-	inZone := now.In(h.cfg.Loc)
 	b.WriteString("Current time: " + now.UTC().Format(time.RFC3339) + " UTC; in " +
-		h.cfg.Loc.String() + ": " + inZone.Format("2006-01-02T15:04:05 -0700 (MST)") + ".\n")
-	b.WriteString(capCtx + "\n")
-	if hints.Type != "" || hints.Capability != "" {
-		b.WriteString("Decision hints: type " + hints.Type + ", capability " + hints.Capability + ".\n")
+		h.cfg.Loc.String() + ": " + now.In(h.cfg.Loc).Format("2006-01-02T15:04:05 -0700 (MST)") + ".\n\n")
+	if len(caps) == 1 {
+		b.WriteString("The request targets the single available capability:\n")
+	} else {
+		b.WriteString("Available capabilities:\n")
 	}
+	for _, c := range caps {
+		schema := c.Parameters
+		if schema == "" {
+			schema = `{"type":"object","properties":{},"additionalProperties":false}`
+		}
+		b.WriteString(fmt.Sprintf("- %s: %s. parameters: %s\n", c.Name, c.Description, schema))
+	}
+	if hints.Type != "" || hints.Capability != "" {
+		if len(caps) == 1 {
+			b.WriteString("\nDecision hints: type " + hints.Type + ".\n")
+		} else {
+			b.WriteString("\nDecision hints: type " + hints.Type + ", capability " + hints.Capability + ".\n")
+		}
+	}
+	b.WriteString("\nRequest: " + prompt + "\n")
 	return b.String()
 }
 
-// destCapContext is set's cap_context: the destination's id and
-// description, and each visible capability's name, description and
-// parameters schema.
-func destCapContext(dest actio.AgentID, view actio.AgentView) string {
-	names := make([]string, 0, len(view.Capabilities))
-	for n := range view.Capabilities {
-		names = append(names, n)
+// injectDestCap fills dest_capability with the single capability's name in a
+// reply (the model is not asked for it when the destination has one
+// capability).
+func injectDestCap(reply, name string) string {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal([]byte(reply), &obj) != nil {
+		return reply
 	}
-	sort.Strings(names)
-	var b strings.Builder
-	fmt.Fprintf(&b, "destination %s: %s. capabilities: ", dest, view.Spec.Description)
-	for i, n := range names {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		c := view.Capabilities[n]
-		fmt.Fprintf(&b, "%s (%s) parameters: %s", n, c.Description, c.Parameters)
+	obj["dest_capability"] = json.RawMessage(`"` + name + `"`)
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return reply
 	}
-	return b.String()
+	return string(out)
 }
 
 // rejectedAnswer is set's rejected result.

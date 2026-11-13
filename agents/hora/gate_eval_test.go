@@ -6,8 +6,8 @@
 // against d1-2b at HORA_LIVE_URL. It asserts the mechanics, not the
 // accuracy: the table is read at the gate review and after the build. One
 // copy at a time, never in the standing check. The decision goes through
-// destCapContext (set.go), the exact cap_context set builds for the row's
-// capabilities, so the measurement is of what the pipeline really sends.
+// the same capInfo list set builds for the row's capabilities, so the
+// measurement is of what the pipeline really sends.
 package main
 
 import (
@@ -17,8 +17,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"actio-go"
 )
 
 // evalRow is one row of testdata/gate_corpus.json.
@@ -38,30 +36,6 @@ type evalCapability struct {
 // gateEvalDeadline is the per-call deadline the harness gives decide (30 s,
 // the shape the live rows use).
 const gateEvalDeadline = 30 * time.Second
-
-// destView is the synthetic destination the harness measures against: the
-// row's capabilities, each with an empty parameter schema, so the
-// cap_context is exactly what set would build for them.
-func destView(caps []evalCapability) actio.AgentView {
-	m := map[string]actio.Capability{}
-	for _, c := range caps {
-		m[c.Name] = actio.Capability{
-			Name:        c.Name,
-			Description: c.Description,
-			Parameters:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
-		}
-	}
-	return actio.AgentView{ID: "dest", Spec: actio.Spec{Description: "the destination agent"}, Capabilities: m}
-}
-
-// capNames is the row's capability names.
-func capNames(caps []evalCapability) []string {
-	names := make([]string, 0, len(caps))
-	for _, c := range caps {
-		names = append(names, c.Name)
-	}
-	return names
-}
 
 // TestGateEval measures the gates over the corpus (the plan's gate harness).
 func TestGateEval(t *testing.T) {
@@ -124,14 +98,16 @@ func TestGateEval(t *testing.T) {
 		goodAccepted, rejectsRejected, typeRight, typeTotal, failed := 0, 0, 0, 0, 0
 		var latency time.Duration
 		for i, row := range rows {
-			view := destView(row.Capabilities)
-			capCtx := destCapContext(actio.AgentID("dest"), view)
+			caps := make([]capInfo, 0, len(row.Capabilities))
+			for _, c := range row.Capabilities {
+				caps = append(caps, capInfo{Name: c.Name, Description: c.Description})
+			}
 			if i == 0 {
-				t.Logf("cap_context row=01: %s", capCtx)
+				t.Logf("caps row=01: %d capabilities", len(caps))
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), gateEvalDeadline)
 			start := time.Now()
-			verdict, err := m.decide(ctx, row.Prompt, capCtx, capNames(row.Capabilities))
+			verdict, err := m.decide(ctx, row.Prompt, caps)
 			cancel()
 			elapsed := time.Since(start)
 			latency += elapsed

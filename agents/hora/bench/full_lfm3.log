@@ -1,0 +1,32 @@
+01 gate=ok   p=0.979 r1=ok   r2=-    final=one-shot  type=ok   fin=-      5s | Remind me to do a full network scan tomorrow at noon
+02 gate=ok   p=0.956 r1=FAIL r2=ok   final=cron      type=ok   fin=-     34s | Call for do a full back up on sundays 13h
+03 gate=ok   p=0.987 r1=ok   r2=-    final=periodic  type=ok   fin=-      5s | send this prompt every 30 min 'Check workers status and if done start the final stage and unset the scheduler'
+04 gate=ok   p=0.994 r1=FAIL r2=ok   final=cron      type=ok   fin=-     12s | Call the backup capability every day at 13:00
+05 gate=ok   p=0.979 r1=ok   r2=-    final=one-shot  type=ok   fin=-     10s | Remind me to run the network scan on 2026-12-01 at 09:30
+06 gate=ok   p=0.978 r1=ok   r2=-    final=periodic  type=ok   fin=-     11s | Call echo with a status ping every 15 minutes
+07 gate=ok   p=0.985 r1=ok   r2=-    final=one-shot  type=ok   fin=-      4s | Call scan tomorrow at 08:00 with the fast profile
+08 gate=ok   p=0.981 r1=ok   r2=-    final=periodic  type=ok   fin=-      5s | Every 10 minutes call echo to check the queue depth
+09 gate=ok   p=0.962 r1=FAIL r2=ok   final=cron      type=ok   fin=-     57s | Run the echo capability on the first of every month at 00:05
+10 gate=ok   p=0.983 r1=ok   r2=-    final=periodic  type=ok   fin=-     22s | Call scan every 2 hours
+11 gate=ok   p=0.001 r1=-    r2=-    final=-          type=-       0s | what is the capital of France?
+12 gate=ok   p=0.984 r1=-    r2=-    final=-          type=-       0s | Call the report generator every day at 09:00
+13 gate=ok   p=0.015 r1=-    r2=-    final=-          type=-       0s | call echo with hi
+14 gate=ok   p=0.021 r1=-    r2=-    final=-          type=-       0s | Remove the schedule SCH-0a1b2c3d
+15 gate=ok   p=0.006 r1=-    r2=-    final=-          type=-       0s | what time is it in Madrid?
+16 gate=ok   p=0.003 r1=-    r2=-    final=-          type=-       0s | Tell me a joke about go programming
+17 gate=ok   p=0.951 r1=-    r2=-    final=-          type=-       0s | Do something every hour
+18 gate=ok   p=0.336 r1=-    r2=-    final=-          type=-       0s | Set a reminder for the meeting notes
+19 gate=ok   p=0.977 r1=ok   r2=-    final=one-shot  type=ok   fin=-      5s | recuérdame hacer una copia de seguridad mañana a las 9:00
+20 gate=ok   p=0.867 r1=ok   r2=-    final=periodic  type=ok   fin=-     14s | llama a echo cada 15 minutos
+21 gate=ok   p=0.994 r1=FAIL r2=ok   final=cron      type=ok   fin=-     38s | cada domingo a las 13:00 ejecuta la copia de seguridad
+22 gate=ok   p=0.995 r1=ok   r2=-    final=one-shot  type=ok   fin=-     20s | ejecuta scan el 01-12-2026 a las 09:30
+23 gate=ok   p=0.002 r1=-    r2=-    final=-          type=-       0s | ¿cuál es la capital de España?
+24 gate=ok   p=0.024 r1=-    r2=-    final=-          type=-       0s | llama a echo con hola
+25 gate=ok   p=0.968 r1=-    r2=-    final=-          type=-       0s | haz algo cada hora
+26 gate=ok   p=0.128 r1=-    r2=-    final=-          type=-       0s | ponme un recordatorio para las notas de la reunión
+27 gate=ok   p=0.983 r1=FAIL r2=ok   final=one-shot  type=-    fin=BAD   39s | run the backup on 2020-01-01 at 09:00
+28 gate=ok   p=0.989 r1=FAIL r2=ok   final=one-shot  type=-    fin=BAD   31s | ejecuta scan el 01-01-2020 a las 10:00
+29 gate=ok   p=0.882 r1=ok   r2=-    final=one-shot  type=-    fin=BAD   31s | call echo at 09:00 on 2021-12-25
+30 gate=ok   p=0.830 r1=FAIL r2=FAIL final=REJECT    type=-    fin=ok   127s | call echo every 500 milliseconds
+
+gate: 30/30 verdicts | accepted: 18 | r1-pass: 11 | r2-fixed: 6 | final-pass: 17 | extract-rej-ok: 1 | type-ok: 14 | wall: 7m59s

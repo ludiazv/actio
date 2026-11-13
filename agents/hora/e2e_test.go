@@ -405,7 +405,7 @@ func TestE2ESetRejections(t *testing.T) {
 // the answer, and the new sched_id is in it.
 func TestE2EDBBeforeAnswer(t *testing.T) {
 	e := newE2E(t, []string{replyEchoPeriodic60s}, acceptAnswers)
-	res, _ := e.call(e.caller, "set", map[string]any{"prompt": "a slow tick", "dest_id": "dest"})
+	res, _ := e.call(e.caller, "set", map[string]any{"prompt": "a slow echo tick", "dest_id": "dest"})
 	m := map[string]any{}
 	_ = json.Unmarshal(res, &m)
 	if m["result"] != "scheduled" {
@@ -449,7 +449,7 @@ func TestE2EStartCancelledBeforeItCompletes(t *testing.T) {
 // in Hora's diarium, and it is gone after.
 func TestE2EOneShotFires(t *testing.T) {
 	e := newE2E(t, []string{replyOneShotEcho(time.Now().Add(3 * time.Second))}, acceptAnswers)
-	id := e.setAndID("remind me once")
+	id := e.setAndID("remind me once with echo")
 	if ids := e.dbEntryIDs(); !ids[id] {
 		t.Fatalf("the DB has no %s when the scheduled answer arrives: %v", id, ids)
 	}
@@ -465,8 +465,8 @@ func TestE2EOneShotFires(t *testing.T) {
 // diarium, and the cron keeps its zone prefix.
 func TestE2EPeriodicAndCronFire(t *testing.T) {
 	e := newE2E(t, []string{replyEchoPeriodic1s, replyEchoCronEvery}, acceptAnswers)
-	perID := e.setAndID("tick every second")
-	cronID := e.setAndID("beat every second")
+	perID := e.setAndID("echo a tick every second")
+	cronID := e.setAndID("echo a beat every second")
 	await(e.t, "the periodic fires more than once", func() bool { return e.diariumCount("fire "+perID+" dest/echo: confirmed") >= 2 })
 	await(e.t, "the cron fires", func() bool { return e.hasLine("fire " + cronID + " dest/echo: confirmed") })
 	if n := e.ds.echoCount(); n < 3 {
@@ -488,7 +488,7 @@ func TestE2EPeriodicAndCronFire(t *testing.T) {
 // unset, and the DB follows the answer.
 func TestE2EListAndUnsetAcrossOwners(t *testing.T) {
 	e := newE2E(t, []string{replyEchoPeriodic60s}, acceptAnswers)
-	id := e.setAndID("a slow tick")
+	id := e.setAndID("a slow echo tick")
 	for _, r := range []struct {
 		agent *actio.Agent
 		what  string
@@ -555,8 +555,8 @@ func TestE2EOneShotListedDuringSlowCall(t *testing.T) {
 // with its line, before it can fire.
 func TestE2ERestartKeepsEntriesAndCleansExpired(t *testing.T) {
 	e := newE2E(t, []string{replyEchoCronEvery, replyEchoPeriodic1s}, acceptAnswers)
-	cronID := e.setAndID("beat every second")
-	perID := e.setAndID("tick every second")
+	cronID := e.setAndID("echo a beat every second")
+	perID := e.setAndID("echo a tick every second")
 	await(e.t, "both fire before the restart", func() bool {
 		return e.hasLine("fire "+cronID+" dest/echo: confirmed") && e.hasLine("fire "+perID+" dest/echo: confirmed")
 	})

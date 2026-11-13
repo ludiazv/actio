@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/MichaelKinsy/PiG/ai"
 )
@@ -62,20 +63,29 @@ type hints struct {
 	Capability string
 }
 
+// capInfo is one visible capability: name, description, and the
+// parameters schema (JSON string, as published by the destination).
+type capInfo struct {
+	Name        string
+	Description string
+	Parameters  string
+}
+
 // gateVerdict is the outcome of the decision step (D-9).
 type gateVerdict struct {
 	Gate  string
 	OK    bool
 	Hints hints
 	Score float64
+	t     time.Duration
 }
 
 // gate is one named decision gate: a struct of functions, not an interface (D-9).
 type gate struct {
 	name      string
-	state     func(prompt, capContext string) ai.JsonObject
+	state     func(prompt string, caps []capInfo) ai.JsonObject
 	questions func(capNames []string) ai.ClassifierQuestions
-	verdict   func(a ai.ClassifierAnswers, capNames []string) (gateVerdict, error)
+	verdict   func(a ai.ClassifierAnswers, prompt string, capNames []string) (gateVerdict, error)
 }
 
 // gates is the registry of the decision gates (D-9); v1 is D-14.
@@ -92,21 +102,37 @@ func findGate(name string) (gate, bool) {
 }
 
 // decide runs the decision step through the configured gate (D-9).
-func (m *models) decide(ctx context.Context, prompt, capContext string, capNames []string) (gateVerdict, error) {
+func (m *models) decide(ctx context.Context, prompt string, caps []capInfo) (gateVerdict, error) {
 	g, ok := findGate(m.gateName)
 	if !ok {
 		return gateVerdict{}, fmt.Errorf("unknown decision gate %q", m.gateName)
 	}
-	res := ai.ClassifyTypesafeSystemOne(ctx, ai.ClassifierModel{ID: m.decisionModel, API: ai.ClassifierAPITypesafeSystemOne, Provider: "hora", BaseURL: m.decisionBase}, ai.ClassifierContext{State: g.state(prompt, capContext), Questions: g.questions(capNames)}, ai.ClassifierOptions{APIKey: m.decisionKey, APIKeySet: true, Fetch: m.decisionFetch})
-	if res.StopReason != ai.ClassifierStopReasonStop {
-		return gateVerdict{}, fmt.Errorf("decision stopped with %q: %s", res.StopReason, res.ErrorMessage)
+	capNames := make([]string, 0, len(caps))
+	for _, c := range caps {
+		capNames = append(capNames, c.Name)
 	}
-	return g.verdict(res.Answers, capNames)
+	start := time.Now()
+	res := ai.ClassifyTypesafeSystemOne(ctx, ai.ClassifierModel{ID: m.decisionModel, API: ai.ClassifierAPITypesafeSystemOne, Provider: "hora", BaseURL: m.decisionBase}, ai.ClassifierContext{State: g.state(prompt, caps), Questions: g.questions(capNames)}, ai.ClassifierOptions{APIKey: m.decisionKey, APIKeySet: true, Fetch: m.decisionFetch})
+	elapsed := time.Since(start)
+	if res.StopReason != ai.ClassifierStopReasonStop {
+		return gateVerdict{t: elapsed}, fmt.Errorf("decision stopped with %q: %s", res.StopReason, res.ErrorMessage)
+	}
+	v, err := g.verdict(res.Answers, prompt, capNames)
+	v.t = elapsed
+	return v, err
 }
 
-// complete runs one extraction round and returns the reply text (D-7, D-8).
+// complete runs one single-turn extraction round and returns the reply
+// text (D-7, D-8).
 func (m *models) complete(ctx context.Context, system, user string) (string, error) {
-	msg, err := ai.CompleteSimple(ctx, &ai.Model{ID: m.model, ProviderMeta: ai.ProviderMetadata{ProviderID: "hora", API: ai.APIOpenAICompletions, BaseURL: m.baseURL}}, ai.Context{SystemPrompt: system, Messages: []ai.Message{ai.UserMessage{Content: ai.UserText(user)}}}, ai.StreamOptions{APIKey: m.apiKey, MaxTokens: 8192, Fetch: m.fetch})
+	return m.completeChat(ctx, system, []ai.Message{ai.UserMessage{Content: ai.UserText(user)}})
+}
+
+// completeChat runs an extraction round with the full message history, so a
+// round 2 can continue the conversation: the model sees its own first reply
+// as an assistant message before the validation errors (D-6).
+func (m *models) completeChat(ctx context.Context, system string, msgs []ai.Message) (string, error) {
+	msg, err := ai.CompleteSimple(ctx, &ai.Model{ID: m.model, ProviderMeta: ai.ProviderMetadata{ProviderID: "hora", API: ai.APIOpenAICompletions, BaseURL: m.baseURL}}, ai.Context{SystemPrompt: system, Messages: msgs}, ai.StreamOptions{APIKey: m.apiKey, MaxTokens: 8192, Fetch: m.fetch})
 	if err != nil {
 		return "", err
 	}
@@ -165,9 +191,19 @@ const v1ValidCutOff = 0.5
 // gateV1 is the shipped gate v1 (D-14).
 var gateV1 = gate{name: "v1", state: v1State, questions: v1Questions, verdict: v1Verdict}
 
-// v1State is v1's classification state (D-14).
-func v1State(prompt, capContext string) ai.JsonObject {
-	return ai.JsonObject{"request": prompt, "destination": capContext, "modes": "one-shot fires once at a given date and time; cron fires on a calendar pattern; periodic fires every fixed interval"}
+// v1State is v1's classification state (D-14): a single field holding the
+// request and the capabilities as markdown text.
+func v1State(prompt string, caps []capInfo) ai.JsonObject {
+	var b strings.Builder
+	fmt.Fprintf(&b, "User is requesting scheduling with this request:\n%q\nAvailable capabilities are:\n", prompt)
+	for _, c := range caps {
+		if c.Description != "" {
+			fmt.Fprintf(&b, "- %s: %s\n", c.Name, c.Description)
+		} else {
+			b.WriteString("- " + c.Name + "\n")
+		}
+	}
+	return ai.JsonObject{"request": strings.TrimSuffix(b.String(), "\n")}
 }
 
 // v1Questions is v1's questions (D-14); capability is asked only when there
@@ -202,8 +238,10 @@ func v1Questions(capNames []string) ai.ClassifierQuestions {
 
 // v1Verdict is v1's pure verdict (D-14): the score is P(valid), it rejects
 // below v1ValidCutOff, and the hints come from the type and capability
-// answers.
-func v1Verdict(a ai.ClassifierAnswers, capNames []string) (gateVerdict, error) {
+// answers. With multiple capabilities it also requires the request to name
+// one of them, so a request for a non-existent capability is rejected
+// without trusting the model's guess.
+func v1Verdict(a ai.ClassifierAnswers, prompt string, capNames []string) (gateVerdict, error) {
 	raw, ok := answerOf(a, "valid")
 	if !ok {
 		return gateVerdict{}, fmt.Errorf("gate v1: missing answer %q", "valid")
@@ -214,6 +252,19 @@ func v1Verdict(a ai.ClassifierAnswers, capNames []string) (gateVerdict, error) {
 	}
 	if valid.Probability < v1ValidCutOff {
 		return gateVerdict{Gate: "v1", OK: false, Score: valid.Probability}, nil
+	}
+	if len(capNames) >= 2 {
+		lo := strings.ToLower(prompt)
+		named := false
+		for _, n := range capNames {
+			if strings.Contains(lo, strings.ToLower(n)) {
+				named = true
+				break
+			}
+		}
+		if !named {
+			return gateVerdict{Gate: "v1", OK: false, Score: valid.Probability}, nil
+		}
 	}
 	typ, ok := choiceAnswer(a, "type")
 	if !ok {

@@ -1,20 +1,396 @@
 [
-  {"prompt": "Remind me to do a full network scan tomorrow at noon", "capabilities": [{"name": "scan", "description": "scan the network for open ports"}], "want": "accept", "type": "one-shot"},
-  {"prompt": "Call for do a full back up on sundays 13h", "capabilities": [{"name": "backup", "description": "run a full backup of the data volume"}], "want": "accept", "type": "cron"},
-  {"prompt": "send this prompt every 30 min 'Check workers status and if done start the final stage and unset the scheduler'", "capabilities": [{"name": "workers", "description": "report the status of all workers"}], "want": "accept", "type": "periodic"},
-  {"prompt": "Call the backup capability every day at 13:00", "capabilities": [{"name": "backup", "description": "run a full backup of the data volume"}, {"name": "echo", "description": "echo a message back to the caller"}, {"name": "scan", "description": "scan the network for open ports"}], "want": "accept", "type": "cron"},
-  {"prompt": "Remind me to run the network scan on 2026-12-01 at 09:30", "capabilities": [{"name": "backup", "description": "run a full backup of the data volume"}, {"name": "echo", "description": "echo a message back to the caller"}, {"name": "scan", "description": "scan the network for open ports"}], "want": "accept", "type": "one-shot"},
-  {"prompt": "Call echo with a status ping every 15 minutes", "capabilities": [{"name": "backup", "description": "run a full backup of the data volume"}, {"name": "echo", "description": "echo a message back to the caller"}, {"name": "scan", "description": "scan the network for open ports"}], "want": "accept", "type": "periodic"},
-  {"prompt": "Call scan tomorrow at 08:00 with the fast profile", "capabilities": [{"name": "scan", "description": "scan the network for open ports"}, {"name": "backup", "description": "run a full backup of the data volume"}], "want": "accept", "type": "one-shot"},
-  {"prompt": "Every 10 minutes call echo to check the queue depth", "capabilities": [{"name": "echo", "description": "echo a message back to the caller"}, {"name": "backup", "description": "run a full backup of the data volume"}], "want": "accept", "type": "periodic"},
-  {"prompt": "Run the echo capability on the first of every month at 00:05", "capabilities": [{"name": "echo", "description": "echo a message back to the caller"}], "want": "accept", "type": "cron"},
-  {"prompt": "Call scan every 2 hours", "capabilities": [{"name": "scan", "description": "scan the network for open ports"}], "want": "accept", "type": "periodic"},
-  {"prompt": "what is the capital of France?", "capabilities": [{"name": "echo", "description": "echo a message back to the caller"}], "want": "reject", "type": ""},
-  {"prompt": "Call the report generator every day at 09:00", "capabilities": [{"name": "echo", "description": "echo a message back to the caller"}, {"name": "backup", "description": "run a full backup of the data volume"}], "want": "reject", "type": ""},
-  {"prompt": "call echo with hi", "capabilities": [{"name": "echo", "description": "echo a message back to the caller"}], "want": "reject", "type": ""},
-  {"prompt": "Remove the schedule SCH-0a1b2c3d", "capabilities": [{"name": "echo", "description": "echo a message back to the caller"}], "want": "reject", "type": ""},
-  {"prompt": "what time is it in Madrid?", "capabilities": [{"name": "echo", "description": "echo a message back to the caller"}], "want": "reject", "type": ""},
-  {"prompt": "Tell me a joke about go programming", "capabilities": [{"name": "echo", "description": "echo a message back to the caller"}, {"name": "backup", "description": "run a full backup of the data volume"}], "want": "reject", "type": ""},
-  {"prompt": "Do something every hour", "capabilities": [{"name": "echo", "description": "echo a message back to the caller"}, {"name": "backup", "description": "run a full backup of the data volume"}], "want": "reject", "type": ""},
-  {"prompt": "Set a reminder for the meeting notes", "capabilities": [{"name": "echo", "description": "echo a message back to the caller"}, {"name": "backup", "description": "run a full backup of the data volume"}], "want": "reject", "type": ""}
+ {
+  "prompt": "Remind me to do a full network scan tomorrow at noon",
+  "capabilities": [
+   {
+    "name": "scan",
+    "description": "scan the network for open ports"
+   }
+  ],
+  "want": "accept",
+  "type": "one-shot"
+ },
+ {
+  "prompt": "Call for do a full back up on sundays 13h",
+  "capabilities": [
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "accept",
+  "type": "cron"
+ },
+ {
+  "prompt": "send this prompt every 30 min 'Check workers status and if done start the final stage and unset the scheduler'",
+  "capabilities": [
+   {
+    "name": "workers",
+    "description": "report the status of all workers"
+   }
+  ],
+  "want": "accept",
+  "type": "periodic"
+ },
+ {
+  "prompt": "Call the backup capability every day at 13:00",
+  "capabilities": [
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   },
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   },
+   {
+    "name": "scan",
+    "description": "scan the network for open ports"
+   }
+  ],
+  "want": "accept",
+  "type": "cron"
+ },
+ {
+  "prompt": "Remind me to run the network scan on 2026-12-01 at 09:30",
+  "capabilities": [
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   },
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   },
+   {
+    "name": "scan",
+    "description": "scan the network for open ports"
+   }
+  ],
+  "want": "accept",
+  "type": "one-shot"
+ },
+ {
+  "prompt": "Call echo with a status ping every 15 minutes",
+  "capabilities": [
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   },
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   },
+   {
+    "name": "scan",
+    "description": "scan the network for open ports"
+   }
+  ],
+  "want": "accept",
+  "type": "periodic"
+ },
+ {
+  "prompt": "Call scan tomorrow at 08:00 with the fast profile",
+  "capabilities": [
+   {
+    "name": "scan",
+    "description": "scan the network for open ports"
+   },
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "accept",
+  "type": "one-shot"
+ },
+ {
+  "prompt": "Every 10 minutes call echo to check the queue depth",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   },
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "accept",
+  "type": "periodic"
+ },
+ {
+  "prompt": "Run the echo capability on the first of every month at 00:05",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   }
+  ],
+  "want": "accept",
+  "type": "cron"
+ },
+ {
+  "prompt": "Call scan every 2 hours",
+  "capabilities": [
+   {
+    "name": "scan",
+    "description": "scan the network for open ports"
+   }
+  ],
+  "want": "accept",
+  "type": "periodic"
+ },
+ {
+  "prompt": "what is the capital of France?",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   }
+  ],
+  "want": "reject",
+  "type": ""
+ },
+ {
+  "prompt": "Call the report generator every day at 09:00",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   },
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "reject",
+  "type": ""
+ },
+ {
+  "prompt": "call echo with hi",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   }
+  ],
+  "want": "reject",
+  "type": ""
+ },
+ {
+  "prompt": "Remove the schedule SCH-0a1b2c3d",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   }
+  ],
+  "want": "reject",
+  "type": ""
+ },
+ {
+  "prompt": "what time is it in Madrid?",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   }
+  ],
+  "want": "reject",
+  "type": ""
+ },
+ {
+  "prompt": "Tell me a joke about go programming",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   },
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "reject",
+  "type": ""
+ },
+ {
+  "prompt": "Do something every hour",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   },
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "reject",
+  "type": ""
+ },
+ {
+  "prompt": "Set a reminder for the meeting notes",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   },
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "reject",
+  "type": ""
+ },
+ {
+  "prompt": "recuérdame hacer una copia de seguridad mañana a las 9:00",
+  "capabilities": [
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "accept",
+  "type": "one-shot"
+ },
+ {
+  "prompt": "llama a echo cada 15 minutos",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   },
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "accept",
+  "type": "periodic"
+ },
+ {
+  "prompt": "cada domingo a las 13:00 ejecuta la copia de seguridad",
+  "capabilities": [
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "accept",
+  "type": "cron"
+ },
+ {
+  "prompt": "ejecuta scan el 01-12-2026 a las 09:30",
+  "capabilities": [
+   {
+    "name": "scan",
+    "description": "scan the network for open ports"
+   },
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "accept",
+  "type": "one-shot"
+ },
+ {
+  "prompt": "¿cuál es la capital de España?",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   }
+  ],
+  "want": "reject",
+  "type": ""
+ },
+ {
+  "prompt": "llama a echo con hola",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   }
+  ],
+  "want": "reject",
+  "type": ""
+ },
+ {
+  "prompt": "haz algo cada hora",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   },
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "reject",
+  "type": ""
+ },
+ {
+  "prompt": "ponme un recordatorio para las notas de la reunión",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   },
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "reject",
+  "type": ""
+ },
+ {
+  "prompt": "run the backup on 2020-01-01 at 09:00",
+  "capabilities": [
+   {
+    "name": "backup",
+    "description": "run a full backup of the data volume"
+   }
+  ],
+  "want": "accept",
+  "type": "one-shot"
+ },
+ {
+  "prompt": "ejecuta scan el 01-01-2020 a las 10:00",
+  "capabilities": [
+   {
+    "name": "scan",
+    "description": "scan the network for open ports"
+   }
+  ],
+  "want": "accept",
+  "type": "one-shot"
+ },
+ {
+  "prompt": "call echo at 09:00 on 2021-12-25",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   }
+  ],
+  "want": "accept",
+  "type": "one-shot"
+ },
+ {
+  "prompt": "call echo every 500 milliseconds",
+  "capabilities": [
+   {
+    "name": "echo",
+    "description": "echo a message back to the caller"
+   }
+  ],
+  "want": "accept",
+  "type": "periodic"
+ }
 ]

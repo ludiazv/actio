@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -134,6 +135,7 @@ func TestSetValidation(t *testing.T) {
 	rows := []struct {
 		name    string
 		reply   string
+		caps    []string
 		wantSub []string
 	}{
 		{
@@ -176,8 +178,9 @@ func TestSetValidation(t *testing.T) {
 			},
 		},
 		{
-			name:  "an unknown capability",
+			name:  "an unknown capability (two visible: the name check applies)",
 			reply: `{"sched_type":"periodic","sched_expression":"@every 30m","dest_capability":"nope","capability_parameters":{"text":"hi"}}`,
+			caps:  []string{"echo", "scan"},
 			wantSub: []string{
 				`dest_capability "nope": not a visible capability of the destination`,
 			},
@@ -211,7 +214,11 @@ func TestSetValidation(t *testing.T) {
 			srv := newChatServer(t, &recorded{}, "", row.reply, "stop")
 			defer srv.Close()
 			h, _ := newTestHora(t, srv.URL, "", testNow)
-			out, err := h.scheduleFor(ctx, "dest", "call echo every 30 minutes", testDestView("echo"), logf)
+			caps := row.caps
+			if len(caps) == 0 {
+				caps = []string{"echo"}
+			}
+			out, err := h.scheduleFor(ctx, "dest", "call echo every 30 minutes", testDestView(caps...), logf)
 			if err != nil {
 				t.Fatalf("scheduleFor: %v", err)
 			}
@@ -238,8 +245,10 @@ func TestSetValidation(t *testing.T) {
 	}
 }
 
-// TestSetTwoRounds is D-7's round 2: a fresh request with the original
-// prompt, the first reply and the failure reasons, and the same system.
+// TestSetTwoRounds is D-7's round 2: a conversation continuation. The
+// model sees round 1's user message, its own first reply as an assistant
+// message, and a new user message with the validation errors; the system
+// is the same in both rounds.
 func TestSetTwoRounds(t *testing.T) {
 	prompt := "call echo every 30 minutes"
 	badReply := `{"sched_type":"cron","sched_expression":"5 6 7","dest_capability":"echo","capability_parameters":{"text":"hi"}}`
@@ -259,38 +268,60 @@ func TestSetTwoRounds(t *testing.T) {
 	}
 	first := messageContents(t, rl.bodies[0])
 	second := messageContents(t, rl.bodies[1])
-	if len(first) != 2 || len(second) != 2 {
-		t.Fatalf("each request wants exactly a system and a user message: %v, %v", first, second)
+	if len(first) != 2 || len(second) != 4 {
+		t.Fatalf("round 1 wants system+user, round 2 wants system+user+assistant+user: %v, %v", first, second)
 	}
-	// The user message of round 1 is the original prompt, verbatim.
-	if first[1] != prompt {
-		t.Fatalf("round 1 user = %q, want the original prompt %q", first[1], prompt)
-	}
-	// The system is the same in both rounds, and it carries D-7's items.
+	// The system is the same in both rounds, and it carries the static
+	// v2 items: the 3-key contract (one visible capability), the modes
+	// and their formats.
 	if first[0] != second[0] {
 		t.Fatalf("round 2's system differs from round 1's")
 	}
 	system := first[0]
 	for _, sub := range []string{
+		"You are a scheduling assistant",
 		"JSON only",
-		"exactly the keys sched_type, sched_expression, dest_capability, capability_parameters",
+		"exactly the keys sched_type, sched_expression, capability_parameters",
 		"one-shot, cron, periodic",
 		"RFC 3339",
 		"six fields (sec min hour dom month dow)",
 		"@every",
-		"2026-11-08T12:00:00Z UTC",
-		"destination dest: the test destination",
+		"Examples:",
 	} {
 		if !strings.Contains(system, sub) {
 			t.Fatalf("the system prompt lacks %q: %s", sub, system)
 		}
 	}
-	// Round 2 is a fresh request: its user message carries the original
-	// prompt, the first reply and the failure reasons.
-	user := second[1]
-	for _, sub := range []string{prompt, badReply, "cron 5 6 7:"} {
-		if !strings.Contains(user, sub) {
-			t.Fatalf("round 2 user lacks %q: %s", sub, user)
+	if strings.Contains(system, "destination dest") {
+		t.Fatalf("the system prompt carries the destination name: %s", system)
+	}
+	// Round 1's user message is the data block: time, the capability,
+	// the request verbatim.
+	for _, sub := range []string{
+		"2026-11-08T12:00:00Z UTC",
+		"single available capability",
+		"echo does its thing",
+		"Request: " + prompt,
+	} {
+		if !strings.Contains(first[1], sub) {
+			t.Fatalf("round 1 user lacks %q: %s", sub, first[1])
+		}
+	}
+	// Round 2 continues the conversation: same user block, the model's
+	// own first reply, then the validation errors.
+	if second[1] != first[1] {
+		t.Fatalf("round 2's user block differs from round 1's")
+	}
+	var firstJSON, secondJSON map[string]any
+	if json.Unmarshal([]byte(badReply), &firstJSON) != nil || json.Unmarshal([]byte(second[2]), &secondJSON) != nil {
+		t.Fatalf("round 2's assistant message is not JSON: %q", second[2])
+	}
+	if !reflect.DeepEqual(firstJSON, secondJSON) {
+		t.Fatalf("round 2's assistant message = %v, want the first reply %v", secondJSON, firstJSON)
+	}
+	for _, sub := range []string{"failed validation", "cron 5 6 7:"} {
+		if !strings.Contains(second[3], sub) {
+			t.Fatalf("round 2 feedback lacks %q: %s", sub, second[3])
 		}
 	}
 
@@ -316,14 +347,17 @@ func TestSetTwoRounds(t *testing.T) {
 			run:   newRunner(func(string) {}),
 			now:   func() time.Time { return testNow },
 		}
-		p := h.systemPrompt("destination dest: the test destination", hints{})
+		system := extractSystem([]capInfo{{Name: "echo"}})
+		if !strings.Contains(system, "it is read in the config zone") {
+			t.Fatalf("the Madrid system prompt lacks the config-zone rule: %s", system)
+		}
+		user := h.extractUser("call echo every 5 minutes", []capInfo{{Name: "echo"}}, hints{})
 		for _, sub := range []string{
 			"Europe/Madrid",
 			"2026-11-08T13:00:00 +0100 (CET)",
-			"a cron without a prefix is read in the config zone",
 		} {
-			if !strings.Contains(p, sub) {
-				t.Fatalf("the Madrid system prompt lacks %q: %s", sub, p)
+			if !strings.Contains(user, sub) {
+				t.Fatalf("the Madrid user message lacks %q: %s", sub, user)
 			}
 		}
 	})
@@ -391,15 +425,19 @@ func TestSetGate(t *testing.T) {
 		if res["result"] != "scheduled" {
 			t.Fatalf("result = %v, want scheduled: %v", res["result"], res)
 		}
-		want := "gate v1: ok=true score=0.870 type=periodic capability=echo"
-		if len(lines) != 1 || lines[0] != want {
-			t.Fatalf("lines = %v, want exactly [%q]", lines, want)
+		want := "gate v1: ok=true score=0.870 type=periodic capability=echo "
+		if len(lines) != 1 || !strings.HasPrefix(lines[0], want) {
+			t.Fatalf("lines = %v, want exactly [%q...]", lines, want)
 		}
-		// The chat request's system prompt carries the decision's hints.
-		sys := messageContents(t, chat.body)[0]
-		for _, sub := range []string{"Decision hints: type periodic, capability echo"} {
-			if !strings.Contains(sys, sub) {
-				t.Fatalf("the system prompt's hints lack %q: %s", sub, sys)
+		if !strings.Contains(lines[0][len(want):], "time=") {
+			t.Fatalf("the gate line lacks the time: %q", lines[0])
+		}
+		// The chat request's user message carries the decision's hints
+		// (type only: the destination has one visible capability).
+		msgs := messageContents(t, chat.body)
+		for _, sub := range []string{"Decision hints: type periodic."} {
+			if !strings.Contains(msgs[1], sub) {
+				t.Fatalf("the user message's hints lack %q: %s", sub, msgs[1])
 			}
 		}
 	})
@@ -409,9 +447,12 @@ func TestSetGate(t *testing.T) {
 		if res["result"] != "rejected" || res["rejection"] != "not a scheduling request" {
 			t.Fatalf("res = %v, want rejected: not a scheduling request", res)
 		}
-		want := "gate v1: ok=false score=0.100 type= capability="
-		if len(lines) != 1 || lines[0] != want {
-			t.Fatalf("lines = %v, want exactly [%q]", lines, want)
+		want := "gate v1: ok=false score=0.100 type= capability= "
+		if len(lines) != 1 || !strings.HasPrefix(lines[0], want) {
+			t.Fatalf("lines = %v, want exactly [%q...]", lines, want)
+		}
+		if !strings.Contains(lines[0][len(want):], "time=") {
+			t.Fatalf("the gate line lacks the time: %q", lines[0])
 		}
 	})
 
@@ -421,9 +462,12 @@ func TestSetGate(t *testing.T) {
 		if res["result"] != "scheduled" {
 			t.Fatalf("result = %v, want scheduled: %v", res["result"], res)
 		}
-		want := `gate v1: failed: decision stopped with "error": System One API did not return an answer for valid`
-		if len(lines) != 1 || lines[0] != want {
-			t.Fatalf("lines = %v, want exactly [%q]", lines, want)
+		want := `gate v1: failed: decision stopped with "error": System One API did not return an answer for valid `
+		if len(lines) != 1 || !strings.HasPrefix(lines[0], want) {
+			t.Fatalf("lines = %v, want exactly [%q...]", lines, want)
+		}
+		if !strings.Contains(lines[0][len(want):], "time=") {
+			t.Fatalf("the gate line lacks the time: %q", lines[0])
 		}
 	})
 
@@ -611,12 +655,12 @@ func TestSetShell(t *testing.T) {
 	if res["result"] != "scheduled" {
 		t.Fatalf("res = %v, want scheduled", res)
 	}
-	system := messageContents(t, rec.body)[0]
-	if !strings.Contains(system, "destination dest: the test destination") {
-		t.Fatalf("the system prompt lacks the real view's cap_context: %s", system)
+	msgs := messageContents(t, rec.body)
+	if strings.Contains(msgs[0], "destination dest") {
+		t.Fatalf("the system prompt carries the destination name: %s", msgs[0])
 	}
-	if !strings.Contains(system, "echo (echoes its parameters)") {
-		t.Fatalf("the system prompt lacks the capability from the real view: %s", system)
+	if !strings.Contains(msgs[1], "echoes its parameters") {
+		t.Fatalf("the user message lacks the capability from the real view: %s", msgs[1])
 	}
 }
 
