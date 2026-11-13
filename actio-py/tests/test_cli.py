@@ -248,7 +248,7 @@ class CallTest(CliTest):
                 finally:
                     await agent.stop()
             self.assertEqual(code, 0)
-            self.assertEqual(out_txt, 'finalStatus: confirmed\nresult: {"echo": {"x": 1}}\n')
+            self.assertEqual(out_txt, 'finalStatus: confirmed\nresult: {"echo":{"x":1}}\n')
             self.assertEqual(err_txt, "cli: outreq\n")
 
     async def test_the_json_outcome(self) -> None:

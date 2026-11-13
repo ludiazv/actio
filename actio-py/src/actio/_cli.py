@@ -195,7 +195,9 @@ def _print_outcome(do_json: bool, outcome: RequestOutcome) -> None:
         result = cast("dict[str, Any]", res.get("result") or {})
         out(f"error: {result.get('code')} {json.dumps(result.get('msg'))}")
     else:
-        out(f"result: {json.dumps(res.get('result'))}")
+        # Compact separators: the reference prints `JSON.stringify(res.result)`, which puts no space
+        # after a colon, and §6 is the same output, not an equivalent one.
+        out(f"result: {json.dumps(res.get('result'), separators=(',', ':'))}")
     if res.get("cancellation"):
         out("cancellation: true")
 
