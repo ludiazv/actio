@@ -27,10 +27,11 @@ drained; every wait is bounded and named; and the whole output is searched for i
 noise (``Exception ignored``, ``was never awaited``, …). The runtime that ran is printed
 (``node`` version and the bun tell), so "interop green" is never read as "tested on Node".
 
-The ``ls`` row deliberately does NOT compare the two ``ignored`` lists: for a folder that
-published nothing, this side records one ``IgnoredFile`` per missing publication while the
-reference ``continue``s (``../actio-ts/src/discovery.ts``); the difference is left to the
-ruling and is reported, not asserted. Cite the protocol, never a process id, in this file.
+The ``ls`` row compares the two ``ignored`` lists by *path* — a file that is there and wrong is
+named the same on both sides, both CLIs reading one tree. The *reason* wording is reported, not
+asserted: this side carries the parser's error (D-15) and the reference a flat string, and which
+wording the protocol fixes is an open question. Cite the protocol, never a process id, in this
+file.
 """
 
 from __future__ import annotations
@@ -186,11 +187,19 @@ NOISE = (
 
 
 class InteropTest(unittest.TestCase):
-    """One shared root, both agents up for the module, one exchange per row."""
+    """One shared root, both agents up for the module, one exchange per row.
+
+    The sync-provider rows (E20) run their own children in a second root (``sync_root``): the
+    provider is the *child's* environment (``ACTIO_SYNC``), so the module pair's fixed env cannot
+    serve them. Those children are tracked in ``sync_children`` and reaped in ``tearDownClass``,
+    inside the tree's lifetime, with the same exit-code and noise assertions as the module pair.
+    """
 
     root: str
     ts: _Child
     py: _Child
+    sync_root: str
+    sync_children: list[_Child]
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -215,18 +224,29 @@ class InteropTest(unittest.TestCase):
             str(PY_ROOT),
             env_py,
         )
+        # a second root for the sync-provider rows: their children carry ACTIO_SYNC in their env,
+        # so the module pair's fixed env cannot serve them
+        cls.sync_root = tempfile.mkdtemp(prefix="interop-sync-")
+        cls.sync_children = []
         cls._wait_for_specs()
 
     @classmethod
     def tearDownClass(cls) -> None:
         ts_code, ts_out, ts_err = cls.ts.stop()
         py_code, py_out, py_err = cls.py.stop()
+        # the sync-provider children, reaped in the same lifetime as the module pair
+        sync: list[tuple[str, int, str]] = []
+        for child in cls.sync_children:
+            code, out, err = child.stop()
+            sync.append((child.name, code, out + err))
+        cls.sync_children = []
         # `examples/echo_agent.py:5`: SIGINT/SIGTERM is "graceful … then exits 0" on either side. A child
         # that came back any other way died, and the reason is on its pipes — not in the row that killed it,
         # which is why this is checked where the children are reaped, at the end.
         for name, code, text in (
             (TS_AGENT, ts_code, ts_out + ts_err),
             (PY_AGENT, py_code, py_out + py_err),
+            *sync,
         ):
             assert code == 0, f"{name} exited {code}, not 0: {text[-400:]!r}"
             # a child that dies mid-run leaves its noise on its pipes: check both sides
@@ -235,6 +255,7 @@ class InteropTest(unittest.TestCase):
         import shutil
 
         shutil.rmtree(cls.root, ignore_errors=True)
+        shutil.rmtree(cls.sync_root, ignore_errors=True)
 
     @classmethod
     def _wait_for_specs(cls) -> None:
@@ -249,17 +270,20 @@ class InteropTest(unittest.TestCase):
 
     # -- the CLI and the file helpers ----------------------------------------
 
-    def cli(self, side: str, *args: str) -> subprocess.CompletedProcess[str]:
-        """Run one CLI command on `side` ("py" or "ts") against the shared root, bounded."""
+    def cli(
+        self, side: str, *args: str, root: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one CLI command on `side` ("py" or "ts") against `root` (default the shared root), bounded."""
+        use_root = root if root is not None else self.root
         if side == "py":
             cmd = [sys.executable, "-X", "dev", "-W", "error", "-m", "actio", *args]
             cwd, env = (
                 str(PY_ROOT),
-                {**os.environ, "ACTIO_DIR": self.root, "PYTHONPATH": str(PY_SRC)},
+                {**os.environ, "ACTIO_DIR": use_root, "PYTHONPATH": str(PY_SRC)},
             )
         else:
             cmd = [NODE, "--import", "tsx", str(TS_CLI), *args]
-            cwd, env = str(TS_ROOT), {**os.environ, "ACTIO_DIR": self.root}
+            cwd, env = str(TS_ROOT), {**os.environ, "ACTIO_DIR": use_root}
         return subprocess.run(
             cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=CALL_BOUND
         )
@@ -269,9 +293,10 @@ class InteropTest(unittest.TestCase):
             for needle in NOISE:
                 self.assertNotIn(needle, text, f"interpreter noise {needle!r} in: {text[:300]!r}")
 
-    def diarium_lines(self, agent: str) -> list[dict[str, Any]]:
+    def diarium_lines(self, agent: str, root: str | None = None) -> list[dict[str, Any]]:
         """Every line of an agent's diarium, parsed; a line that is not JSON fails the row."""
-        path = Path(self.root) / agent / "diarium.jsonl"
+        base = root if root is not None else self.root
+        path = Path(base) / agent / "diarium.jsonl"
         lines = [t for t in path.read_text().split("\n") if t.strip()]
         out: list[dict[str, Any]] = []
         for i, line in enumerate(lines):
@@ -282,10 +307,10 @@ class InteropTest(unittest.TestCase):
             out.append(doc)
         return out
 
-    def inreq_final_statuses(self, agent: str) -> dict[str, str]:
+    def inreq_final_statuses(self, agent: str, root: str | None = None) -> dict[str, str]:
         """The ``final_status`` of every ``inreq`` record, keyed by its request rid."""
         out: dict[str, str] = {}
-        for doc in self.diarium_lines(agent):
+        for doc in self.diarium_lines(agent, root):
             if doc.get("event") != "inreq":
                 continue
             data = doc.get("event_data") or {}
@@ -293,9 +318,9 @@ class InteropTest(unittest.TestCase):
             out[req.get("rid", "")] = data.get("final_status", "")
         return out
 
-    def outreq_final_statuses(self, agent: str) -> dict[str, str]:
+    def outreq_final_statuses(self, agent: str, root: str | None = None) -> dict[str, str]:
         out: dict[str, str] = {}
-        for doc in self.diarium_lines(agent):
+        for doc in self.diarium_lines(agent, root):
             if doc.get("event") != "outreq":
                 continue
             data = doc.get("event_data") or {}
@@ -303,7 +328,12 @@ class InteropTest(unittest.TestCase):
         return out
 
     def wait_for_record(
-        self, agent: str, event: str, want: str, bound: float = RECORD_BOUND
+        self,
+        agent: str,
+        event: str,
+        want: str,
+        bound: float = RECORD_BOUND,
+        root: str | None = None,
     ) -> dict[str, str]:
         """The `final_status` of every `inreq` (or `outreq`) record of `agent`, once one of them reads
         `want`.
@@ -317,7 +347,7 @@ class InteropTest(unittest.TestCase):
         read = self.inreq_final_statuses if event == "inreq" else self.outreq_final_statuses
         deadline = time.monotonic() + bound
         while True:
-            found = read(agent)
+            found = read(agent, root)
             if any(v == want for v in found.values()):
                 return found
             if time.monotonic() >= deadline:
@@ -531,13 +561,19 @@ class InteropTest(unittest.TestCase):
                 [(c["name"], c["disabled"], c["accepts_from"]) for c in b["capabilities"]],
                 f"{agent} capability details differ",
             )
-        # the two `ignored` lists agree: same paths and same reasons (sorted, so order is not the
-        # claim; both CLIs read one tree, so a listed path is the same string on both sides)
+        # the two `ignored` lists name the same files: the protocol makes the *path* visible (a
+        # file that is there and wrong), so the paths are compared. The *reason* wording is not
+        # compared — this side carries the parser's error (D-15) and the reference a flat string,
+        # and which wording the protocol fixes is an open question — so it is reported, not asserted.
         self.assertEqual(
-            sorted(py["ignored"], key=lambda i: i["path"]),
-            sorted(ts["ignored"], key=lambda i: i["path"]),
-            "the two `ignored` lists differ",
+            sorted(i["path"] for i in py["ignored"]),
+            sorted(i["path"] for i in ts["ignored"]),
+            "the two `ignored` lists name different files",
         )
+        for i in py["ignored"]:
+            print(f"interop ls ignored (py): {i['path']}: {i['reason']}")
+        for i in ts["ignored"]:
+            print(f"interop ls ignored (ts): {i['path']}: {i['reason']}")
 
     # -- row 8: the diarium, both ways ---------------------------------------
 
@@ -563,6 +599,103 @@ class InteropTest(unittest.TestCase):
         # the exchange records' final_status values agree with what the rows did
         self.wait_for_record(TS_AGENT, "inreq", "confirmed")
         self.wait_for_record(PY_AGENT, "inreq", "confirmed")
+
+    # -- row 9: the sync providers, E1 under each (E20) -----------------------
+
+    def _sync_pair(self, provider: str, mutagen_bin: Path | None = None) -> None:
+        """One Python and one TS agent in the sync root, with ``ACTIO_SYNC=<provider>`` in the
+        child's environment; the mutagen arm points ``ACTIO_MUTAGEN_BIN`` at a fake binary that
+        records its arguments. The children are registered for reaping in ``tearDownClass``."""
+        env_ts = {
+            **os.environ,
+            "ACTIO_DIR": self.sync_root,
+            "ACTIO_AGENT_ID": TS_AGENT,
+            "ACTIO_HEARTBEAT": "2",
+            "ACTIO_SYNC": provider,
+        }
+        env_py = {
+            **os.environ,
+            "ACTIO_DIR": self.sync_root,
+            "ACTIO_AGENT_ID": PY_AGENT,
+            "ACTIO_HEARTBEAT": "2",
+            "ACTIO_SYNC": provider,
+            "PYTHONPATH": str(PY_SRC),
+        }
+        if mutagen_bin is not None:
+            env_ts["ACTIO_MUTAGEN_BIN"] = str(mutagen_bin)
+            env_py["ACTIO_MUTAGEN_BIN"] = str(mutagen_bin)
+        ts = _Child(TS_AGENT, [NODE, "--import", "tsx", str(TS_EXAMPLE)], str(TS_ROOT), env_ts)
+        py = _Child(
+            PY_AGENT,
+            [sys.executable, "-X", "dev", "-W", "error", str(PY_EXAMPLE)],
+            str(PY_ROOT),
+            env_py,
+        )
+        self.sync_children.append(ts)
+        self.sync_children.append(py)
+        self._wait_for_sync_specs()
+
+    def _wait_for_sync_specs(self) -> None:
+        end = time.monotonic() + PUBLISH_BOUND
+        while time.monotonic() < end:
+            if (Path(self.sync_root) / TS_AGENT / "spec.json").is_file() and (
+                Path(self.sync_root) / PY_AGENT / "spec.json"
+            ).is_file():
+                return
+            time.sleep(0.2)
+        raise AssertionError(f"a sync agent did not publish spec.json within {PUBLISH_BOUND}s")
+
+    def _sync_echo(self, provider: str) -> None:
+        """The E1 exchange (echo) between the two sync agents: the Python CLI calls the TS agent,
+        both sides end ``confirmed``, and the answer is echoed — the same protocol-named fields as
+        the ``none`` row (*Sync and Race Conditions*: the outcome is the protocol's, not the
+        transport's)."""
+        r = self.cli(
+            "py", "call", PY_CLI, TS_AGENT, "echo", '{"text":"provider"}', root=self.sync_root
+        )
+        self.assert_no_noise(r.stdout, r.stderr)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("finalStatus: confirmed", r.stdout)
+        self.assertIn('result: {"text":"provider"}', r.stdout)  # the compact form
+        self.assertIn(f"{PY_CLI}: outreq", r.stderr)
+        self.wait_for_record(TS_AGENT, "inreq", "confirmed", root=self.sync_root)
+        self.wait_for_record(PY_CLI, "outreq", "confirmed", root=self.sync_root)
+
+    def test_12_sync_none(self) -> None:
+        self._sync_pair("none")
+        self._sync_echo("none")
+
+    def test_13_sync_delay(self) -> None:
+        self._sync_pair("delay:20")
+        self._sync_echo("delay:20")
+
+    def test_14_sync_fsync_delay(self) -> None:
+        self._sync_pair("fsync+delay:20")
+        self._sync_echo("fsync+delay:20")
+
+    def test_15_sync_mutagen(self) -> None:
+        # the reference's fake binary: a #!/bin/sh script that appends "$@" to a log in the tree;
+        # the provider reads ACTIO_MUTAGEN_BIN at run time
+        log = Path(self.sync_root) / "mutagen.log"
+        bin_path = Path(self.sync_root) / "mutagen-fake"
+        bin_path.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\n', encoding="utf-8")
+        bin_path.chmod(0o755)
+        self._sync_pair("mutagen:robustness", mutagen_bin=bin_path)
+        self._sync_echo("mutagen:robustness")
+        # the debounced flush (200 ms after the last write) reached the fake binary: at least one
+        # `sync flush <session>`. The bound is the row's, named in the failure; the flush has no
+        # protocol deadline, only the agent's clock.
+        flush_bound = 10.0
+        end = time.monotonic() + flush_bound
+        while time.monotonic() < end:
+            if log.is_file() and "sync flush robustness" in log.read_text():
+                break
+            time.sleep(0.1)
+        self.assertTrue(
+            log.is_file() and "sync flush robustness" in log.read_text(),
+            f"the mutagen fake binary never logged a flush within {flush_bound}s: "
+            f"{log.read_text() if log.is_file() else '(missing)'}",
+        )
 
 
 if __name__ == "__main__":
