@@ -121,6 +121,9 @@ def setUpModule() -> None:  # noqa: N802 - the unittest module hook
     )
 
 
+RECORD_BOUND = 15.0  # how long a row waits for the other side's diarium line: `wait_for_record`
+
+
 class _Child:
     """One long-running agent: its pipes are drained on threads (a full pipe is a child that
     never finishes), and it is reaped inside the tree's lifetime with a bound."""
@@ -295,6 +298,28 @@ class InteropTest(unittest.TestCase):
             out[data.get("rid", "")] = data.get("final_status", "")
         return out
 
+    def wait_for_record(
+        self, agent: str, event: str, want: str, bound: float = RECORD_BOUND
+    ) -> dict[str, str]:
+        """The `final_status` of every `inreq` (or `outreq`) record of `agent`, once one of them reads
+        `want`.
+
+        A CLI prints its outcome when **its own** side of the exchange is archived; the other side appends
+        its line around the same moment, so a diarium read the instant the child exits can miss it — and
+        under load, with eight copies of this suite on one machine, it does. The bound is what the row
+        waits, named in the failure; it is not the protocol's, because the line has no deadline, only the
+        two processes' clocks.
+        """
+        read = self.inreq_final_statuses if event == "inreq" else self.outreq_final_statuses
+        deadline = time.monotonic() + bound
+        while True:
+            found = read(agent)
+            if any(v == want for v in found.values()):
+                return found
+            if time.monotonic() >= deadline:
+                self.fail(f"{agent}: no {event} record reading {want!r} within {bound}s: {found}")
+            time.sleep(0.05)
+
     # -- row 1-4: the reference CLI calls this side's agent ------------------
 
     def test_01_ts_cli_py_echo(self) -> None:
@@ -305,10 +330,8 @@ class InteropTest(unittest.TestCase):
         self.assertIn('result: {"text":"hello from ts"}', r.stdout)  # the compact form
         self.assertIn(f"{TS_CLI_ID}: outreq", r.stderr)
         # the exchange's files, both sides: the receiver's inreq and the caller's outreq
-        inreq = self.inreq_final_statuses(PY_AGENT)
-        self.assertTrue(any(v == "confirmed" for v in inreq.values()), inreq)
-        outreq = self.outreq_final_statuses(TS_CLI_ID)
-        self.assertTrue(any(v == "confirmed" for v in outreq.values()), outreq)
+        self.wait_for_record(PY_AGENT, "inreq", "confirmed")
+        self.wait_for_record(TS_CLI_ID, "outreq", "confirmed")
 
     def test_02_ts_cli_py_fail(self) -> None:
         r = self.cli("ts", "call", TS_CLI_ID, PY_AGENT, "fail", "{}")
@@ -328,8 +351,7 @@ class InteropTest(unittest.TestCase):
         # no work was done: a rejection at A0 is answered before the handler runs, so the
         # receiver's diarium carries the inreq as an answered (confirmed) rejection, not a
         # busy status for work that never started.
-        inreq = self.inreq_final_statuses(PY_AGENT)
-        self.assertTrue(any(v == "confirmed" for v in inreq.values()), inreq)
+        self.wait_for_record(PY_AGENT, "inreq", "confirmed")
 
     def test_04_ts_cli_py_sleep_cancelled(self) -> None:
         # --timeout 3 is whole seconds (a sub-second timeout is already expired when the peer
@@ -342,10 +364,8 @@ class InteropTest(unittest.TestCase):
         self.assertIn("finalStatus: cancelled", r.stdout)
         self.assertIn("cancellation: true", r.stdout)
         self.assertIn(f"{TS_CLI_ID}: outreq", r.stderr)
-        inreq = self.inreq_final_statuses(PY_AGENT)
-        self.assertTrue(any(v == "cancelled" for v in inreq.values()), inreq)
-        outreq = self.outreq_final_statuses(TS_CLI_ID)
-        self.assertTrue(any(v == "cancelled" for v in outreq.values()), outreq)
+        self.wait_for_record(PY_AGENT, "inreq", "cancelled")
+        self.wait_for_record(TS_CLI_ID, "outreq", "cancelled")
         # the peer is alive and answering afterwards
         after = self.cli("ts", "call", TS_CLI_ID, PY_AGENT, "echo", '{"text":"still here"}')
         self.assert_no_noise(after.stdout, after.stderr)
@@ -361,10 +381,8 @@ class InteropTest(unittest.TestCase):
         self.assertIn("finalStatus: confirmed", r.stdout)
         self.assertIn('result: {"text":"hello from py"}', r.stdout)
         self.assertIn(f"{PY_CLI}: outreq", r.stderr)
-        inreq = self.inreq_final_statuses(TS_AGENT)
-        self.assertTrue(any(v == "confirmed" for v in inreq.values()), inreq)
-        outreq = self.outreq_final_statuses(PY_CLI)
-        self.assertTrue(any(v == "confirmed" for v in outreq.values()), outreq)
+        self.wait_for_record(TS_AGENT, "inreq", "confirmed")
+        self.wait_for_record(PY_CLI, "outreq", "confirmed")
 
     def test_06_py_cli_ts_fail(self) -> None:
         r = self.cli("py", "call", PY_CLI, TS_AGENT, "fail", "{}")
@@ -381,8 +399,7 @@ class InteropTest(unittest.TestCase):
         self.assertIn("finalStatus: confirmed", r.stdout)
         self.assertRegex(r.stdout, r"error: 103 .*")
         self.assertIn(f"{PY_CLI}: outreq", r.stderr)
-        inreq = self.inreq_final_statuses(TS_AGENT)
-        self.assertTrue(any(v == "confirmed" for v in inreq.values()), inreq)
+        self.wait_for_record(TS_AGENT, "inreq", "confirmed")
 
     def test_08_py_cli_ts_sleep_cancelled(self) -> None:
         r = self.cli("py", "call", PY_CLI, TS_AGENT, "sleep", '{"seconds": 10}', "--timeout", "3")
@@ -391,10 +408,8 @@ class InteropTest(unittest.TestCase):
         self.assertIn("finalStatus: cancelled", r.stdout)
         self.assertIn("cancellation: true", r.stdout)
         self.assertIn(f"{PY_CLI}: outreq", r.stderr)
-        inreq = self.inreq_final_statuses(TS_AGENT)
-        self.assertTrue(any(v == "cancelled" for v in inreq.values()), inreq)
-        outreq = self.outreq_final_statuses(PY_CLI)
-        self.assertTrue(any(v == "cancelled" for v in outreq.values()), outreq)
+        self.wait_for_record(TS_AGENT, "inreq", "cancelled")
+        self.wait_for_record(PY_CLI, "outreq", "cancelled")
         after = self.cli("py", "call", PY_CLI, TS_AGENT, "echo", '{"text":"still here"}')
         self.assert_no_noise(after.stdout, after.stderr)
         self.assertEqual(after.returncode, 0, after.stderr)
@@ -535,8 +550,8 @@ class InteropTest(unittest.TestCase):
         self.assertTrue(any(d.get("event") == "inreq" for d in ts_read), ts_read)
 
         # the exchange records' final_status values agree with what the rows did
-        self.assertTrue(any(v == "confirmed" for v in self.inreq_final_statuses(TS_AGENT).values()))
-        self.assertTrue(any(v == "confirmed" for v in self.inreq_final_statuses(PY_AGENT).values()))
+        self.wait_for_record(TS_AGENT, "inreq", "confirmed")
+        self.wait_for_record(PY_AGENT, "inreq", "confirmed")
 
 
 if __name__ == "__main__":
