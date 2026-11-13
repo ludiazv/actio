@@ -37,7 +37,7 @@ from ._protocol import (
     Status,
     StatusState,
 )
-from ._receiver import Receiver
+from ._receiver import STANDARD_COMMANDS, Receiver
 from ._requestor import Requestor
 from ._spec_builder import build_spec
 from ._status import StatusPublisher, build_status, heartbeat
@@ -62,8 +62,7 @@ from ._types import (
 from ._validate import CapabilityValidator, compile_capability
 from ._watch import AUDIT_SECONDS, FolderWatch, Watcher
 
-# The mandatory commands (*Commands*); `on_command` cannot shadow them, and they are never advertised.
-STANDARD_COMMANDS: frozenset[str] = frozenset({"stop", "enable", "restart", "ping"})
+# The four mandatory commands live with the receiver, which is the only party that can judge a name (D0).
 
 # D-10: the restart `delay` is clamped here; an unbounded delay lets a peer keep the agent down.
 RESTART_DELAY_MAX = 60.0
@@ -394,7 +393,9 @@ class ActioAgent:
             watcher = await Watcher.open(self._spawn, audit_seconds=AUDIT_SECONDS)
             run.watcher = watcher
             ctx = _Ctx(self, run)
-            run.receiver = Receiver(ctx, _ReceiverHooks(self), watcher, self._spawn)
+            run.receiver = Receiver(
+                ctx, _ReceiverHooks(self), watcher, self._spawn, custom_commands=self._commands
+            )
             run.requestor = Requestor(ctx, _RequestorHooks(self), watcher, self._spawn)
             # Nuntium (D-17): every event schedules one debounced full scan; the first discovery of
             # the workflow (step 4) runs now, not after the debounce.

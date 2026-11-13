@@ -7,7 +7,7 @@ import contextlib
 import dataclasses
 import os
 import re
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -34,12 +34,14 @@ from ._protocol import (
     RequestBody,
     RequestFile,
     ResponseFile,
+    Rid,
     Spec,
 )
 from ._types import (
     ActioError,
     AgentContext,
     CapabilityHandler,
+    CommandHandler,
     IgnoredEvent,
     InreqEvent,
     LogEvent,
@@ -76,6 +78,10 @@ STOPPING_RESULT: dict[str, Any] = {"code": 300, "msg": AGENT_STOPPING_MSG}
 HANDLER_CANCEL_WAIT = 1.0
 
 CONFIRM_POLL = 0.05  # the shortest sleep the confirmation wait takes between scans
+
+# The commands every agent implements (*Commands*). They are never advertised, so D0's question — is this
+# "a command the agent knows" — can only be judged here, against these names and the agent's own table.
+STANDARD_COMMANDS: frozenset[str] = frozenset({"stop", "enable", "restart", "ping"})
 
 
 class ReceiverHooks(Protocol):
@@ -150,6 +156,16 @@ class _CapabilityContext:
         return await self._receiver._publish_attachment(self._ex, name, data)
 
 
+@dataclasses.dataclass(slots=True)
+class _CommandContext:
+    """What a custom command's handler is told: the envelope and its sender, one fresh object per
+    envelope. Commands are never answered and never cancelled (*Request and command files*, rule 5), so
+    there is nothing else to hand over — and the handler has no way back into the exchange from here."""
+
+    rid: Rid
+    src: AgentId
+
+
 class Receiver:
     """Serves one agent's inbox until `stop`; created at `start`, closed by `stop`."""
 
@@ -160,8 +176,15 @@ class Receiver:
         watch: Watcher,
         spawn: Spawn,
         handler_cancel_wait: float = HANDLER_CANCEL_WAIT,
+        custom_commands: Mapping[str, CommandHandler] | None = None,
     ) -> None:
         self._ctx, self._hooks, self._watch, self._spawn = ctx, hooks, watch, spawn
+        # D0: a name the agent "implements internally" is one the receiver can judge, so the agent hands
+        # over its own table — the live dict, which is why `on_command` after `start()` still counts. The
+        # empty table has to stay the agent's: `{}` is false, and a `… or {}` would swap in a dead dict.
+        self._custom: Mapping[str, CommandHandler] = (
+            {} if custom_commands is None else custom_commands
+        )
         # D-9's bound, shrinkable in tests; the agent leaves it at the module constant.
         self._handler_cancel_wait = handler_cancel_wait
         self._handlers: _HandlerTable = cast(_HandlerTable, ctx)
@@ -742,7 +765,7 @@ class Receiver:
         spec = self._ctx.spec()  # read fresh: `enable` may have changed the list since we started
         if file["src"] not in spec.get("accepts_commands_from", []):
             return f"{file['src']} is not in accepts_commands_from"
-        if name not in ("stop", "enable", "restart", "ping"):
+        if name not in STANDARD_COMMANDS and name not in self._custom:
             return f"unknown command {name!r}"
         return None
 
@@ -766,12 +789,17 @@ class Receiver:
                 self._ctx.emit(LogEvent(message=f"command {rid} failed: {err}"))
 
     async def _run_command(self, file: RequestFile, name: str) -> None:
-        # D1-D3: the archive always completes BEFORE the lifecycle hook runs; the `restart` delay
-        # only starts after it (D-10).
-        await self._archive_command(file, "completed")
+        # D1-D3: a standard command archives BEFORE the lifecycle hook runs ("the archive is always
+        # completed before shutting down"), and the `restart` delay only starts after it (D-10). A custom
+        # command is the other way round: the handler is the work D2 asks for, so it runs first and the
+        # envelope archives `completed` afterwards, whatever the handler did.
         body = file["request"]
         params = body.get("parameters") if isinstance(body, dict) else {}
         params = params if isinstance(params, dict) else {}
+        if (custom := self._custom.get(name)) is not None:
+            await self._run_custom_command(file, name, params, custom)
+            return
+        await self._archive_command(file, "completed")
         if name == "stop":
             await self._hooks.on_command_stop(params.get("force") is True)
         elif name == "restart":
@@ -783,6 +811,20 @@ class Receiver:
             await self._hooks.on_command_enable(params.get("enabled") is True)
         else:
             await self._hooks.on_command_ping()
+
+    async def _run_custom_command(
+        self, file: RequestFile, name: str, params: dict[str, Any], handler: CommandHandler
+    ) -> None:
+        # A handler's failure is an internal one, not a protocol state: D0 accepted the envelope, so D4 is
+        # ruled out and there is nothing to answer — commands generate no response. It still archives as
+        # `completed`, and the operator gets the one line.
+        try:
+            await handler(params, _CommandContext(rid=file["rid"], src=file["src"]))
+        except Exception as err:
+            why = f"command {name} from {file['src']} failed: {err}"
+            self._ctx.emit(LogEvent(message=why))
+            await self._ctx.append_diarium(log_event(self._ctx.id, self._ctx.now(), why))
+        await self._archive_command(file, "completed")
 
     async def _archive_command(
         self, file: RequestFile, final_status: InreqFinalStatus, reason: str | None = None
