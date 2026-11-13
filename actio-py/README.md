@@ -47,22 +47,35 @@ from actio import ActioAgent
 ECHO = {
     "name": "echo",
     "description": "echoes the text it gets",
-    "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"],
-                    "additionalProperties": False},
-    "actio": {"result": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
+    "parameters": {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+        "additionalProperties": False,
+    },
+    "actio": {
+        "result": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        }
+    },
 }
+
 
 async def echo(params, ctx):
     return {"text": params["text"]}
 
+
 async def main() -> None:
     beta = ActioAgent(id="beta", description="the echo agent", accepts_commands_from=["alpha"])
-    beta.capability(ECHO, echo)                  # or @beta.capability(ECHO)
-    await beta.start()                           # ACTIO_DIR names the shared tree
+    beta.capability(ECHO, echo)  # or @beta.capability(ECHO)
+    await beta.start()  # ACTIO_DIR names the shared tree
     try:
-        await beta.wait_stopped()                # a `stop` command, or SIGINT in the example
+        await beta.wait_stopped()  # a `stop` command, or SIGINT in the example
     finally:
         await beta.stop()
+
 
 asyncio.run(main())
 ```
@@ -75,8 +88,8 @@ Its peer calls it by id:
 
 ```python
 outcome = await alpha.request("beta", "echo", {"text": "hello"}, timeout=10)
-print(outcome.response["result"])        # {'text': 'hello'}
-print(outcome.final_status)              # 'confirmed'
+print(outcome.response["result"])  # {'text': 'hello'}
+print(outcome.final_status)  # 'confirmed'
 ```
 
 `examples/echo_agent.py` is the black-box conformance target: five capabilities and a `noop` command

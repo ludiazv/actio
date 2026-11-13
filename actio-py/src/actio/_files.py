@@ -292,7 +292,9 @@ async def list_dir(path: str) -> list[str]:
 # What one publication file came back as: `("text", the text)`, `("missing", "")`, `("unreadable",
 # the reason)` or `("unparsable", the reason)`. A reason is one line and never a value of the peer's
 # (D-15); a file that is readable but not UTF-8 is unparsable, and its reason is the flat one — the
-# read itself succeeded, so the decoder's message stays out of a peer's file's report (I-9).
+# read itself succeeded, so the decoder's message stays out of a peer's file's report. The reference
+# cannot see the difference: its `readFile(target, "utf8")` turns an invalid byte into U+FFFD and
+# never raises (../actio-ts/src/io.ts:59), so mangled text reaches its parser instead.
 Publication = tuple[str, str]
 
 
