@@ -395,11 +395,6 @@ class Receiver:
     async def _process_file(self, name: str) -> None:
         if not name.endswith(".json"):
             return
-        if self._stopped and not self._owed_during_stop(name):
-            # While `stop()` waits out phase (3), the inbox is open to one thing: the confirmation, or a late
-            # cancellation, of an exchange this stop has already answered. A new request is still refused, and
-            # so is a second answer (`_respond`'s guard); `A2` writes nothing after the stop starts.
-            return
         path = os.path.join(self._inbox, name)
         value, reason = await self._read_envelope(path)
         if value is None:
@@ -408,6 +403,13 @@ class Receiver:
             return
         if (kind := envelope_kind(value)) is None:
             await self._ignore(path, name, validate("request", value) or "no envelope body key")
+            return
+        if self._stopped and not self._owed_during_stop(kind, value):
+            # While `stop()` waits out phase (3), the inbox is open to one thing: the confirmation, or a late
+            # cancellation, of an exchange this stop has already answered. The file is admitted by its body
+            # key — the receiver's own classification, which a name never stands in for — and by the `rid`
+            # in its body, never the name. A new request is still refused, and so is a second answer
+            # (`_respond`'s guard); `A2` writes nothing after the stop starts.
             return
         if isinstance(value[kind], str):
             await self._ignore(path, name, "base64 body (encryption is not supported)")
@@ -424,14 +426,15 @@ class Receiver:
                 cast(CancellationFile | ConfirmationFile, value), path, name, kind
             )
 
-    def _owed_during_stop(self, name: str) -> bool:
-        """Is this inbox file owed while `stop()` waits for confirmations? Only a confirmation or a
-        cancellation whose rid is an exchange answered here and not yet confirmed: never a request."""
-        for suffix in (".con.json", ".can.json"):
-            if name.endswith(suffix):
-                ex = self._exchanges.get(name[: -len(suffix)])
-                return ex is not None and ex.res is not None and ex.con is None
-        return False
+    def _owed_during_stop(self, kind: str, value: dict[str, Any]) -> bool:
+        """Is this inbox file owed while `stop()` waits for confirmations? Decided by the body, as the
+        normal path decides it: a confirmation or a cancellation whose `rid` in its body is an exchange
+        answered here and not yet confirmed. Never a request — and never the file's name."""
+        if kind not in ("confirmation", "cancellation"):
+            return False
+        rid = value.get("rid")
+        ex = self._exchanges.get(rid) if isinstance(rid, str) else None
+        return ex is not None and ex.res is not None and ex.con is None
 
     async def _read_envelope(self, path: str) -> tuple[dict[str, Any] | None, str | None]:
         # (value, ignore-reason); a vanished file is (None, None).
