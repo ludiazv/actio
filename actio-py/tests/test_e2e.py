@@ -15,6 +15,7 @@ that ends the row with an assertion naming it instead of a run that never return
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 import secrets
@@ -1873,6 +1874,98 @@ class E2ETest(ActioTestCase):
                 in_final="confirmed",
                 out_final="confirmed",
                 attachments=("att.txt",),
+            )
+
+    # --- E17 ------------------------------------------------------------------------
+
+    async def test_e17_pending_envelopes_at_startup_are_processed_as_if_just_arrived(
+        self,
+    ) -> None:
+        """E17: pending envelopes at startup — the receiver is stopped, two requests land in
+        its inbox (one whose `timeout` is still in the future, one already spent), and the
+        start's scan processes them as if they had just arrived (D-4): the fresh one is served
+        and, with no requestor to confirm, archives `completed`; the spent one is refused by
+        `A0` with 108 `request_expired`. The protocol leaves pending envelopes to each
+        implementation (*Assumptions and non-goals*: "Each implementation decides",
+        `../doc/actio_protocol.md:65`; *Implementation guidance*, `:991`); D-4 chooses
+        "process them as if they had just arrived". *Acceptance errors* 108, `:582`."""
+        with actio_tree() as root:
+            handlers = full_handlers([], asyncio.Event(), [])
+            alpha, beta = await self.pair(root, handlers=handlers)
+            rec = InboxRecorder(root / BETA / "inbox")
+            rec.start()
+            self.addAsyncCleanup(rec.stop)
+            await bounded(beta.stop(), STOP_BOUND, "the receiver's stop")
+            # both files while the receiver is inactive: the fresh one (30 s of headroom, far
+            # past the 2 s floor, so the whole-second `ts` cannot spend it) and the spent one
+            # (100 s past its 5 s `timeout`, the E3 idiom)
+            fresh = write_request(root, ALPHA, BETA, "echo", {"text": "x"}, timeout=30)
+            spent = write_request(
+                root, ALPHA, BETA, "echo", {"text": "x"}, timeout=5, ts_offset=-100
+            )
+            await bounded(beta.start(), START_BOUND, "the receiver's start")
+            await until(
+                "both pending requests to be archived",
+                lambda: (
+                    inreq_final(root, BETA, fresh) is not None
+                    and inreq_final(root, BETA, spent) is not None
+                ),
+                SETTLE,
+            )
+            recv = await read_diarium(str(root / BETA))
+            fresh_res = cast("dict[str, Any]", inreq_line(recv, fresh)["res"])["response"]
+            self.assertNotIn(
+                "code",
+                cast("dict[str, Any]", fresh_res["result"]),
+                "the fresh request was served, not refused",
+            )
+            spent_res = cast("dict[str, Any]", inreq_line(recv, spent)["res"])["response"]
+            self.assertEqual(
+                int(cast("dict[str, Any]", spent_res["result"])["code"]),
+                108,
+                "request_expired",
+            )
+            for rid in (fresh, spent):
+                # no requestor: no confirmation ever arrives, so the archive is `completed`
+                # and no `outreq` line is owed (out_final=None)
+                await self.assert_exchange(
+                    root,
+                    ALPHA,
+                    BETA,
+                    rid,
+                    rec,
+                    inbox_order=("req", "res"),
+                    in_final="completed",
+                    out_final=None,
+                )
+
+    # --- E19 ------------------------------------------------------------------------
+
+    async def test_e19_a_running_agent_keeps_its_status_fresh(self) -> None:
+        """E19: heartbeat freshness on a live agent, no traffic — `status.json`'s `datetime`
+        is sampled over ~3 s and never reads older than the 0.5 s `heartbeat_interval` plus
+        the row's named slack of 1.5 s: 1 s for the whole-second `datetime` (the fraction is
+        floored away) and 0.5 s for the write's scheduling. The rule is *Agent's status* rule
+        3 — update the status at least every 90 s, observed here at the suite's shorter 0.5 s
+        interval — and *Responsibilities* row 5 (`../doc/actio_protocol.md:373,751`). The tick
+        mechanism is `tests/test_status.py`'s; this row observes the live agent's file."""
+        with actio_tree() as root:
+            agent = self.make_agent(root, ALPHA)
+            await bounded(agent.start(), START_BOUND, "the agent's start")
+            interval = 0.5  # the suite's configured `heartbeat_interval`
+            slack = 1.5  # named: 1 s of whole-second `datetime` + 0.5 s of write scheduling
+            bound = interval + slack
+            oldest = 0.0
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                status = json.loads((root / ALPHA / "status.json").read_text())
+                updated = datetime.datetime.fromisoformat(str(status["datetime"])).timestamp()
+                oldest = max(oldest, time.time() - updated)
+                await asyncio.sleep(0.2)
+            self.assertLessEqual(
+                oldest,
+                bound,
+                f"the oldest read was {oldest:.2f} s old (bound {bound:.1f} s)",
             )
 
     # --- E21 ------------------------------------------------------------------------
