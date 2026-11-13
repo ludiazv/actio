@@ -2667,3 +2667,169 @@ class TwoAgentTest(AgentTest):
                 ["completed"],
                 "an answer nobody confirmed archives as `completed`, with its line",
             )
+
+    async def test_a_confirmation_written_under_an_unusual_name_is_admitted_during_the_stop(
+        self,
+    ) -> None:
+        """D-9's confirmation wait admits what the inbox owes by the **body key** — the receiver's own
+        classification, the one the normal path uses — and by the `rid` in that body: file names are
+        "recommended but not enforced by the protocol" (`../doc/actio_protocol.md:448`), and the name rule
+        is the CLI's files', never the inbox's. So a confirmation that arrives as `<rid>.late.json`, a name
+        no rule recommends, is admitted exactly like `<rid>.con.json`: the exchange ends `confirmed`, and
+        the confirmation is recorded in the archive."""
+        grace = 0.2
+        async with self.tree() as root:
+            parked = asyncio.Event()
+
+            async def park(params: dict[str, Any], ctx: Any) -> dict[str, Any]:
+                parked.set()
+                while True:  # a handler that will not answer: `stop()` cancels it, and it ends
+                    await asyncio.sleep(0.05)
+
+            beta, _ = self.build_peer(root, caps={"park": park}, stop_grace=grace)
+            await beta.start()
+            alpha, _ = await self.boot(root, stop_grace=grace)
+            await self._see(alpha, "park")
+            call = asyncio.create_task(alpha.request(PEER, "park", {}, timeout=0))
+            await wait_for("beta's handler to begin", parked.is_set, timeout=WATCH_SETTLE)
+            request_path = next(
+                p
+                for p in inbox_dir(root, PEER).iterdir()
+                if p.suffix == ".json" and p.name.count(".") == 1
+            )
+            r = request_path.name[: -len(".json")]
+            header = doc(request_path)
+            await alpha.stop()  # the caller is gone: the confirmation that follows is the row's own
+            call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+            stop = asyncio.create_task(beta.stop())
+            try:
+                res_path = inbox_dir(root, PEER) / f"{r}.res.json"
+                await wait_for("beta's code-300 answer", res_path.exists, timeout=WATCH_SETTLE)
+                con = {
+                    k: header[k] for k in ("rid", "src", "dst", "datetime", "type", "actio_version")
+                }
+                con["confirmation"] = {"ts": int(TS), "nonce": NONCE, "signature": None}
+                # Atomic, as the probe writes it: the scan must never see a half file.
+                tmp = res_path.parent / f".con.{r}.tmp"
+                tmp.write_text(json.dumps(con), encoding="utf-8")
+                os.replace(tmp, res_path.parent / f"{r}.late.json")
+            finally:
+                # The row ends the stop it started, whatever its assertions decided: an agent left with
+                # one stop in flight, and the teardown awaiting a second, is a state the library does not
+                # promise.
+                _, pending = await asyncio.wait({stop}, timeout=HANDLER_CANCEL_WAIT + 5.0)
+                for stuck in pending:
+                    stuck.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if pending:
+                    raise AssertionError(
+                        f"beta.stop() returned nothing within {HANDLER_CANCEL_WAIT + 5.0}s: "
+                        "D-9's bound of the confirmation wait did not hold"
+                    )
+                stop.result()
+            records = [
+                cast(dict[str, Any], line["event_data"])
+                for line in lines(root, PEER)
+                if line["event"] == "inreq"
+            ]
+            self.assertEqual(
+                [rec["final_status"] for rec in records],
+                ["confirmed"],
+                f"the confirmation was admitted by its body under a name no rule recommends: {records}",
+            )
+            self.assertTrue(
+                all(rec["con"] is not None for rec in records),
+                f"the confirmation was recorded in the archive: {records}",
+            )
+
+    async def test_the_stop_spends_one_bound_for_a_stuck_handler_and_an_unconfirmed_answer(
+        self,
+    ) -> None:
+        """D-9's last phase keeps a **single** bound even when both of its waits want it: the handler that
+        swallows the cancellation spends the bound in the handler wait, and the answer nobody confirms
+        wants the bound in the confirmation wait. The bound is computed once, from the running loop's clock
+        — never the config's — so `stop()` returns inside the grace plus one `HANDLER_CANCEL_WAIT` plus
+        `MARGIN`, the margin named below. A fresh second for the confirmations would spend the grace plus
+        two, and this row fails it. The bound the row measures against is the agent's own constant,
+        `HANDLER_CANCEL_WAIT` — not a literal second."""
+        grace = 0.2
+        MARGIN = 0.8  # the named margin: a bound, so load cannot flip the verdict
+        async with self.tree() as root:
+            peer_tree(root, "gamma")  # published, and never booted: nobody will confirm
+            started, leave = asyncio.Event(), asyncio.Event()
+
+            async def quick(params: dict[str, Any], ctx: Any) -> dict[str, Any]:
+                return {"answered": True}
+
+            # `confirm_timeout` well past the stop: the unconfirmed answer must still be owed when the
+            # confirmation wait begins, not already archived by its own timer during the handler wait.
+            beta, _ = self.build_peer(
+                root, caps={"quick": quick}, stop_grace=grace, confirm_timeout=5.0
+            )
+            self._stubborn(beta, started, leave)
+            await beta.start()
+            alpha, _ = await self.boot(root, stop_grace=grace)
+            await self._see(alpha, "stubborn")
+
+            call = asyncio.create_task(alpha.request(PEER, "stubborn", {}, timeout=30))
+            await wait_for("beta's handler to start", started.is_set, timeout=WATCH_SETTLE)
+            write_file(
+                inbox_dir(root, PEER) / f"{rid(30)}.json",
+                request_file(rid(30), "quick", src="gamma", dst=PEER, timeout=0),
+            )
+            await wait_for(
+                "beta's answer of the request nobody will confirm",
+                lambda: bool(answers(root, PEER)),
+                timeout=WATCH_SETTLE,
+            )
+            await alpha.stop()  # the caller is gone: no confirmation is coming for the 300 either
+            call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+            # Captured before the stop, and the stop is bounded by the same number the row asserts: whatever
+            # happens below, this row ends the handler it started — a row that hangs the suite when a bound
+            # breaks reports nothing.
+            work = [t for t in asyncio.all_tasks() if t.get_name().startswith("actio.work.")]
+            try:
+                took = await self._stop_and_time(beta, grace + HANDLER_CANCEL_WAIT + MARGIN)
+                self.assertGreaterEqual(
+                    took,
+                    HANDLER_CANCEL_WAIT,
+                    f"stop() took {took:.2f}s: the handler wait of the phase was not spent",
+                )
+                self.assertLess(
+                    took,
+                    grace + HANDLER_CANCEL_WAIT + MARGIN,
+                    f"stop() took {took:.2f}s: the phase spent more than its one bound",
+                )
+                records = [
+                    cast(dict[str, Any], line["event_data"])
+                    for line in lines(root, PEER)
+                    if line["event"] == "inreq"
+                ]
+                self.assertEqual(
+                    sorted(rec["final_status"] for rec in records),
+                    ["completed", "completed"],
+                    f"neither answer is confirmed: both archive `completed`: {records}",
+                )
+                codes = [
+                    cast(
+                        dict[str, Any],
+                        cast(dict[str, Any], rec["res"]["response"])["result"],
+                    ).get("code")
+                    for rec in records
+                ]
+                self.assertEqual(len(codes), 2, f"two answered exchanges: {records}")
+                self.assertEqual(
+                    codes.count(300),
+                    1,
+                    f"the code 300 is the one answer the stop owes: {records}",
+                )
+                self.assertEqual(doc(status_path(root, PEER))["status"], "inactive")
+            finally:
+                # End what this row started: the rogue handler (with `leave`, since it swallows a
+                # cancellation).
+                leave.set()
+                for task in work:
+                    task.cancel()
+                await asyncio.gather(*work, return_exceptions=True)
