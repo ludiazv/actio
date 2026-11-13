@@ -1415,7 +1415,8 @@ class E2ETest(ActioTestCase):
                 ],
             )
             # (3) the malformed envelope: IGNORED, not dropped — *Strict format* ignores it
-            # before the gate, so no diarium line at all, and the file stays in the inbox
+            # before the gate, so it is never archived (no `inreq` line), and the file stays
+            # in the inbox (a `log` line may name it; that is not an archive)
             before = snapshot()
             bad_rid = write_command(root, ALPHA, BETA, "ping", None, malformed=True)
             # The watcher gets its full scan window; the claim is negative (left alone), so the
@@ -1425,10 +1426,18 @@ class E2ETest(ActioTestCase):
                 (root / BETA / "inbox" / f"{bad_rid}.json").exists(),
                 "an ignored file is left in the inbox (it is never archived)",
             )
+            # If this ever fails again, the message carries the line that was found: the only
+            # writer of an `inreq` line is the archive, so the line is the diagnosis.
+            bad_lines = [
+                json.dumps(line)
+                for line in diarium_lines(root, BETA)
+                if bad_rid in json.dumps(line)
+            ]
             self.assertIsNone(
                 inreq_final(root, BETA, bad_rid),
                 "an ignored file is never archived: no `inreq` line, `dropped` or otherwise "
-                "(the receiver may record the ignore in a `log` line; that is not an archive)",
+                "(the receiver may record the ignore in a `log` line; that is not an archive); "
+                f"the lines found for the rid: {bad_lines}",
             )
             self.assertFalse(
                 diarium_has_rid(root, ALPHA, bad_rid),
