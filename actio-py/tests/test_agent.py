@@ -1147,6 +1147,164 @@ class CommandTest(AgentTest):
             with self.assertRaises(TypeError):
                 agent.on_command("sync_cmd", cast(CommandHandler, sync_handler))
 
+    async def test_a_custom_command_runs_and_archives_completed(self) -> None:
+        """D0 and D2: a name the agent "implements internally" is a command it knows. `on_command` says
+        which names those are, and the handler runs before the envelope archives `completed` — the order
+        the standard commands deliberately do not use, because for them the archive has to precede the
+        lifecycle hook (D3, D-10).
+
+        The registration is after `start()`, which is how an application writes it: the receiver holds the
+        agent's own table, not a copy taken at start.
+        """
+        seen: list[tuple[str, str, Any]] = []
+        async with self.tree() as root:
+            agent, _ = await self.boot(root, heartbeat_interval=1000)
+
+            async def noop(params: Any, ctx: Any) -> None:
+                seen.append((ctx.rid, ctx.src, params))
+
+            agent.on_command("noop", noop)
+            r = rid(31)
+            write_file(inbox_dir(root) / f"{r}.json", cmd_file(r, "noop", {"a": 1}))
+            await wait_for(
+                "the custom command's handler and its archive",
+                lambda: bool(seen) and "completed" in self._inreq_final(root),
+                timeout=WATCH_SETTLE,
+            )
+            self.assertEqual(
+                seen, [(r, PEER, {"a": 1})], "the handler got the envelope it was sent"
+            )
+            self.assertEqual(self._inreq_final(root), ["completed"])
+            self.assertFalse(
+                (inbox_dir(root) / f"{r}.json").exists(), "D3: the envelope is archived"
+            )
+
+    async def test_a_custom_command_registered_before_start_runs_too(self) -> None:
+        """The other half of "the receiver holds the agent's table": a name registered on a stopped agent
+        is still a name the started agent answers. The pair of rows is the point — a table handed over as
+        a snapshot, or as a default that `or` replaced with an empty dict, answers one of the two and not
+        the other."""
+        seen: list[str] = []
+        async with self.tree() as root:
+            agent, _ = self.build(root, heartbeat_interval=1000)
+
+            async def early(params: Any, ctx: Any) -> None:
+                seen.append(ctx.rid)
+
+            agent.on_command("early", early)
+            await agent.start()
+            r = rid(32)
+            write_file(inbox_dir(root) / f"{r}.json", cmd_file(r, "early", None))
+            await wait_for(
+                "the command of a name registered before start",
+                lambda: bool(seen),
+                timeout=WATCH_SETTLE,
+            )
+            self.assertEqual(self._inreq_final(root), ["completed"])
+        self.assertEqual(seen, [r])
+
+    async def test_a_custom_command_is_executed_before_it_is_archived(self) -> None:
+        """D1 then D3: the command is *executed*, and only then is the envelope deleted and registered as
+        `inreq` `completed`. What the handler can see while it runs is the proof of the order: its own
+        envelope still in the inbox, and no record of the exchange in the diarium yet.
+
+        The four standard commands deliberately run the other way round — for them the archive has to
+        complete before the lifecycle hook (`stop` and `restart`: D3's "the archive is always completed
+        before shutting down", and D-10's delay) — and a custom command has no shutdown to precede.
+        """
+        during: list[tuple[bool, bool]] = []
+        async with self.tree() as root:
+            agent, _ = await self.boot(root, heartbeat_interval=1000)
+
+            async def during_handler(params: Any, ctx: Any) -> None:
+                during.append(
+                    (
+                        (inbox_dir(root) / f"{ctx.rid}.json").exists(),
+                        any(
+                            (cast(dict[str, Any], line["event_data"]).get("req") or {}).get("rid")
+                            == ctx.rid
+                            for line in lines(root)
+                            if line["event"] == "inreq"
+                        ),
+                    )
+                )
+
+            agent.on_command("during", during_handler)
+            r = rid(35)
+            write_file(inbox_dir(root) / f"{r}.json", cmd_file(r, "during", None))
+            await wait_for(
+                "the handler of the command that watches its own archive",
+                lambda: bool(during),
+                timeout=WATCH_SETTLE,
+            )
+            self.assertEqual(during, [(True, False)], "D1 before D3: executed, then archived")
+            await wait_for(
+                "the archive itself",
+                lambda: (
+                    self._inreq_final(root) == ["completed"]
+                    and not (inbox_dir(root) / f"{r}.json").exists()
+                ),
+                timeout=WATCH_SETTLE,
+            )
+
+    async def test_a_custom_command_that_raises_archives_and_logs_once(self) -> None:
+        """A handler's failure is an internal one, not a protocol state: D0 accepted the envelope, so D4 is
+        ruled out and there is nothing to answer — commands generate no response. It archives `completed`
+        and the operator gets one `log` line naming the command and who sent it."""
+        async with self.tree() as root:
+            agent, _ = await self.boot(root, heartbeat_interval=1000)
+
+            async def broken(params: Any, ctx: Any) -> None:
+                raise RuntimeError("handler said no")
+
+            agent.on_command("broken", broken)
+            r = rid(33)
+            write_file(inbox_dir(root) / f"{r}.json", cmd_file(r, "broken", None))
+            await wait_for(
+                "the archive of the command whose handler raised",
+                lambda: "completed" in self._inreq_final(root),
+                timeout=WATCH_SETTLE,
+            )
+            logged = [
+                str(line["event_data"])
+                for line in lines(root)
+                if line["event"] == "log" and "broken" in str(line["event_data"])
+            ]
+            self.assertEqual(len(logged), 1, f"the failed handler's report: {logged}")
+            self.assertIn(PEER, logged[0])
+            self.assertEqual(self._inreq_final(root), ["completed"])
+            # Never answered: the sender's inbox holds no response for that rid.
+            self.assertEqual(
+                [p.name for p in inbox_dir(root, PEER).glob(f"{r}.*")],
+                [],
+                "commands generate no response",
+            )
+
+    async def test_an_unknown_command_is_dropped_and_the_reason_names_it(self) -> None:
+        """D0's other branch: a name that is neither protocol-standard nor one the agent registered is
+        dropped (D4) and never answered. The reason says which name, so the operator can tell a typo from
+        an agent that was never taught it."""
+        async with self.tree() as root:
+            agent, _ = await self.boot(root, heartbeat_interval=1000)
+
+            async def unused(params: Any, ctx: Any) -> None:
+                return None
+
+            agent.on_command("noop", unused)  # a table that is not empty, so the name matters
+            r = rid(34)
+            write_file(inbox_dir(root) / f"{r}.json", cmd_file(r, "nope", None))
+            await wait_for(
+                "the dropped inreq line for an unknown name",
+                lambda: "dropped" in self._inreq_final(root),
+                timeout=WATCH_SETTLE,
+            )
+            self.assertEqual(self._inreq_final(root), ["dropped"])
+            self.assertEqual(
+                [p.name for p in inbox_dir(root, PEER).glob(f"{r}.*")],
+                [],
+                "a dropped command is never answered",
+            )
+
 
 class RegistrationTest(AgentTest):
     """Lane C: the capability registrations and their schemas (D-19), and how they reach
