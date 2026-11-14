@@ -7,6 +7,10 @@ the decisions behind it, and how to run the tests and the release. If you are **
 
 ## 1. The shape of the code
 
+Sixteen source modules and two generated ones, about 2 700 lines outside `src/generated/`, and 21 test files.
+Every statement below names the file it comes from: the code and its tests are the specification, and this
+document is the map to them.
+
 ```
 src/index.ts          the package entry: every public type and function, no deep imports needed
 src/agent.ts          ActioAgent: lifecycle steps 1–6, lane C wiring, commands, the public API
@@ -294,6 +298,30 @@ prints what it resolved. On CI the Node version comes from the workflow instead.
   protocol documents and the other implementations too; `protocol/v0.1` is the tag for the schemas. The
   workflow refuses if the tag does not match `package.json`, and it checks out the whole monorepo because
   `gen:check` reads `../doc/schemas`.
+- **Choices behind this shape**: the entry is *compiled* rather than published as TypeScript — the Pi loader
+  (jiti) and `tsx` would take a `.ts` entry happily, plain `node` would not, and a library should not assume
+  the consumer runs one of our two loaders. The name is the bare `actio-ts` (unclaimed on the registry; the
+  bare `actio` is not, so the CLI can never take it either — §15). The license is BSD-3-Clause, holder
+  `ldiaz`, and it covers the embedded schemas, which is why they are part of the artifact and not a pointer.
+- **Requirements on the repository side**: it stays **public** (the provenance attestation is verified against
+  it), and there is a repository secret **`NPM_TOKEN`** — an npm automation token with publish permission.
+  `private` is already `false`; `prepublishOnly` re-runs the gate for a hand-run `npm publish` too, so that
+  path is possible but is not the way releases happen.
+- **Cutting a release**: bump `version`, add a `## <version>` entry to `CHANGELOG.md` — with the schema
+  digests if `doc/schemas` moved, since `gen:check` fails the gate if the two drift apart — then:
+
+  ```sh
+  ver=$(node -p "require('./package.json').version")
+  git tag -a "actio-ts/v$ver" -m "actio-ts $ver" && git push origin "actio-ts/v$ver"
+  ```
+
+- **A release is permanent.** `npm unpublish` works inside 72 hours and only while nothing depends on the
+  version; the way out of a bad release is `npm deprecate actio-ts@0.1.0 "… use 0.1.1"` followed by a patch.
+  And while `0.x`, remember what consumers can pin: `^0.1.0` admits **only** `0.1.x`, so a breaking fix in the
+  0.x line means telling people to re-pin.
+- **After the first publish**, `pi-actio` switches from its `"actio-ts": "file:../actio-ts"` link to the
+  published version — pinned exactly while 0.x — and its `npm run check` and `npm run smoke` re-run against
+  the registry artifact rather than the workspace symlink.
 
 ## 15. The CLI
 
