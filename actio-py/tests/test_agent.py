@@ -30,9 +30,9 @@ from actio import ActioAgent, Capability, CapabilityHandler, CommandHandler, Log
 from actio._config import ActioConfig
 from actio._protocol import DiariumEntry
 from actio._receiver import HANDLER_CANCEL_WAIT
-from actio._watch import AUDIT_SECONDS
 from actio._types import AgentView, RequestOutcome
 from actio._util import format_iso
+from actio._watch import AUDIT_SECONDS
 from helpers import ActioTestCase, actio_tree
 
 SETTLE = 6.0  # watchdog wake + debounce + a handler: a failure, not a timing expectation
