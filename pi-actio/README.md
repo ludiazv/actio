@@ -1,10 +1,11 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ludiazv/actio/HEAD/actio-logo.svg" alt="Actio" width="200">
+</p>
+
 # pi-actio
 
-A pi extension that makes a **pi coding agent a member of an Actio team**: it sees the team, calls other
-agents' capabilities, and can let the team send prompts into the session.
-
-All protocol behavior comes from [`actio-ts`](../actio-ts) through its package entry. This extension contains
-no protocol logic, and it never reads or writes the actio root directly.
+A [pi](https://pi.dev) extension that makes a **pi coding agent a member of an Actio team**: it sees the
+team, calls other agents' capabilities, and can let the team send prompts into the session.
 
 ## What it adds
 
@@ -16,34 +17,31 @@ no protocol logic, and it never reads or writes the actio root directly.
 | optional | **activity notifications** (`reportActivity`) |
 | configuration | one JSON file, `actio.json`, read on load and on `/reload` |
 
-Out of scope, on purpose: sending *commands* to other agents (`cmd`), attachments, a per-call timeout
-parameter, history that survives `/reload`, settings UIs, and any protocol logic outside actio-ts.
+Out of scope, on purpose: sending *commands* to other agents, attachments, a per-call timeout parameter,
+history that survives `/reload`, settings UIs.
 
 ## Install
 
-`actio-ts` must be installed and its schemas generated, and `pi-actio` needs its own dependencies:
-
 ```bash
-cd actio-ts    && npm ci && npm run gen
-cd ../pi-actio && npm install
-pi install <absolute path>/pi-actio
+pi install npm:pi-actio@0.1.0
 ```
 
-- **Node ≥ 22.** pi runs on whatever `node` is first on PATH. If that is a Bun shim, `npm run check` fails:
-  Bun does not hand Node's quoted `test/*.test.ts` glob to the test runner. `npm run smoke` and the extension
-  itself work under both. There is no `npm test` script here.
-- Removing it: `pi uninstall <absolute path>/pi-actio` — pi matches a local extension by its resolved path, so
-  the bare name only works from the folder you installed from.
-- For development, nothing needs installing: `pi -ne -e <path>/pi-actio/src/index.ts`. Keep
-  `PI_CODING_AGENT_DIR` and `ACTIO_DIR` pointed at temporary directories while testing, or the agent joins a
-  real team.
+The npm source becomes available with the first published release. From a source checkout, install the
+folder instead — `pi install <absolute path>/pi-actio` — and install the checkout's dependencies first
+([internals.md](internals.md) §11).
+
+- **Node ≥ 22.**
+- Remove it with `pi uninstall <source>`. For a folder, pi matches an installed extension by its resolved
+  path, so use the same path you installed from.
+- Personal installs are recorded in `~/.pi/agent/settings.json`. An install is loaded at the next `pi` start
+  or `/reload`.
 
 ## Configuration (`actio.json`)
 
 Location: the pi agent directory — `$PI_CODING_AGENT_DIR/actio.json`, by default `~/.pi/agent/actio.json`.
 
 **Every key is optional.** No file, or an empty object, means all defaults. A file that is not valid JSON, has
-an unknown key, or has a wrong type, or a bad agent id (`agentId` or an `acceptPrompt` item), registers
+an unknown key, has a wrong type, or has a bad agent id (`agentId` or an `acceptPrompt` item) registers
 **nothing** and shows one notification naming the file and the first error; fix it and `/reload`.
 
 | Key | Type | Default | Meaning |
@@ -61,7 +59,7 @@ The default `agentId` is the current folder's name, with characters outside `[a-
 cut to 27 characters, plus `-` and four random hex characters. It stays the same across `/reload`, `/new` and
 `/fork` in one process, and two pi sessions in the same folder get different ids.
 
-A configuration change takes effect on `/reload`, because the extension reads the file as it loads.
+A configuration change takes effect on `/reload`.
 
 ## The `actio` tool
 
@@ -73,12 +71,12 @@ The model uses it; parameters in italics are optional.
 | `actio {command: "info", id: "<agent>", capability: *"name"*}` | that agent's status, health and namespaces, and its capabilities with their parameters and result schemas. Without `capability`, all of them. An unknown name is an error that lists the real ones |
 | `actio {command: "call", target: "<id>/<capability>", params: *{…}*}` | calls a peer and **waits** for the answer. Press Escape to cancel it |
 
-Before a call is sent, the target is checked against the team view and the parameters against the published
+Before a call is sent, the target is checked against the team and the parameters against the published
 schema, and the error says what to do next (`use info <id>`). A peer's **error answer** is a normal result —
 it is the peer's answer — and is shown as `→ error <code>: <msg>`. Only a local failure (unknown agent,
 unknown capability, bad parameters, no answer) is an error from the tool.
 
-With `json: true` every result is `JSON.stringify(value, null, 2)` of the same shape.
+With `json: true` every result is JSON instead of Markdown.
 
 ## The prompt service
 
@@ -96,29 +94,24 @@ Behavior worth knowing:
 
 - When the session is busy, a new prompt is **queued** and sent when the run settles. `asap: true` instead
   **steers** the running one, and a steered prompt shares that run's answer.
-- Two prompts sent back to back while the session is idle: the second is queued. The extension keeps its own
-  idea of "busy", because pi reports idle for a moment after accepting a prompt.
+- Two prompts sent back to back while the session is idle: the second is queued.
 - `retrieve` of a `done` prompt returns the answer and **forgets** the id; a second `retrieve` of the same id
   is `ActioError 1000`. `cancel` forgets it in any state. An unknown id is the same error 1000.
 - Cancelling a **running** prompt aborts the whole run, so another prompt riding the same run ends with the
   partial answer.
 - A prompt may be answered by a run the local user started, and `prompt` cannot select a model or a mode.
-- The pi agent accepts no protocol **commands** (`cmd`); the prompt service is the only thing it offers.
+- The pi agent accepts no protocol **commands**; the prompt service is the only thing it offers.
 - `acceptPrompt` lists the agent ids allowed to call these capabilities. The default `[]` means every agent on
-  the team — the pi agent still has no capability at all unless `exposePrompt` is on.
+  the team — and the pi agent publishes no capability at all unless `exposePrompt` is on.
 
 With `reportActivity: true` the pi user sees, as notifications: `actio: <src> → <capability> [<prompt_id>]`
 for each received request, and `actio: <target> → confirmed | error <code> | cancelled | …` when a call the
-agent made finishes. Polling `retrieve` while a prompt is queued or running makes no noise. These have no
-protocol effect.
+agent made finishes. Polling `retrieve` while a prompt is queued or running makes no noise.
 
 ## `/actio` — the Actio Explorer
 
-Opens an overlay with three tabs. It needs the interactive terminal; in another mode it reports that.
-
-It is a bordered window of **at least 12 rows**: an almost empty tab is padded inside the frame, a
-long one grows the frame. Every line of the frame — the outer border and the header and footer
-rules — uses the theme's `border` token, the same one pi's own dialogs draw with.
+Opens an overlay with three tabs. It needs the interactive terminal; in another mode it reports that. The
+window never collapses below twelve rows, and it follows pi's theme colours.
 
 ```
 ╭──────────────────────────────────────────────────────────────────────────────────────────╮
@@ -132,46 +125,9 @@ rules — uses the theme's `border` token, the same one pi's own dialogs draw wi
 ╰──────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-The list updates by itself when a call or a request arrives or finishes; `r` re-scans the team.
-The history is **in memory, per session**: `/reload`, `/new` or `/fork` starts it empty again, which is what
-"live sessions" means. It has no size cap.
-
-## Implementation choices
-
-- One config file, read at load; a `/reload` is enough to change anything.
-- An invalid configuration registers nothing and says so once, rather than half-working.
-- The agent starts when a session starts and stops when it ends, with no grace period on quit; in-flight
-  inbound requests are answered 300 and outbound ones are abandoned.
-- The team view excludes the agent itself, so the model can never prompt its own session.
-- `list-team` scans again (that is what "live" means); `info`, `call` and the Explorer use the view the
-  protocol keeps current.
-- Everything the tool prints is a peer's answer rendered as text or JSON; nothing is invented locally.
-- A prompt's answer is the last assistant text of the run, which may be empty after an abort.
-
-The code cites these decisions by number:
-
-| Id | Decision |
-| --- | --- |
-| D-1 | The config file is `actio.json` in pi's agent dir; a missing file means all defaults |
-| D-2 | An invalid config (bad JSON, schema violation) registers and starts nothing, and is notified once |
-| D-3 | `disabled: true` turns the extension fully off: no agent, no tool, no command, until `/reload` |
-| D-4 | The default `agentId` is the cwd basename made safe, cut to 27 characters, plus `-` and 4 hex characters, kept per process and cwd |
-| D-5 | `actioDir` (with `~/` expanded) is the root; absent, actio-ts applies `$ACTIO_DIR` or `~/.actio` |
-| D-6 | Identity: description `pi coding agent in <cwd>`, no protocol commands accepted, capabilities only from the prompt service |
-| D-7 | The agent starts in `session_start` and stops in `session_shutdown` with `force`; a failed start is notified |
-| D-8 | The team view excludes the agent itself |
-| D-9 | `list-team` scans again; `info`, `call` and the Explorer use the current view |
-| D-10 | A call is validated before anything is written: the target's form, the agent in the view, the capability, its parameters |
-| D-11 | A peer's error answer is a normal tool result; only a local failure throws |
-| D-12 | Prompt ids are 8 lower-case hex characters, redrawn on a collision |
-| D-13 | Prompt states are `queued`, `running`, `done`; `retrieve` of a done prompt and `cancel` forget the id; an unknown id is error 1000 |
-| D-14 | A prompt is sent now when the session is idle, steered when busy and `asap`, queued otherwise; it is done on `agent_settled` |
-| D-15 | Cancelling a running prompt aborts the whole run |
-| D-16 | `compact` returns `null` whatever happens; while busy it waits for the run to settle |
-| D-17 | `acceptPrompt` becomes each prompt capability's `accepts_from`, omitted when empty |
-| D-18 | `reportActivity: true` notifies the pi user of each prompt received and each call that ends |
-| D-19 | The Explorer's history is in memory, per runtime, with no cap |
-| D-20 | `json: true` makes every tool result pretty-printed JSON; otherwise it is Markdown |
+The list updates by itself when a call or a request arrives or finishes; `r` re-scans the team. The history is
+**in memory, per session**: `/reload`, `/new` or `/fork` starts it empty again, which is what "live sessions"
+means.
 
 ## Limits
 
@@ -179,10 +135,18 @@ The code cites these decisions by number:
 - No per-call timeout parameter; a call waits for the peer and Escape cancels it.
 - History is not persisted, and there is no way to ask about a session that is not running.
 - The prompt service answers with the run's final text: no streaming, no mid-run output, no model choice.
-- The Explorer cannot show the resolved actio root when `actioDir` is unset (actio-ts keeps it); set
-  `actioDir` to see the path in the header.
+- The Explorer cannot show the resolved actio root when `actioDir` is unset; set `actioDir` to see the path in
+  the header.
 - A compaction started **by the pi user** (`/compact`) is outside the extension's view: a prompt queued during
   it waits for the next run, and an `asap` prompt sent during it never reaches the model and is later reported
   `done` with the next run's answer. Every compaction requested through the prompt service is waited for and
   then run.
-- No protocol commands (`cmd`), no attachments, no retries.
+- No protocol commands, no attachments, no retries.
+
+## Where the details are
+
+- [`internals.md`](internals.md) — how it works, the decisions behind each behaviour, tests, packaging.
+- [The Actio protocol](https://github.com/ludiazv/actio/blob/master/doc/actio_protocol.md) — the wire format,
+  which this extension implements through [`actio-ts`](https://www.npmjs.com/package/actio-ts). The protocol
+  is public but still a **draft**: its security layer is unspecified, and write access to the shared actio
+  folder *is* peer authority. Do not point two teams' folders at each other.
