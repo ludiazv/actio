@@ -549,6 +549,34 @@ class LaneATest(ReceiverTest):
             inreqs = [e for e in ctx.events if isinstance(e, InreqEvent)]
             self.assertEqual([(e.rid, e.final_status) for e in inreqs], [(r, "completed")])
 
+    async def test_a_rid_archived_in_this_run_is_not_served_again(self) -> None:
+        """One request per `rid` per run: once the receiver has archived a `rid`, the same request file
+        arriving again is passed over — no second handler call, no second response file, no second
+        `inreq` line. The duplicate is left where it is: nothing deletes it, and nothing serves it."""
+        calls: list[int] = []
+
+        async def handler(parameters: Any, ctx: Any) -> str:
+            calls.append(1)
+            return "short"
+
+        with actio_tree() as root:
+            ctx, _, _ = await self.boot(root, handlers={"summarize": handler})
+            r = rid(41)
+            await self.files(root, **{f"{r}.json": request_file(r)})
+            await wait_for("the first response file", lambda: self.res_path(root, r).exists())
+            await wait_until("the first archive", archived_check(root, r))
+            await wait_inbox_empty(root)
+            await self.files(root, **{f"{r}.json": request_file(r)})
+            # The wait's end is "nothing happens", so it is a floor on the clock, not a watch event: the
+            # write itself wakes the watcher, and 1.5 s is many passes over the inbox.
+            await asyncio.sleep(1.5)
+            self.assertEqual(calls, [1], "the archived rid was served a second time")
+            self.assertFalse(
+                self.res_path(root, r).exists(), "the duplicate wrote a response of its own"
+            )
+            inreqs = [e for e in ctx.events if isinstance(e, InreqEvent) and e.rid == r]
+            self.assertEqual(len(inreqs), 1, "the duplicate recorded a second inreq line")
+
     async def test_the_handler_publishes_an_attachment_that_the_archive_deletes(self) -> None:
         async def handler(parameters: Any, ctx: Any) -> str:
             await ctx.publish_attachment("notes/out.txt", b"the summary")
@@ -1062,6 +1090,19 @@ class CommandTest(ReceiverTest):
             )
             await wait_for("the command hook", lambda: bool(hooks.commands))
             self.assertEqual(hooks.commands, [("restart", False, 2.0)])
+
+    async def test_a_command_rid_runs_once_per_run(self) -> None:
+        """One command per `rid` per run: the same command file arriving twice runs the command once."""
+        with actio_tree() as root:
+            _, hooks, _ = await self.boot(root)
+            r = rid(43)
+            await self.files(root, **{f"{r}.json": cmd_file(r, "ping")})
+            await wait_for("the first ping", lambda: bool(hooks.commands))
+            await self.files(root, **{f"{r}.json": cmd_file(r, "ping")})
+            # A floor, not a watch event: the second write wakes the watcher at once, and the assertion is
+            # that a second pass over the inbox changes nothing.
+            await asyncio.sleep(1.5)
+            self.assertEqual(hooks.commands, [("ping",)], "the command ran twice for one rid")
 
     async def test_enable_and_ping(self) -> None:
         with actio_tree() as root:
