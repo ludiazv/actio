@@ -1,9 +1,15 @@
 """`examples/echo_agent.py`: the conformance target, driven as a black box.
 
 Every row spawns the example as a child process on a `helpers.actio_tree()` root and drives it
-with a caller built from the library in this process. A child is always reaped inside the tree's
-context and its pipes drained (`communicate`), so no child outlives its row and no interpreter
-noise leaks out. Every wait has a bound: `WAIT`, never the runner's timeout.
+with a caller built from the library in this process. A child is always reaped before its row
+ends and its pipes drained (`communicate`), so no child outlives its row and no interpreter noise
+leaks out. The rows that start a caller in this process enter their root with
+`self.enterContext(actio_tree())` rather than a `with` block, so the caller's `stop()` cleanup runs
+while the root is still there: a stop writes its last status, its diarium lines and its nuntium
+file, and a root already removed at the end of the body would be recreated by them and left behind
+in `TMPDIR`. The rows that start no caller here — the spec, the direct sender's 103, and SIGTERM —
+keep their `with` block, because nothing writes after their body ends. Every wait has a bound:
+`WAIT`, never the runner's timeout.
 """
 
 from __future__ import annotations
@@ -252,40 +258,40 @@ class ExampleTest(ActioTestCase):
                 self.assertEqual(err, "")
 
     async def test_echo_answers_with_the_text_it_got(self) -> None:
-        with actio_tree() as root:
-            with _Child(root) as child:
-                await wait_up(root, "echo")
-                caller = self.make_caller(root)
-                await caller.start()
-                await self.discover(caller, "echo")
-                with no_leftovers():
-                    outcome = await caller.request("echo", "echo", {"text": "hello"})
-                    await self.settled()
-                self.assertEqual(outcome.final_status, "confirmed")
-                assert outcome.response is not None
-                self.assertIs(outcome.response["error"], False)
-                self.assertEqual(outcome.response["result"], {"text": "hello"})
-                code, _, _ = child.reap(signal.SIGTERM)
-                self.assertEqual(code, 0)
+        root = self.enterContext(actio_tree())
+        with _Child(root) as child:
+            await wait_up(root, "echo")
+            caller = self.make_caller(root)
+            await caller.start()
+            await self.discover(caller, "echo")
+            with no_leftovers():
+                outcome = await caller.request("echo", "echo", {"text": "hello"})
+                await self.settled()
+            self.assertEqual(outcome.final_status, "confirmed")
+            assert outcome.response is not None
+            self.assertIs(outcome.response["error"], False)
+            self.assertEqual(outcome.response["result"], {"text": "hello"})
+            code, _, _ = child.reap(signal.SIGTERM)
+            self.assertEqual(code, 0)
 
     async def test_fail_answers_code_1000(self) -> None:
-        with actio_tree() as root:
-            with _Child(root) as child:
-                await wait_up(root, "echo")
-                caller = self.make_caller(root)
-                await caller.start()
-                await self.discover(caller, "echo")
-                with no_leftovers():
-                    outcome = await caller.request("echo", "fail", None)
-                    await self.settled()
-                self.assertEqual(outcome.final_status, "confirmed")
-                assert outcome.response is not None
-                self.assertIs(outcome.response["error"], True)
-                self.assertEqual(
-                    outcome.response["result"], {"code": 1000, "msg": "fail: requested failure"}
-                )
-                code, _, _ = child.reap(signal.SIGTERM)
-                self.assertEqual(code, 0)
+        root = self.enterContext(actio_tree())
+        with _Child(root) as child:
+            await wait_up(root, "echo")
+            caller = self.make_caller(root)
+            await caller.start()
+            await self.discover(caller, "echo")
+            with no_leftovers():
+                outcome = await caller.request("echo", "fail", None)
+                await self.settled()
+            self.assertEqual(outcome.final_status, "confirmed")
+            assert outcome.response is not None
+            self.assertIs(outcome.response["error"], True)
+            self.assertEqual(
+                outcome.response["result"], {"code": 1000, "msg": "fail: requested failure"}
+            )
+            code, _, _ = child.reap(signal.SIGTERM)
+            self.assertEqual(code, 0)
 
     async def test_private_is_refused_by_the_peers_spec_with_103(self) -> None:
         # A full agent would refuse locally (rule 11, from the peer's spec); a direct sender has
@@ -308,56 +314,55 @@ class ExampleTest(ActioTestCase):
                 self.assertEqual(code, 0)
 
     async def test_a_cancelled_sleep_wakes_and_frees_its_slot(self) -> None:
-        with actio_tree() as root:
-            with _Child(root) as child:
-                await wait_up(root, "echo")
-                caller = self.make_caller(root)
-                await caller.start()
-                await self.discover(caller, "echo")
-                with no_leftovers():
-                    started = time.monotonic()
-                    # 2.0, not 0.5: the envelope's `ts` is whole-second, so a sub-second timeout
-                    # can read as already expired on the peer (code 108) a moment after the write.
-                    outcome = await caller.request("echo", "sleep", {"seconds": 5}, timeout=2.0)
-                    self.assertLessEqual(time.monotonic() - started, 6.0)
-                    await self.settled()
-                self.assertIn(outcome.final_status, ("cancelled", "abandoned"))
-                if outcome.final_status == "abandoned":
-                    self.assertIsNone(outcome.response)
-                self.assertTrue(child.alive())  # the example is still running
-                read = await read_diarium(str(root / "echo"))
-                cancelled = [
-                    line
-                    for line in read.lines
-                    if line["event"] == "inreq"
-                    and cast("dict[str, Any]", line["event_data"]).get("final_status")
-                    == "cancelled"
-                ]
-                self.assertTrue(cancelled, "the child's diarium owes a cancelled inreq line")
-                # max_parallel is 1: a second sleep only answers if the first one woke.
-                with no_leftovers():
-                    second = await caller.request("echo", "sleep", {"seconds": 0.2}, timeout=3.0)
-                    await self.settled()
-                self.assertEqual(second.final_status, "confirmed")
-                assert second.response is not None
-                self.assertEqual(second.response["result"], {"slept": 0.2})
-                code, _, _ = child.reap(signal.SIGTERM)
-                self.assertEqual(code, 0)
+        root = self.enterContext(actio_tree())
+        with _Child(root) as child:
+            await wait_up(root, "echo")
+            caller = self.make_caller(root)
+            await caller.start()
+            await self.discover(caller, "echo")
+            with no_leftovers():
+                started = time.monotonic()
+                # 2.0, not 0.5: the envelope's `ts` is whole-second, so a sub-second timeout
+                # can read as already expired on the peer (code 108) a moment after the write.
+                outcome = await caller.request("echo", "sleep", {"seconds": 5}, timeout=2.0)
+                self.assertLessEqual(time.monotonic() - started, 6.0)
+                await self.settled()
+            self.assertIn(outcome.final_status, ("cancelled", "abandoned"))
+            if outcome.final_status == "abandoned":
+                self.assertIsNone(outcome.response)
+            self.assertTrue(child.alive())  # the example is still running
+            read = await read_diarium(str(root / "echo"))
+            cancelled = [
+                line
+                for line in read.lines
+                if line["event"] == "inreq"
+                and cast("dict[str, Any]", line["event_data"]).get("final_status") == "cancelled"
+            ]
+            self.assertTrue(cancelled, "the child's diarium owes a cancelled inreq line")
+            # max_parallel is 1: a second sleep only answers if the first one woke.
+            with no_leftovers():
+                second = await caller.request("echo", "sleep", {"seconds": 0.2}, timeout=3.0)
+                await self.settled()
+            self.assertEqual(second.final_status, "confirmed")
+            assert second.response is not None
+            self.assertEqual(second.response["result"], {"slept": 0.2})
+            code, _, _ = child.reap(signal.SIGTERM)
+            self.assertEqual(code, 0)
 
     async def test_the_noop_command_goes_through(self) -> None:
-        with actio_tree() as root:
-            with _Child(root, ACTIO_COMMANDERS="caller") as child:
-                await wait_up(root, "echo")
-                caller = self.make_caller(root)
-                await caller.start()
-                await self.discover(caller, "echo")
-                with no_leftovers():
-                    rid = await caller.command("echo", "noop")
-                    await self.settled()
-                self.assertRegex(rid, r"^[0-9A-HJKMNP-TV-Z]{26}$")
-                self.assertTrue(child.alive())
-                code, _, _ = child.reap(signal.SIGTERM)
-                self.assertEqual(code, 0)
+        root = self.enterContext(actio_tree())
+        with _Child(root, ACTIO_COMMANDERS="caller") as child:
+            await wait_up(root, "echo")
+            caller = self.make_caller(root)
+            await caller.start()
+            await self.discover(caller, "echo")
+            with no_leftovers():
+                rid = await caller.command("echo", "noop")
+                await self.settled()
+            self.assertRegex(rid, r"^[0-9A-HJKMNP-TV-Z]{26}$")
+            self.assertTrue(child.alive())
+            code, _, _ = child.reap(signal.SIGTERM)
+            self.assertEqual(code, 0)
 
     async def test_sigterm_is_a_graceful_stop_and_exit_zero(self) -> None:
         with actio_tree() as root:
@@ -371,24 +376,24 @@ class ExampleTest(ActioTestCase):
                 self.assertEqual(status["status"], "inactive")
 
     async def test_the_environment_moves_the_folder_and_the_commanders(self) -> None:
-        with actio_tree() as root:
-            with _Child(root, ACTIO_AGENT_ID="other", ACTIO_COMMANDERS="caller,cmdr") as child:
-                folder = await wait_up(root, "other")
-                self.assertEqual(folder, root / "other")
-                self.assertFalse((root / "echo").exists())
-                spec = json.loads((folder / "spec.json").read_text(encoding="utf-8"))
-                self.assertEqual(spec["id"], "other")
-                self.assertEqual(spec["accepts_commands_from"], ["caller", "cmdr"])
-                caller = self.make_caller(root)
-                await caller.start()
-                await self.discover(caller, "other")
-                with no_leftovers():
-                    rid = await caller.command("other", "noop")
-                    await self.settled()
-                self.assertRegex(rid, r"^[0-9A-HJKMNP-TV-Z]{26}$")
-                self.assertTrue(child.alive())
-                code, _, _ = child.reap(signal.SIGTERM)
-                self.assertEqual(code, 0)
+        root = self.enterContext(actio_tree())
+        with _Child(root, ACTIO_AGENT_ID="other", ACTIO_COMMANDERS="caller,cmdr") as child:
+            folder = await wait_up(root, "other")
+            self.assertEqual(folder, root / "other")
+            self.assertFalse((root / "echo").exists())
+            spec = json.loads((folder / "spec.json").read_text(encoding="utf-8"))
+            self.assertEqual(spec["id"], "other")
+            self.assertEqual(spec["accepts_commands_from"], ["caller", "cmdr"])
+            caller = self.make_caller(root)
+            await caller.start()
+            await self.discover(caller, "other")
+            with no_leftovers():
+                rid = await caller.command("other", "noop")
+                await self.settled()
+            self.assertRegex(rid, r"^[0-9A-HJKMNP-TV-Z]{26}$")
+            self.assertTrue(child.alive())
+            code, _, _ = child.reap(signal.SIGTERM)
+            self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":
