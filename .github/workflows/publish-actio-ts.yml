@@ -99,7 +99,10 @@ jobs:
 
       # Deleting the NPM_TOKEN secret is therefore the whole migration to trusted publishing.
       # --ignore-scripts so prepublishOnly does not run the gate a third time (the step above produced dist/).
-      # Unscoped package: no --access.
+      # No --access flag: provenance refuses a new package unless the access is declared ("Can't generate
+      # provenance for new or private package, you must set `access` to public"), and package.json carries that
+      # as publishConfig.access, which pack-smoke checks. Same for --provenance: automatic under trusted
+      # publishing, explicit on the token path.
       - name: publish with trusted publishing (no secret; provenance automatic)
         if: steps.credential.outputs.mode == 'oidc'
         run: npm publish --ignore-scripts

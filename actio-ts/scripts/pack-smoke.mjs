@@ -44,6 +44,10 @@ try {
   const specs = JSON.stringify({ ...(manifest.dependencies ?? {}), ...(manifest.peerDependencies ?? {}) });
   check(!/(file:|link:|workspace:|\.\.\/)/.test(specs), `no local dependency in the manifest: ${specs}`);
   if (manifest.private === true) console.log("note  private:true — flip it in the publish commit; publishing is not the job of this script");
+  //    Provenance refuses a new package unless the access is declared ("Can't generate provenance for new or
+  //    private package, you must set `access` to public"), so the declaration lives in the manifest, where
+  //    every publish path picks it up, and not in a CI flag.
+  check(manifest.publishConfig?.access === "public", "publishConfig.access is public (provenance demands it for a new package)");
 
   // 3. The file list: what must be there, and what must not.
   for (const need of ["package/dist/index.js", "package/dist/index.d.ts", "package/src/index.ts", "package/src/generated/schemas.ts", "package/README.md", "package/internals.md", "package/LICENSE"]) {

@@ -321,6 +321,11 @@ prints what it resolved. On CI the Node version comes from the workflow instead.
   — GitHub rejects the **whole workflow file** with *Unrecognized named-value: 'secrets'* — so the workflow
   decides `token` vs `oidc` in a step's `env:` (where secrets are allowed, and the shell only ever sees
   `true`/`false`) and gates the two publish steps on that step's `$GITHUB_OUTPUT`.
+- **`publishConfig.access` must be `public`.** `--provenance` refuses a package the registry has never seen:
+  *"Can't generate provenance for new or private package, you must set `access` to public"* — that is what
+  stopped the first attempt at `actio-ts/v0.1.0`. Being unscoped is not the same as being declared public. The
+  declaration lives in `package.json`, not in a CI flag, so the token path, the OIDC path and a hand-run
+  `npm publish` all behave the same way; `pack-smoke` fails the gate if it goes missing.
 - **The other migration path, if OIDC is blocked** — a self-hosted runner, or simply wanting a human in the
   loop: a **stage-only** token and `npm stage publish` in CI; a maintainer then reviews with
   `npm stage list` / `npm stage view <id>` / `npm stage download <id>` and promotes with

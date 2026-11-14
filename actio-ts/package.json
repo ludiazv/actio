@@ -5,6 +5,9 @@
   "license": "BSD-3-Clause",
   "type": "module",
   "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "author": "ldiaz",
   "repository": {
     "type": "git",
