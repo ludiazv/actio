@@ -303,10 +303,30 @@ prints what it resolved. On CI the Node version comes from the workflow instead.
   the consumer runs one of our two loaders. The name is the bare `actio-ts` (unclaimed on the registry; the
   bare `actio` is not, so the CLI can never take it either — §15). The license is BSD-3-Clause, holder
   `ldiaz`, and it covers the embedded schemas, which is why they are part of the artifact and not a pointer.
-- **Requirements on the repository side**: it stays **public** (the provenance attestation is verified against
-  it), and there is a repository secret **`NPM_TOKEN`** — an npm automation token with publish permission.
-  `private` is already `false`; `prepublishOnly` re-runs the gate for a hand-run `npm publish` too, so that
-  path is possible but is not the way releases happen.
+- **How the credential works, and why it changes in January 2027.** npm revoked classic tokens (2025-12-09)
+  and **removes direct publishing with bypass-2FA granular tokens in January 2027**: a long-lived
+  `NPM_TOKEN` is a countdown, not a setup. The workflow therefore has both paths, and the migration is
+  "delete the secret": with `NPM_TOKEN` set it publishes with a granular **Read and write (publish and
+  stage)** token and an explicit `--provenance`; with the secret gone it publishes through **trusted
+  publishing** — OIDC from a GitHub-hosted runner, `id-token: write`, no credential stored in the repository,
+  provenance generated automatically. Configure it on the package page (Publishing from CI/CD → GitHub
+  Actions: user `ludiazv`, repository `actio`, workflow filename `publish-actio-ts.yml`) and tick **`npm
+  publish`** under Allowed actions — a configuration created after 2026-09-03 allows only `npm stage publish`
+  until you say otherwise. Three constraints that bite: the package must **exist** before it can have a
+  trusted publisher (so the first version still goes out on the token path), the connection is **immutable**
+  (the workflow filename is a commitment — to change it, delete and recreate it), and a fresh configuration
+  must complete a first successful publish **within 2 days** or it expires. Requirements: a **public**
+  repository, **GitHub-hosted** runners (npm accepts no OIDC from self-hosted ones yet), npm CLI ≥ 11.5.1 and
+  Node ≥ 22.14.
+- **The other migration path, if OIDC is blocked** — a self-hosted runner, or simply wanting a human in the
+  loop: a **stage-only** token and `npm stage publish` in CI; a maintainer then reviews with
+  `npm stage list` / `npm stage view <id>` / `npm stage download <id>` and promotes with
+  `npm stage approve <id> --otp <code>` or discards with `npm stage reject <id>`. A stage-only token that
+  tries `npm publish` fails with `E_STAGE_REQUIRED`; it can still move dist-tags and deprecate versions, so it
+  narrows the risk rather than bounding it. Related: since August 2026 no token can perform account-identity
+  actions (create tokens, change 2FA, add maintainers) — those require an interactive 2FA challenge.
+- `private` is already `false`, and `prepublishOnly` re-runs the gate for a hand-run `npm publish` too, so
+  that path is possible but is not the way releases happen.
 - **Cutting a release**: bump `version`, add a `## <version>` entry to `CHANGELOG.md` — with the schema
   digests if `doc/schemas` moved, since `gen:check` fails the gate if the two drift apart — then:
 

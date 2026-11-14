@@ -5,13 +5,25 @@
 # agents/ too). The publishing job re-runs the whole gate on the exact checkout of the tag before uploading,
 # and refuses if the tag does not match package.json.
 #
-# Requirements:
-#   - repo secret NPM_TOKEN: an npm automation token with publish permission on `actio-ts`;
-#   - the repository stays public (npm provenance attestations are verified against it);
-#   - the checkout is the whole monorepo on purpose: `gen:check` reads `../doc/schemas`, outside actio-ts/.
+# Credentials — npm is removing direct publishing with bypass-2FA tokens in January 2027, so this workflow
+# has both paths and the migration is "delete the secret":
 #
-# Not used here: `orchestra/env.sh` — that script exists to dodge the Bun shims on the build box; on CI the
-# Node version comes from actions/setup-node.
+#   * Trusted publishing (the target): no secret at all. Configure the package on npmjs.com → Publishing from
+#     CI/CD → Add trusted publisher → GitHub Actions, user `ludiazv`, repository `actio`, workflow filename
+#     `publish-actio-ts.yml`, and tick **`npm publish`** under Allowed actions (a configuration created after
+#     2026-09-03 allows only `npm stage publish` until you say otherwise). `id-token: write` below is what
+#     makes the OIDC exchange work; provenance attestations are then generated automatically. The connection
+#     cannot be edited afterwards — the workflow filename is a permanent commitment, and a new configuration
+#     must complete a first successful publish within 2 days.
+#   * A granular token (only for the first release, or until the configuration above exists): set the repo
+#     secret NPM_TOKEN to a "Read and write (publish and stage)" granular token. A package must already exist
+#     before it can have a trusted publisher, so the first version is published this way. This path stops
+#     working in January 2027.
+#
+# The repository stays public (provenance is verified against it), and GitHub-hosted runners only — npm does
+# not accept OIDC from self-hosted ones yet. The checkout is the whole monorepo on purpose: `gen:check` reads
+# `../doc/schemas`, outside actio-ts/. Not used here: `orchestra/env.sh`, which exists to dodge the Bun shims
+# on the build box; on CI the Node version comes from actions/setup-node.
 name: publish actio-ts
 
 on:
@@ -21,7 +33,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # npm provenance
+  id-token: write # OIDC for npm trusted publishing (and provenance on the token path)
 
 jobs:
   # The gate on both the floor of engines.node and the version the build box actually uses.
@@ -35,8 +47,8 @@ jobs:
       run:
         working-directory: actio-ts
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -50,11 +62,9 @@ jobs:
     defaults:
       run:
         working-directory: actio-ts
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: "22.x"
           registry-url: "https://registry.npmjs.org"
@@ -73,9 +83,18 @@ jobs:
       - run: npm ci
       - name: the gate again, on the publishing checkout
         run: npm run check:publish
-      - name: publish with provenance
-        # --ignore-scripts so prepublishOnly does not run the gate a third time (the build already produced
-        # dist/ in the step above). Unscoped package: no --access. npm refuses if package.json says private.
+
+      # Exactly one of the two publish steps runs, chosen by whether the secret exists: deleting NPM_TOKEN is
+      # the migration to trusted publishing. --ignore-scripts so prepublishOnly does not run the gate a third
+      # time (the build above already produced dist/). Unscoped package: no --access.
+      - name: publish with trusted publishing (no secret; provenance automatic)
+        if: ${{ secrets.NPM_TOKEN == '' }}
+        run: npm publish --ignore-scripts
+
+      - name: publish with a granular token (first release only; ends January 2027)
+        if: ${{ secrets.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --provenance --ignore-scripts
 
       - name: the registry serves it

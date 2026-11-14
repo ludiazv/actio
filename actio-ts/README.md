@@ -234,6 +234,8 @@ agent publishes `inactive` and announces. `stop({ force: true })` skips only the
 
 ## Conformance, testing, license
 
+- **Provenance**: releases are built and published by CI with an npm provenance attestation, so an
+  installed tarball can be checked against the commit that produced it.
 - [`CONFORMANCE.md`](CONFORMANCE.md): every MUST row of the protocol, with the code and the test.
 - [`CHANGELOG.md`](CHANGELOG.md): what each release changed, and the schema digests of the protocol
   revision it implements.
