@@ -317,7 +317,10 @@ prints what it resolved. On CI the Node version comes from the workflow instead.
   (the workflow filename is a commitment — to change it, delete and recreate it), and a fresh configuration
   must complete a first successful publish **within 2 days** or it expires. Requirements: a **public**
   repository, **GitHub-hosted** runners (npm accepts no OIDC from self-hosted ones yet), npm CLI ≥ 11.5.1 and
-  Node ≥ 22.14.
+  Node ≥ 22.14. One Actions trap that bit this file: a step-level `if:` cannot mention the `secrets` context
+  — GitHub rejects the **whole workflow file** with *Unrecognized named-value: 'secrets'* — so the workflow
+  decides `token` vs `oidc` in a step's `env:` (where secrets are allowed, and the shell only ever sees
+  `true`/`false`) and gates the two publish steps on that step's `$GITHUB_OUTPUT`.
 - **The other migration path, if OIDC is blocked** — a self-hosted runner, or simply wanting a human in the
   loop: a **stage-only** token and `npm stage publish` in CI; a maintainer then reviews with
   `npm stage list` / `npm stage view <id>` / `npm stage download <id>` and promotes with

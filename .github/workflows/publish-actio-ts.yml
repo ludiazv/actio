@@ -84,15 +84,28 @@ jobs:
       - name: the gate again, on the publishing checkout
         run: npm run check:publish
 
-      # Exactly one of the two publish steps runs, chosen by whether the secret exists: deleting NPM_TOKEN is
-      # the migration to trusted publishing. --ignore-scripts so prepublishOnly does not run the gate a third
-      # time (the build above already produced dist/). Unscoped package: no --access.
+      # Which credential exists decides which of the two publish steps below runs. A step-level `if:` cannot
+      # mention the `secrets` context at all — GitHub rejects the entire file with "Unrecognized named-value:
+      # 'secrets'" — so the comparison lives in this step's `env:` (where secrets are allowed) and the answer
+      # travels as a step output. The shell only ever sees "true" or "false", never the token itself.
+      - name: which credential is available
+        id: credential
+        env:
+          HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+        run: |
+          if [ "$HAS_NPM_TOKEN" = "true" ]; then mode=token; else mode=oidc; fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "publish step will use: $mode"
+
+      # Deleting the NPM_TOKEN secret is therefore the whole migration to trusted publishing.
+      # --ignore-scripts so prepublishOnly does not run the gate a third time (the step above produced dist/).
+      # Unscoped package: no --access.
       - name: publish with trusted publishing (no secret; provenance automatic)
-        if: ${{ secrets.NPM_TOKEN == '' }}
+        if: steps.credential.outputs.mode == 'oidc'
         run: npm publish --ignore-scripts
 
       - name: publish with a granular token (first release only; ends January 2027)
-        if: ${{ secrets.NPM_TOKEN != '' }}
+        if: steps.credential.outputs.mode == 'token'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --provenance --ignore-scripts
