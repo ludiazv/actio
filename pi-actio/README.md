@@ -40,14 +40,45 @@ folder instead — `pi install <absolute path>/pi-actio` — and install the che
 
 Location: the pi agent directory — `$PI_CODING_AGENT_DIR/actio.json`, by default `~/.pi/agent/actio.json`.
 
-**Every key is optional.** No file, or an empty object, means all defaults. A file that is not valid JSON, has
-an unknown key, has a wrong type, or has a bad agent id (`agentId` or an `acceptPrompt` item) registers
-**nothing** and shows one notification naming the file and the first error; fix it and `/reload`.
+**Every key is optional**, and those eight keys are the whole language: a file that is not valid JSON, has an
+unknown key, has a wrong type, or has a bad agent id (`agentId` or an `acceptPrompt` item) registers
+**nothing** and shows one notification naming the file and the first error. Fix it and `/reload`.
+
+A complete file, every key spelled out:
+
+```json
+{
+  "agentId": "planner-4f2a",
+  "namespaces": ["planning"],
+  "actioDir": "~/.actio",
+  "exposePrompt": true,
+  "acceptPrompt": ["oracle-9c1e", "scribe-7b3d"],
+  "disabled": false,
+  "json": false,
+  "reportActivity": true
+}
+```
+
+What people usually write, leaving the id to the extension and the root to the environment:
+
+```json
+{
+  "exposePrompt": true,
+  "acceptPrompt": ["oracle-9c1e", "scribe-7b3d"],
+  "reportActivity": true
+}
+```
+
+and the shortest file there is, which means the same as no file at all:
+
+```json
+{}
+```
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `agentId` | `^[a-zA-Z0-9_-]{1,32}$` | see below | the id this agent joins the team with |
-| `namespaces` | `string[]` | unset (actio-ts's default) | the namespaces this agent publishes |
+| `namespaces` | `string[]` | unset (actio-ts's default) | the namespaces this agent belongs to; `"*"` means all of them |
 | `actioDir` | `string` | unset → `$ACTIO_DIR` or `~/.actio` | the actio root folder; a leading `~` is expanded |
 | `exposePrompt` | boolean | `false` | offer the prompt service (§The prompt service) |
 | `acceptPrompt` | `string[]` of agent ids | `[]` | who may call the prompt service; `[]` means every agent on the team |

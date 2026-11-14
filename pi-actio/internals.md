@@ -66,8 +66,13 @@ One file: `join(getAgentDir(), "actio.json")` (D-1). The original requirements w
 `${PI_CODING_AGENT_DIR}/angent/actio.json`; that is read as the agent dir itself, because
 `PI_CODING_AGENT_DIR` *is* that directory.
 
-- The shape is a TypeBox `Value.Cast` check, not a `Cast` swallow: an unknown key, a wrong type, or an id
-  outside `^[a-zA-Z0-9_-]{1,32}$` throws an error that **names the path** (D-2).
+- The shape is a TypeBox schema check, not a `Cast` swallow: an unknown key, a wrong type, or an id
+  outside `^[a-zA-Z0-9_-]{1,32}$` throws an error that **names the path** (D-2). With
+  `additionalProperties: false`, a typo in a key means a dead extension rather than a silent default — which
+  is why the README spells all eight keys out.
+- The config is **stricter than the protocol in one place**: `namespaces` is `string[]` here, while the
+  protocol's `spec.schema.json` allows `null` items (`"*"` means all namespaces). Writing
+  `"namespaces": [null]` in `actio.json` is a D-2 file, even though it would be a legal spec.
 - A missing file, an empty file, or a partial file are all valid and mean defaults.
 - `disabled: true` is the fully-off switch (D-3); it takes effect on `/reload`, like every config change,
   because the file is read as the extension loads.
