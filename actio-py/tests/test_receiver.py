@@ -742,23 +742,38 @@ class AcceptanceTest(ReceiverTest):
 
 class CancellationTest(ReceiverTest):
     async def test_a_cancellation_during_work_wins(self) -> None:
+        """A cancellation that arrives while the handler is working: the handler's task is
+        cancelled, so the work is interrupted at its `await` with `ctx.cancelled` set (*Envelope
+        lifecycle*, "Cancelled during work": the work is stopped and cleaned,
+        `../doc/actio_protocol.md:499`; the reference aborts it at `../actio-ts/src/receiver.ts:441`),
+        and the answer is the cancellation response."""
+        seen: list[bool] = []
+        entered = asyncio.Event()
+
         async def handler(parameters: Any, ctx: Any) -> str:
+            entered.set()  # the witness that the work started: the request file is not one
             try:
-                await asyncio.wait_for(ctx.cancelled.wait(), timeout=3.0)
-                return "should not get here"
-            except TimeoutError:
-                return "done"
+                await asyncio.sleep(3.0)  # work with no safe point of its own
+            except asyncio.CancelledError:
+                seen.append(ctx.cancelled.is_set())
+                raise
+            return "should not get here"
 
         with actio_tree() as root:
             await self.boot(root, handlers={"summarize": handler})
             r = rid(14)
             await self.files(root, **{f"{r}.json": request_file(r)})
-            await wait_for("the work to start", lambda: running(root, r))
+            await wait_for("the work to start", entered.is_set)
             await self.files(root, **{f"{r}.can.json": cancellation_file(r)})
             await wait_for("the cancellation response", lambda: self.res_path(root, r).exists())
             res = await self.read_res(root, r)
             self.assertTrue(res["response"]["cancellation"])
             self.assertIsNone(res["response"]["result"])
+            self.assertEqual(
+                seen,
+                [True],
+                "the task was cancelled, and the flag was set when the handler noticed",
+            )
             await wait_until("the archive", archived_check(root, r))
             record = await inreq_for(root, r)
             assert record is not None

@@ -134,6 +134,12 @@ Exceptions: `ActioError` (a handler's refusal, `code >= 1000`), `ActioCallError`
 rules refused it before anything was written), `ActioResultError` (the peer's answer broke its own
 declared `result` schema).
 
+Inside a handler, a peer's cancellation reaches the work as a **task cancellation**: `ctx.cancelled`
+is set and the handler's task is cancelled, so the handler gets `CancelledError` at its next `await`
+and need not poll anything. The `cancelled` event is there for the work a task cancellation cannot
+reach — a thread, a subprocess — where the handler checks it at a safe point of its own. Whatever the
+handler then does, the answer the peer gets is the cancellation response.
+
 ---
 
 ## Implementation choices
@@ -145,7 +151,7 @@ choice is what the code is doing.
 | Label | The choice |
 | --- | --- |
 | **D-1** | The folder name is the agent's `id`: an agent's folder is named for the id it publishes. |
-| **D-2** | `stop` never kills a handler task. It asks the handler to stop at its next safe point and waits a bounded time; the handler is never cancelled under it. |
+| **D-2** | File names are the recommended ones, always written as them (`<rid>.json`, `.can.json`, `.res.json`, `.con.json`); on **read** an exchange is matched by `rid` and its body key, never by file name, and only `*.json` files in an inbox are considered. |
 | **D-3** | Two folders publishing the same id: the first in lexical order keeps the id, the other is skipped and reported as a `LogEvent`. |
 | **D-4** | Envelopes already in the inbox at startup are processed as if they had just arrived: requests go through `A0` (so an expired one is answered `108 request_expired`), commands through `D0`, and a response with no confirmation restarts the confirmation timer from now. The protocol lists this as one of three admissible behaviours. |
 | **D-5** | A `rid` already archived in this run is ignored, not served again; a command runs once per `rid` per run. |

@@ -137,25 +137,26 @@ async def ok_handler(params: Any, ctx: CapabilityContext) -> dict[str, Any]:
     return {"ok": True}
 
 
-def make_sleep_handler(calls: list[bool]) -> CapabilityHandler:
-    """The `sleep` work, abortable through the context's `cancelled` event (the handler's
-    `signal`): the row records whether the signal aborted it."""
+def make_sleep_handler(calls: list[bool], flags: list[bool] | None = None) -> CapabilityHandler:
+    """The `sleep` work: one long `await`, and nothing else. A peer's cancellation reaches it as a
+    task cancellation (`_receiver` sets `ctx.cancelled` and cancels the task), so the handler records
+    the `CancelledError` and re-raises it: swallowing it would only delay the answer, never change it.
+    `flags` records what `ctx.cancelled` said when the work was interrupted; `calls` records only a
+    cancellation that came from the peer, which is what the scenarios ask about."""
 
     async def sleep_handler(params: Any, ctx: CapabilityContext) -> dict[str, Any]:
         seconds = cast("dict[str, Any]", params)["seconds"]
-        loop = asyncio.get_running_loop()
-        sleeper = loop.create_task(asyncio.sleep(float(seconds)), name="e2e.sleep")
-        signaller = loop.create_task(ctx.cancelled.wait(), name="e2e.signal")
         try:
-            await asyncio.wait({sleeper, signaller}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for task in (sleeper, signaller):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(sleeper, signaller, return_exceptions=True)
-        if ctx.cancelled.is_set():
-            calls.append(True)
-            raise asyncio.CancelledError()
+            await asyncio.sleep(float(seconds))
+        except asyncio.CancelledError:
+            # `stop()` cancels this task too, and does not set the flag: the flag says whose
+            # cancellation reached the work, and only a peer's is the scenario's cancellation.
+            by_peer = ctx.cancelled.is_set()
+            if flags is not None:
+                flags.append(by_peer)
+            if by_peer:
+                calls.append(True)
+            raise
         calls.append(False)
         return {"slept": seconds}
 
@@ -174,11 +175,14 @@ def make_hold_handler(gate: asyncio.Event, calls: list[int]) -> CapabilityHandle
 
 
 def full_handlers(
-    sleep_calls: list[bool], hold_gate: asyncio.Event, hold_calls: list[int]
+    sleep_calls: list[bool],
+    hold_gate: asyncio.Event,
+    hold_calls: list[int],
+    sleep_flags: list[bool] | None = None,
 ) -> dict[str, CapabilityHandler]:
     return {
         "echo": echo_handler,
-        "sleep": make_sleep_handler(sleep_calls),
+        "sleep": make_sleep_handler(sleep_calls, sleep_flags),
         "off": ok_handler,
         "private": ok_handler,
         "strict": ok_handler,
@@ -965,12 +969,15 @@ class E2ETest(ActioTestCase):
     # --- E6 ---------------------------------------------------------------------------
 
     async def test_e6_a_cancellation_during_work_aborts_the_handler(self) -> None:
-        """E6: cancelled during work (`sleep`) — `cancelled` both sides, the handler's
-        `signal` aborted (*Envelope lifecycle*, "Cancelled during work"; the cancellation sets
-        the event the handler checks, and the receiver answers the cancellation)."""
+        """E6: cancelled during work (`sleep`) — `cancelled` both sides, and the handler was
+        interrupted at its `await` (*Envelope lifecycle*, "Cancelled during work": the work is stopped
+        and cleaned, `../doc/actio_protocol.md:499`; the reference aborts it the same way at
+        `../actio-ts/src/receiver.ts:441`, so the handler sees `CancelledError` with `ctx.cancelled`
+        set, and the answer is the cancellation response)."""
         with actio_tree() as root:
             sleep_calls: list[bool] = []
-            handlers = full_handlers(sleep_calls, asyncio.Event(), [])
+            sleep_flags: list[bool] = []
+            handlers = full_handlers(sleep_calls, asyncio.Event(), [], sleep_flags)
             alpha, beta = await self.pair(root, handlers=handlers)
             rec = InboxRecorder(root / BETA / "inbox")
             rec.start()
@@ -990,7 +997,12 @@ class E2ETest(ActioTestCase):
             body = out.response
             assert body is not None
             self.assertIs(body["cancellation"], True)
-            self.assertEqual(sleep_calls, [True], "the handler started and its signal aborted")
+            self.assertEqual(sleep_calls, [True], "the handler started and was interrupted")
+            self.assertEqual(
+                sleep_flags,
+                [True],
+                "the handler's task was cancelled, and `ctx.cancelled` was set when it noticed",
+            )
             self.assertEqual(len(rec.rids()), 1)
             rid = rec.rids()[0]
             # (d) this scenario has no attachments
@@ -1082,12 +1094,14 @@ class E2ETest(ActioTestCase):
         self,
     ) -> None:
         """E8: requestor timeout -> cancel -> response — `cancelled` both sides. The
-        requestor's own `timeout` (the `B2` deadline) writes the cancellation; the receiver's
-        handler is aborted by its `signal` and answers the cancellation (*Issue a request*,
-        `B4`; *Envelope lifecycle*, "Cancelled during work")."""
+        requestor's own `timeout` (the `B2` deadline) writes the cancellation; the receiver cancels
+        the handler's task, so the work is interrupted at its `await` with `ctx.cancelled` set, and
+        the answer is the cancellation response (*Issue a request*, `B4`; *Envelope lifecycle*,
+        "Cancelled during work", `../doc/actio_protocol.md:499`)."""
         with actio_tree() as root:
             sleep_calls: list[bool] = []
-            handlers = full_handlers(sleep_calls, asyncio.Event(), [])
+            sleep_flags: list[bool] = []
+            handlers = full_handlers(sleep_calls, asyncio.Event(), [], sleep_flags)
             alpha, beta = await self.pair(root, handlers=handlers)
             rec = InboxRecorder(root / BETA / "inbox")
             rec.start()
@@ -1108,7 +1122,12 @@ class E2ETest(ActioTestCase):
             assert body is not None
             self.assertIs(body["cancellation"], True)
             self.assertIsNone(body["result"])
-            self.assertEqual(sleep_calls, [True], "the handler's signal aborted")
+            self.assertEqual(sleep_calls, [True], "the handler was interrupted")
+            self.assertEqual(
+                sleep_flags,
+                [True],
+                "the timeout's cancellation cancelled the handler's task, flag set first",
+            )
             self.assertEqual(len(rec.rids()), 1)
             rid = rec.rids()[0]
             # (d) this scenario has no attachments

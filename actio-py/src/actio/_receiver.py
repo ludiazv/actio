@@ -627,8 +627,9 @@ class Receiver:
     def _apply_later(
         self, ex: _Exchange, file: CancellationFile | ConfirmationFile, kind: str
     ) -> str | None:
-        # The effect of one matched envelope, by kind. A cancellation sets the flag the handler
-        # checks at safe points; the handler task is never killed by it (D-2).
+        # The effect of one matched envelope, by kind. A cancellation sets `ctx.cancelled` and cancels
+        # the handler's task, so it gets `CancelledError` at its next `await`; the flag is for work a task
+        # cancellation can't reach. Either way the answer is the cancellation response.
         if not same_header(cast(Header, file), ex.header):
             return f"header mismatch for rid {ex.rid} (D-11)"
         if kind == "cancellation":
@@ -639,6 +640,8 @@ class Receiver:
             if req is not None and not name_matches(cast(RequestBody, req["request"]), can_body):
                 return f"cancellation name mismatch for rid {ex.rid}"
             ex.cancelled.set()
+            if ex.task is not None and not ex.task.done():
+                ex.task.cancel()
             # A `can` after the response is recorded too: the archive ends `cancelled`
             # (*Envelope lifecycle*, "Cancelled after the response"); no second response.
             ex.can = cast(CancellationFile, file)

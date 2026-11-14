@@ -1824,19 +1824,26 @@ class TwoAgentTest(AgentTest):
             self.assertIn("echo", alpha.agmen()[PEER].capabilities)
 
     async def test_a_cancellation_across_the_wire(self) -> None:
-        """A cancellation across the wire: `alpha` requests a capability whose handler parks on the
-        cancel flag; `alpha`'s task is cancelled; the handler reports it was cancelled (the point of
-        the row, not a side effect); `beta` answers the cancellation per *Envelope lifecycle*; both
-        diariums end `cancelled`; nothing is armed on either side afterwards. Control: make `beta`
-        ignore a cancellation for a running handler — the handler never wakes, the exchange never
-        ends, and this test times out."""
+        """A cancellation across the wire: `alpha` requests a capability whose handler is one long
+        `await` with no safe point of its own; `alpha`'s task is cancelled; `beta` sets `ctx.cancelled`
+        and cancels the handler's task, so the handler is interrupted at its `await`, records that the
+        flag was set, and re-raises (*Envelope lifecycle*, "Cancelled during work": the work is
+        stopped and cleaned, `../doc/actio_protocol.md:499`, and the reference aborts it the same way at
+        `../actio-ts/src/receiver.ts:441`); `beta` answers the cancellation per *Envelope
+        lifecycle*; both diariums end `cancelled`; nothing is armed on either side afterwards. Control:
+        do not cancel the handler task — the handler sleeps on, `alpha`'s exchange ends `abandoned`, and
+        this row fails on the recorded flag."""
         async with self.tree() as root:
-            reported = {"cancelled": False}
+            seen: dict[str, Any] = {}
 
             async def cancel_handler(params: Any, ctx: Any) -> dict[str, Any]:
-                await ctx.cancelled.wait()  # park until the cancellation arrives
-                reported["cancelled"] = True  # the handler saw the cancel: that is the row
-                return {"text": "cancelled"}
+                try:
+                    await asyncio.sleep(30)  # work that is nothing but an `await`
+                except asyncio.CancelledError:
+                    seen["flag"] = ctx.cancelled.is_set()
+                    raise
+                seen["finished"] = True
+                return {"text": "not cancelled"}
 
             alpha, _ = await self.boot(root, confirm_timeout=0.2, cancel_wait_timeout=10.0)
             beta, _ = self.build_peer(
@@ -1857,12 +1864,13 @@ class TwoAgentTest(AgentTest):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-            # The handler reported that it was cancelled.
+            # The handler was interrupted at its `await`, with the flag set.
             await wait_for(
-                "the handler to report that it was cancelled",
-                lambda: reported["cancelled"],
+                "the handler to record the cancellation",
+                lambda: seen.get("flag") is True,
                 timeout=WATCH_SETTLE,
             )
+            self.assertNotIn("finished", seen, "the handler never ran to its end")
             # `beta` answered the cancellation; its `inreq` line ends `cancelled`.
             await wait_for(
                 "beta's inreq line to end cancelled",
@@ -1894,6 +1902,52 @@ class TwoAgentTest(AgentTest):
                     and not list(inbox_dir(root, PEER).iterdir())
                 ),
                 timeout=WATCH_SETTLE,
+            )
+
+    async def test_a_handler_that_only_awaits_ends_the_exchange_cancelled(self) -> None:
+        """*Envelope lifecycle*, 'Cancelled during work' (`../doc/actio_protocol.md:499`: the work is
+        stopped and cleaned), with a handler that never looks at the flag: the work is one long
+        `await`, and a caller that asks to cancel still ends the exchange `cancelled` — `beta` sets
+        `ctx.cancelled` and cancels the handler's task, so the handler is interrupted at its `await`
+        and `alpha` gets the cancellation response. Measured without the task cancellation: the
+        handler sleeps on, `alpha` ends `abandoned` with no response, and the handler records
+        nothing."""
+        async with self.tree() as root:
+            seen: dict[str, Any] = {}
+
+            async def sleepy(params: Any, ctx: Any) -> dict[str, Any]:
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    seen["flag"] = ctx.cancelled.is_set()
+                    raise
+                return {"text": "slept"}
+
+            alpha, _ = await self.boot(root, confirm_timeout=0.2, cancel_wait_timeout=10.0)
+            beta, _ = self.build_peer(root, caps={"sleepy": sleepy}, confirm_timeout=0.2)
+            await beta.start()
+            await self._see(alpha, "sleepy")
+            cancel = asyncio.Event()
+            call = asyncio.ensure_future(
+                alpha.request(PEER, "sleepy", {"text": "x"}, timeout=30, cancel=cancel)
+            )
+            # The request is in `beta`'s inbox, so the handler is inside its `await`.
+            await wait_for(
+                "the request in beta's inbox",
+                lambda: any(p.name.endswith(".json") for p in inbox_dir(root, PEER).iterdir()),
+                timeout=WATCH_SETTLE,
+            )
+            cancel.set()
+            out = await asyncio.wait_for(call, self.CALL_BOUND)
+            self.assertEqual(out.final_status, "cancelled")
+            response = out.response
+            assert response is not None
+            self.assertIs(response["cancellation"], True, "the A.3 cancellation response")
+            self.assertIsNone(response["result"])
+            self.assertEqual(
+                seen.get("flag"),
+                True,
+                "the handler's task was cancelled at its `await`, with `ctx.cancelled` set",
             )
 
     async def test_a_command_across_the_wire(self) -> None:
