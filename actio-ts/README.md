@@ -203,9 +203,18 @@ Implementation rules: **I-1** the mutagen `onError` hook; **I-2** every written 
 → build → tarball smoke. It must be green, from this monorepo layout, under `orchestra/env.sh` (real Node —
 the Bun shim cannot run the suite). `package.json` `files` is an allowlist (`dist`, `src`, README,
 CONFORMANCE, CHANGELOG, LICENSE): with no allowlist npm publishes *anything not gitignored*, including the
-whole test tree and its protocol vectors. `private` stays `true` until the publish commit itself: publishing
-is a human act, and `prepublishOnly` re-runs the gate one last time. See `npm-publish-proposal.md` for the
-full runbook and the decisions behind it.
+whole test tree and its protocol vectors.
+
+Publishing is a **tag, not a command**: push `actio-ts/v<version>` and
+`.github/workflows/publish-actio-ts.yml` runs that gate on Node 22 **and** 24, then publishes with
+provenance (needs the `NPM_TOKEN` secret and a public repository). A repo-wide `v*` tag publishes nothing —
+this is a monorepo, so releases are namespaced per package, the same namespace that carries `protocol/v0.1`
+for the schemas. `prepublishOnly` re-runs the gate for any local publish too.
+
+```sh
+# cut a release: bump "version", add a CHANGELOG entry, then
+ git tag -a actio-ts/v0.1.0 -m "actio-ts 0.1.0" && git push origin actio-ts/v0.1.0
+```
 
 ## License
 

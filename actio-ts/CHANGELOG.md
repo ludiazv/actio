@@ -26,3 +26,6 @@ First publishable release.
 - **Release gate**: `npm run check:publish` = `gen:check` → typecheck → the full suite (330 tests) → the
   independent black-box run (19/19) → build → `scripts/pack-smoke.mjs`, which installs the packed tarball
   into a temp directory with `--omit=dev` and drives it from plain Node.
+- **Release pipeline**: `.github/workflows/publish-actio-ts.yml` — pushing the tag `actio-ts/v<version>`
+  (a per-package namespace: a repo-wide `v*` publishes nothing in this monorepo) re-runs that gate on Node
+  22 and 24 and publishes with provenance. The job refuses if the tag does not match `package.json`.

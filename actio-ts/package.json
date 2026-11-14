@@ -4,8 +4,17 @@
   "description": "TypeScript implementation of the Actio protocol v0.1, core conformance profile",
   "license": "BSD-3-Clause",
   "type": "module",
-  "private": true,
+  "private": false,
   "author": "ldiaz",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ludiazv/actio.git",
+    "directory": "actio-ts"
+  },
+  "bugs": {
+    "url": "https://github.com/ludiazv/actio/issues"
+  },
+  "homepage": "https://github.com/ludiazv/actio/tree/main/actio-ts#readme",
   "keywords": [
     "actio",
     "agent-protocol",

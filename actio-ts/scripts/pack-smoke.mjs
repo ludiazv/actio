@@ -22,7 +22,11 @@ const check = (ok, what) => {
   console.log(`${ok ? "ok  " : "FAIL"}  ${what}`);
   if (!ok) failures++;
 };
-const npm = (args, cwd) => execFileSync("npm", args, { cwd, encoding: "utf8" });
+// Nested npm calls inherit the parent's npm_* environment: inside `npm publish` (whose prepublishOnly hook
+// runs this script) that includes npm_config_dry_run=true, so `npm pack` prints a tarball name but writes no
+// file, and `npm install` installs nothing. Children get a clean environment.
+const childEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("npm_")));
+const npm = (args, cwd) => execFileSync("npm", args, { cwd, env: childEnv, encoding: "utf8" });
 
 try {
   // 1. Pack, and unpack into the temp dir.
