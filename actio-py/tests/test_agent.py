@@ -1950,6 +1950,37 @@ class TwoAgentTest(AgentTest):
                 "the handler's task was cancelled at its `await`, with `ctx.cancelled` set",
             )
 
+    async def test_a_result_that_cannot_be_written_answers_an_error(self) -> None:
+        """A handler whose result cannot be written — a `set`, which the one JSON writer refuses
+        rather than coerces — is the handler's failure, not a silence: `beta` answers `error: true`
+        with a result of `{"msg": …}` and no `code` (the error result's schema,
+        `../doc/actio_protocol.md:533`), `alpha` confirms, and the exchange ends `confirmed`. Measured
+        without the check: no response is written at all, `beta` logs `<rid> left unsettled`, and
+        `alpha` ends `abandoned`."""
+        async with self.tree() as root:
+
+            async def setty(params: Any, ctx: Any) -> dict[str, Any]:
+                return {"a set": {1, 2}}
+
+            alpha, _ = await self.boot(root, confirm_timeout=0.2)
+            beta, _ = self.build_peer(root, caps={"setty": setty}, confirm_timeout=0.2)
+            await beta.start()
+            await self._see(alpha, "setty")
+            out = await asyncio.wait_for(
+                alpha.request(PEER, "setty", {"text": "x"}, timeout=30), self.CALL_BOUND
+            )
+            self.assertEqual(out.final_status, "confirmed", "answered, and confirmed by its caller")
+            response = out.response
+            assert response is not None
+            self.assertIs(response["error"], True)
+            self.assertIs(response["cancellation"], False)
+            result = response["result"]
+            assert isinstance(result, dict)
+            self.assertIn("msg", result)
+            self.assertNotIn(
+                "code", result, "a handler failure that is not an `ActioError`: no code"
+            )
+
     async def test_a_command_across_the_wire(self) -> None:
         """A command across the wire: `alpha` sends `enable` to `beta` through the requestor's command
         path (not a hand-written file); `beta`'s spec gains `disabled` and then clears it, and `beta`'

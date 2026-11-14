@@ -13,6 +13,7 @@ from typing import Any, Protocol, cast
 
 from ._diarium import inreq_event, log_event
 from ._files import (
+    dumps,
     loads,
     make_dirs,
     mtime_ns,
@@ -501,6 +502,13 @@ class Receiver:
                 await self._respond(ex, "cancellation")
             elif not ex.task.cancelled():  # a cancelled task is answered by `stop()` itself
                 failure = ex.task.exception()
+                if failure is None:
+                    # A result that cannot be written is the handler's failure, not a silent
+                    # nothing: the value goes through the one JSON writer before the answer.
+                    try:
+                        dumps(ex.result)
+                    except (TypeError, ValueError) as err:
+                        failure = err
                 kind, result = (
                     ("ok", ex.result) if failure is None else ("error", self._error_result(failure))
                 )
