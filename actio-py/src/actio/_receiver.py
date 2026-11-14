@@ -62,13 +62,15 @@ from ._validate import (
 )
 from ._watch import FolderWatch, Watcher, scan
 
+# D-2: names are built only to write our own files and to find a known exchange's files. A new inbox file
+# is classified by its body key, never by its name, so a file renamed by hand is still its exchange.
 _SUFFIX: dict[str, str] = {"cancellation": "can", "response": "res", "confirmation": "con"}
 _SUFFIX_RE = re.compile(r"\.(can|res|con)\.json$")
 
 # `Observer.join` blocks, so the close of the watcher is bounded.
 WATCH_JOIN_TIMEOUT = 5.0
 
-# The A2 answer of a work abandoned by `stop()` (D-10).
+# The A2 answer of a work abandoned by `stop()` (D-9).
 AGENT_STOPPING_MSG = "agent_stopping: the agent stops before answering"
 STOPPING_RESULT: dict[str, Any] = {"code": 300, "msg": AGENT_STOPPING_MSG}
 # D-9's bound on the receiver's last phase: how long `stop()` waits for a handler it has cancelled. The

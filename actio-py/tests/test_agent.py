@@ -335,7 +335,7 @@ class AgentTest(ActioTestCase):
         """`actio_tree()`, with the agents this test built stopped **before** its folders go away.
 
         A test that ends with an agent running deletes its tree under that agent's feet: a delayed
-        write (D-2's `announce_delay` re-announce, D-8's status write) can land mid-removal, and
+        write (the `announce_delay` re-announce, D-24; D-8's status write) can land mid-removal, and
         `TemporaryDirectory.cleanup()` then raises for a reason that has nothing to do with what the
         test asked. The folders outlive every task of the agents that own them — which is what D-9's
         stop order is for. `stop()` on an already stopped agent returns at once, so a test that stopped

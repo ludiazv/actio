@@ -165,6 +165,7 @@ class Requestor:
         reason = validate("request", req)
         if reason is not None:
             raise ValueError(f"requestor: built an invalid command for {dst}/{name}: {reason}")
+        # D-2: the recommended name. A reader matches by `rid` and body key, never by this name.
         path = os.path.join(self._dst_inbox(dst), f"{rid}.json")
         await write_json_atomic(path, req, self._ctx.folders.agent, self._ctx.sync)
         # B1: for a command, "append an `outreq` event (`final_status="sent"`, only `req`)". A command
