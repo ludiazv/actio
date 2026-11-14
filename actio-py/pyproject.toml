@@ -38,7 +38,7 @@ src = ["src", "tests"]
 line-length = 100
 # A sealed copy has no `.git`, so ruff never reads `.gitignore`, and the 3.13 virtualenv under a name
 # other than `.venv` — `.venv-313`, in the sealed validation — is walked and its `activate_this.py`
-# would fail the format check on a file that is not ours. R2-6: name the pattern, so the seal checks
+# would fail the format check on a file that is not ours. Name the pattern, so the seal checks
 # the code and nothing else.
 extend-exclude = [".venv*"]
 
