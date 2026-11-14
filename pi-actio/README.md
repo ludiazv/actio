@@ -26,9 +26,8 @@ history that survives `/reload`, settings UIs.
 pi install npm:pi-actio@0.1.0
 ```
 
-The npm source becomes available with the first published release. From a source checkout, install the
-folder instead — `pi install <absolute path>/pi-actio` — and install the checkout's dependencies first
-([internals.md](internals.md) §11).
+From a source checkout, install the folder instead — `pi install <absolute path>/pi-actio` — and install the
+checkout's dependencies first ([internals.md](internals.md) §11).
 
 - **Node ≥ 22.**
 - Remove it with `pi uninstall <source>`. For a folder, pi matches an installed extension by its resolved
