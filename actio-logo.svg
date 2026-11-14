@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400" role="img" aria-labelledby="t d">
+  <title id="t">Actio</title>
+  <desc id="d">A Romanesque round arch with a dovetailed stone tablet inscribed ·ACTIO· set in front of its base.</desc>
+  <defs>
+    <style>
+      .edge  { stroke: #4F483D; stroke-width: 3; stroke-linejoin: round; }
+      .line  { fill: none; stroke: #4F483D; stroke-width: 2.5; stroke-linecap: round; }
+      .glyph { stroke-linecap: butt; stroke-linejoin: miter; }
+    </style>
+    <g id="letters">
+      <!-- interpunct -->
+      <path d="M90,325 L98,325 L94,333 Z" stroke="none"/>
+      <!-- A (Romanesque flat-topped) -->
+      <path fill="none" d="M108,347 L122,311 L128,311 L142,347 M114.5,335 L135.5,335" stroke-width="5"/>
+      <path fill="none" d="M103,345.5 L113,345.5 M137,345.5 L147,345.5 M119,312.5 L131,312.5" stroke-width="3"/>
+      <!-- C -->
+      <path fill="none" d="M181.3,316.3 A16,18 0 1 0 181.3,341.7" stroke-width="5"/>
+      <path fill="none" d="M182.5,312 L182.5,320 M182.5,338 L182.5,346" stroke-width="3"/>
+      <!-- T -->
+      <path fill="none" d="M198,313.5 L228,313.5 M213,313.5 L213,347" stroke-width="5"/>
+      <path fill="none" d="M199.5,311 L199.5,320 M226.5,311 L226.5,320 M207,345.5 L219,345.5" stroke-width="3"/>
+      <!-- I -->
+      <path fill="none" d="M243,311 L243,347" stroke-width="5"/>
+      <path fill="none" d="M237,312.5 L249,312.5 M237,345.5 L249,345.5" stroke-width="3"/>
+      <!-- O -->
+      <ellipse fill="none" cx="276" cy="329" rx="15.5" ry="17.5" stroke-width="5"/>
+      <!-- interpunct -->
+      <path d="M302,325 L310,325 L306,333 Z" stroke="none"/>
+    </g>
+  </defs>
+
+  <g transform="translate(200,200) scale(1.1) translate(-200,-231.5)">
+    <!-- Round arch: nine voussoirs, open (transparent) underneath -->
+    <path class="edge" fill="#C9C0AE" d="M40,290 A160,160 0 0 1 360,290 L320,290 A120,120 0 0 0 80,290 Z"/>
+    <path class="line" d="M87.24,248.96 L49.65,235.28 M108.08,212.87 L77.43,187.15 M140,186.08 L120,151.44 M179.16,171.82 L172.22,132.43 M220.84,171.82 L227.78,132.43 M260,186.08 L280,151.44 M291.92,212.87 L322.57,187.15 M312.76,248.96 L350.35,235.28"/>
+
+    <!-- Tabula ansata in front of the arch's springing -->
+    <path class="edge" fill="#E2DACB" d="M70,255 L330,255 L330,277 L366,261 L366,327 L330,311 L330,333 L70,333 L70,311 L34,327 L34,261 L70,277 Z"/>
+    <rect class="line" x="78" y="263" width="244" height="62"/>
+    <circle cx="47" cy="294" r="3.5" fill="#4F483D"/>
+    <circle cx="353" cy="294" r="3.5" fill="#4F483D"/>
+
+    <!-- Inscription, centred on the tablet -->
+    <use href="#letters" class="glyph" fill="#8C3B2C" stroke="#8C3B2C" transform="translate(0,-35)"/>
+  </g>
+</svg>
