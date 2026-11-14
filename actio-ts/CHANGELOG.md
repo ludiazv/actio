@@ -29,3 +29,7 @@ First publishable release.
 - **Release pipeline**: `.github/workflows/publish-actio-ts.yml` — pushing the tag `actio-ts/v<version>`
   (a per-package namespace: a repo-wide `v*` publishes nothing in this monorepo) re-runs that gate on Node
   22 and 24 and publishes with provenance. The job refuses if the tag does not match `package.json`.
+- **Documentation split**: `README.md` addresses users of the package (install, the API, configuration,
+  what the draft does not give you); `internals.md` addresses readers of the code — the module map, the
+  lifecycle, the four lanes, the decisions D-1…D-22 with D-20 superseded (generated code is committed, not
+  rebuilt), the implementation rules, the tests and the release pipeline.

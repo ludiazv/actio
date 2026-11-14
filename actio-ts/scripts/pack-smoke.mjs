@@ -46,7 +46,7 @@ try {
   if (manifest.private === true) console.log("note  private:true — flip it in the publish commit; publishing is not the job of this script");
 
   // 3. The file list: what must be there, and what must not.
-  for (const need of ["package/dist/index.js", "package/dist/index.d.ts", "package/src/index.ts", "package/src/generated/schemas.ts", "package/LICENSE", "package/README.md"]) {
+  for (const need of ["package/dist/index.js", "package/dist/index.d.ts", "package/src/index.ts", "package/src/generated/schemas.ts", "package/README.md", "package/internals.md", "package/LICENSE"]) {
     check(listed.includes(need), `${need} published`);
   }
   for (const bad of ["package/test/", "package/scripts/", "package/examples/", "package/orchestra/", "package/node_modules/", "package/tsconfig"]) {

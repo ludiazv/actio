@@ -1,226 +1,244 @@
 # actio-ts
 
-A simple TypeScript implementation of the [Actio protocol](../doc/actio_protocol.md) v0.1 — the **core conformance profile**: `security_support: []`, `security_posture: "trusted"`, `signature: null`. No cryptography.
+A TypeScript client for the [Actio protocol](https://github.com/ludiazv/actio/blob/main/doc/actio_protocol.md)
+v0.1, **core conformance profile**. Actio is file-based agent coordination: a team of agents shares one
+`.actio` directory, each agent publishes what it can do (`spec.json`) and how it is doing (`status.json`),
+and agents exchange JSON envelopes through each other's `inbox/`. There is no broker, no socket and no
+server to run: a peer you cannot reach is a folder that has not been updated recently.
 
-Actio is a file-based agent coordination protocol: a team of agents (*agmen*) shares one `.actio` directory. Each agent publishes `spec.json` and `status.json`, announces in `nuntium/`, and exchanges request/response envelopes (`<rid>.json`, `.can.json`, `.res.json`, `.con.json`) through its `inbox/`. Everything is JSON files on a watchable file system — no broker, no sockets.
+You get one library: `ActioAgent` (run an agent — receive, answer, publish, log), the calling side
+(`request`, `command`), discovery (`agmen`, `scan`, `health`) and the protocol log reader
+(`readDiarium`). How the package works inside is in [`internals.md`](internals.md).
 
-## The protocol is public — and it is still a draft
+## Before you use it
 
-- **Public by design.** The 11 JSON Schemas of the core profile are embedded **verbatim** in `src/generated/schemas.ts`, so this package *is* the wire format: fields, enums, id patterns, envelope names and error codes — and with `src/io.ts`, the whole file layout too. Anyone who installs it can build an interoperable implementation. Published copies are permanent (registry, mirrors, everyone's `node_modules`). The revision of record is the **SHA-256 list in that file's header**, which pins the exact `doc/schemas/` files implemented.
-- **The security layer is unspecified, not merely unimplemented.** `doc/actio_protocol.md` §*Security* reads *PENDING SPECIFICATION OF THE CRYPTOGRAPHIC PROTOCOL*: no keys, no signing, no certificate issuer, no codes 200–299. This profile is `security_posture: "trusted"` with `signature: null` — **every envelope is unsigned and unauthenticated**. Write access to the shared `.actio` root *is* peer authority: never put untrusted agents in one root, and never feed a capability `description` authored by an untrusted peer into an LLM planner — it is untrusted text by design, with no isolation in this profile.
-- **The schemas are shapes, not the spec.** The normative rules the schemas cannot express — one header per exchange except `datetime`, cancellation `name` equals request `name`, capability names unique per agent, `result`/`parameters` validated against the *receiver's* `spec.json`, announce agent-ID equals its writer — and the whole lifecycle semantics live in the prose spec, which is not part of this package.
+The protocol is public, and it is still a **draft**.
 
-## Install & requirements
+- **The wire format ships with this package.** The 11 JSON Schemas of the core profile are embedded
+  verbatim, so installing it gives anyone everything needed to build an interoperable implementation — and
+  published copies are permanent (the registry, mirrors, everyone's `node_modules`). Which exact revision
+  is implemented is pinned by SHA-256 in [`CHANGELOG.md`](CHANGELOG.md).
+- **There is no authentication.** The core profile is `security_posture: "trusted"` with `signature: null`:
+  every envelope is unsigned and unauthenticated, and the cryptographic layer is *pending specification*
+  in the protocol document. **Write access to the shared `.actio` root is peer authority** — anyone who can
+  write there is a peer as far as the protocol is concerned. Do not put untrusted agents in one root, and do
+  not share a root with a process that can be influenced by untrusted input.
+- **Capability descriptions are untrusted text.** They exist to be read by an LLM planner; in this profile
+  they carry no signature and no isolation.
+- **Schemas are shapes, not the specification.** Ownership, lifecycle semantics and the callability rules
+  are prose in the protocol document. This package implements them; [`CONFORMANCE.md`](CONFORMANCE.md)
+  lists every protocol requirement with the code that satisfies it and the test that proves it.
 
-- **Node.js ≥ 22** (npm). `npm ci` installs the dependencies (runtime: only `ajv`; dev: `typescript`, `json-schema-to-typescript`, `tsx`, `@types/node`).
-- The schemas drive the code: `src/generated/` (schemas + interfaces) is **generated** from `../doc/schemas/` and **committed** — a published package cannot regenerate it (the generator reads a directory outside the package and needs devDependencies). The ordinary commands only *verify* it (`npm run gen:check`, byte-exact); `npm run gen` is the explicit "I intend to regenerate" step.
-- Import `actio-ts` (the package entry is the compiled `dist/index.js` + `dist/index.d.ts`); `src/` ships as source for readable traces.
+## Install
 
 ```sh
-npm ci            # install
-npm run check     # gen:check + tsc --noEmit + the full test suite
-npm run blackbox  # the independent black-box run (echo agent as a child process, envelopes by hand)
-npm run build     # dist/: ESM + .d.ts, no maps — the entry of the published package
-npm run check:publish  # the release gate: check, blackbox, build, and the tarball smoke below
+npm install actio-ts
 ```
 
-`scripts/pack-smoke.mjs` (run by `check:publish`) packs the tarball, installs it into a temp directory with
-`--omit=dev` — exactly what a consumer gets — and drives it from **plain Node**: no tsx, no jiti, no path
-into this repository. It is the check that catches "works in the repo, broken when installed".
+- **Node.js ≥ 22**, ESM only (`"type": "module"`). TypeScript declarations ship in the package. One runtime
+  dependency.
+- The agent needs **write access to the whole `.actio` root**, not only its own folder: writing into a
+  peer's `inbox/` *is* how you call it.
+- The storage must deliver **local change notifications** (a local disk, or a sync tool that writes
+  locally). There is no polling fallback — see [Storage sync](#storage-sync).
+- Every protocol type (`Spec`, `Status`, `Rid`, `RequestBody`, `ResponseBody`, `Exchange`, `DiariumLine`, …)
+  is exported from the package entry: you never import from a path inside it.
 
-`test/blackbox/blackbox.mjs` imports no actio-ts code: it writes the protocol files by hand and validates every file the agent produces with its own Ajv built from `../doc/schemas/`. Run it after any change to protocol behavior.
-
-## Quick start: two agents in one process
+## Two agents, one root
 
 ```ts
-import { ActioAgent } from "./src/agent.js";
-import { loadConfig } from "./src/config.js";
+import { ActioAgent } from "actio-ts";
 
-const root = "/tmp/my-team";          // or $ACTIO_DIR; default ~/.actio
+const root = "/shared/actio";   // or $ACTIO_DIR; default ~/.actio
 
-const beta = new ActioAgent({
-  id: "echo",
+const echo = new ActioAgent({
+  id: "echo",                   // also its folder name, always
   description: "echoes text",
   acceptsCommandsFrom: ["alpha"],
-  config: { root, heartbeatInterval: 200, confirmTimeout: 1_000 },
+  config: { root },
 });
-beta.capability(
+
+echo.capability(
   {
     name: "echo",
     description: "echoes the text it gets",
     parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"], additionalProperties: false },
     actio: { result: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } },
   },
-  async (params, ctx) => ({ text: (params as { text: string }).text }),
+  async (params) => ({ text: (params as { text: string }).text }),
 );
-await beta.start();
+await echo.start();             // folders, spec.json, status.json, announce
 
-const alpha = new ActioAgent({ id: "alpha", description: "demo requestor", acceptsCommandsFrom: [], config: { root } });
+const alpha = new ActioAgent({ id: "alpha", description: "requestor", acceptsCommandsFrom: [], config: { root } });
 await alpha.start();
-await alpha.agmen();                  // both agents discovered (alpha sees itself too)
+await alpha.agmen();            // both agents discovered (an agent sees itself too)
 
 const outcome = await alpha.request("echo", "echo", { text: "hello" });
-// outcome.finalStatus === "confirmed"; outcome.response.result === { text: "hello" }
+outcome.finalStatus;            // "confirmed"
+outcome.response?.result;       // { text: "hello" }
 
 await alpha.stop();
-await beta.stop();
+await echo.stop();
 ```
 
-Running examples live in [`examples/`](examples): `echo-agent.ts` (the conformance target, driven by `ACTIO_AGENT_ID` / `ACTIO_COMMANDERS` / `ACTIO_NAMESPACES` + the config env vars) and `planner.ts` (a minimal requestor).
+Two runnable examples are in the repository:
+[`examples/echo-agent.ts`](https://github.com/ludiazv/actio/blob/main/actio-ts/examples/echo-agent.ts) (a
+standalone agent process, the conformance target) and
+[`examples/planner.ts`](https://github.com/ludiazv/actio/blob/main/actio-ts/examples/planner.ts) (a minimal
+caller).
 
-```sh
-npm run echo        # tsx examples/echo-agent.ts
-npm run actio -- ls # the CLI (see below)
+## Publishing a capability
+
+`agent.capability(spec, handler)` registers what the agent can do. `parameters` and `result` are JSON
+Schemas, and they are used on both sides:
+
+- **at registration** they are compiled immediately — a schema Ajv rejects throws there, before the agent
+  starts, not on the first call;
+- **on the receiver**, incoming `parameters` are checked against them first (a request that does not fit is
+  answered with an error, code 105, and the handler never runs);
+- **on the caller**, the response `result` is checked against the schema the *receiver* published; a
+  mismatch throws `ActioResultError` (`finalStatus` is still what the exchange said — the exchange
+  completed, the contract did not).
+
+The handler receives `(params, ctx)`, where `ctx` carries `rid`, `src`, an `AbortSignal` (a cancellation, or
+your own `stop()`), the request's `attachments` as `forum`-relative paths, and
+`ctx.publishAttachment(name, data)` to return a file. Return the result, or throw `ActioError(code, msg)`
+for a **capability** error (`code ≥ 1000`); the peer receives it as an error response (`error: true`, the
+`{ code, msg, details }` in `result`) and the exchange still confirms. Names must be unique per agent, and
+they are also the names peers call you by.
+
+To check a payload against a capability you discovered **before** calling it, use
+`checkParams(capability, params)`: the same check the receiver runs, returning one error string or
+`undefined`.
+
+## Calling
+
+```ts
+const outcome = await alpha.request("echo", "echo", { text: "hello" }, {
+  timeout: 60,          // seconds; 0 waits forever (until the peer answers or `signal` aborts)
+  attachments: ["/tmp/report.pdf"],   // copied into `forum` under their basename
+  signal: controller.signal,          // cancels: writes the cancellation envelope
+});
 ```
 
-## The directory layout an agent maintains
+`outcome.finalStatus` is `"confirmed"`, `"cancelled"` or `"abandoned"`; `response` is present whenever a
+response was received and confirmed. A peer's failure is not an exception: it arrives as a response with
+`error: true` and the `{ code?, msg, details? }` payload in `result` — an error **answer** is still an
+answer. Two things throw instead:
+
+- **`ActioCallError`** — the callability rules refused locally and *nothing was written*: unknown peer,
+  outside your namespaces, peer disabled or not accepting you, `error`/`zombie` status…
+- **`ActioResultError`** — the answer arrived but breaks the peer's published `result` schema.
+
+`agent.command(dst, name, params?)` sends a command instead of a request and resolves with the envelope's
+`rid`: commands are never answered and cannot be cancelled. The four built-ins are `ping` (republish),
+`enable` (`{ enabled }`, which sets or clears `disabled` in `spec.json`), `stop` (`{ force }`) and `restart`
+(`{ delay, force }`); a peer you do not list in `acceptsCommandsFrom` cannot send you any of them.
+
+## Who can I talk to
+
+- **`agent.agmen()`** — the only honest answer: peers that survived the callability rules (namespaces,
+  posture, `disabled`, `accepts_from`, status, health), each with its `spec`, `status`, `health`, the
+  capabilities it lets you use, and whether it accepts your commands. `request()` refuses anything outside
+  this view. `agent.refresh()` runs a scan now; a `nuntium/` event schedules one (debounced) anyway.
+- **`scan(root)`** — the read-only picture of a root for diagnostics and dashboards, with no agent started:
+  every valid agent folder, duplicate ids, and the ignored files with a reason each. A folder without both
+  `spec.json` and `status.json` is skipped silently, so it appears in neither list.
+- **`health(status, nowMs)`** — rates a status at a moment: `healthy | online | degraded | zombie`
+  (undefined for `inactive` and `error`).
+- **`agent.on("event", handler)`** — every protocol event on both sides: `status`, `announce`, `inreq`,
+  `outreq`, `ignored`, `log`.
+
+## The log (diarium)
+
+Every agent appends to its own `diarium.jsonl`: requests received, requests sent, status changes, ignored
+files, `log` lines. `await agent.diarium()` (or `readDiarium(folder)` for any agent folder) returns
+`{ lines, ignored }` — the valid lines in file order, and the ignored ones (1-based) with a reason each. A
+missing file yields an empty result; a last line without a trailing newline is skipped, not reported (an
+append may be in progress). `event_data` arrives as `unknown`, and the event name says what to cast it to:
+`Exchange` after `inreq`/`outreq`, `StatusState` after `status`, `string` after `log`.
+`await agent.log("…")` appends your own `log` line.
+
+## The directory an agent maintains
 
 ```
-<root>/.actio                 (config.root; default ~/.actio, $ACTIO_DIR)
-  actio.json                  optional team metadata (read-only for agents)
-  nuntium/<agent_id>.n.json   announce signals (any create/update triggers a full scan)
-  nuntium/nuntium.json        broadcast signal (special tools only — the CLI writes it)
-  forum/                      attachments (paths relative to forum)
+<root>/                     (config.root; default ~/.actio, or $ACTIO_DIR)
+  actio.json                optional team metadata, read-only for agents
+  nuntium/<agent_id>.n.json announce signals (any write triggers a scan)
+  nuntium/nuntium.json      broadcast signal, written by special tools only
+  forum/                    attachments, addressed by paths relative to it
   <agent_id>/
-    spec.json                 published capabilities (schema-validated)
-    status.json               inactive|idle|busy|error + capability_status
-    diarium.jsonl             the protocol log (append-only, schema-validated lines)
-    inbox/<rid>…              the four envelope files of each exchange
+    spec.json               published capabilities (schema-validated)
+    status.json             inactive | idle | busy | error + per-capability state
+    diarium.jsonl           the protocol log (append-only, schema-validated lines)
+    inbox/<rid>…            the four envelope files of each exchange
 ```
 
-Agents discover each other by scanning the root on every `nuntium` event (debounced) and apply the callability rules (namespaces, posture, disabled, `accepts_from`, capability `accepts_from`, status, health) to build the *Agmen* view — `agent.agmen()`.
+Agents find each other by scanning the root whenever `nuntium/` changes, and apply the callability rules to
+that view.
 
-## Configuration (`ActioConfig`)
+## Configuration (`config`)
 
-All timers come from one `ActioConfig` (durations in **milliseconds** internally; the env overrides are in **seconds**, per the protocol's *Timers and thresholds*):
+All timers are per-agent, in **milliseconds** (the `ACTIO_*` env overrides are in **seconds**, per the
+protocol's *Timers and thresholds*):
 
 | Key | Default | Env override | Notes |
 | --- | --- | --- | --- |
-| `root` | `~/.actio` | `ACTIO_DIR` | the shared `.actio` root |
-| `sync` | `none` | `ACTIO_SYNC` | the storage-sync provider (below) |
-| `heartbeatInterval` | 30 000 ms | `ACTIO_HEARTBEAT` (s) | status rewritten ≥ every 90 s (rule 3) |
-| `confirmTimeout` | 120 000 ms | `ACTIO_CONFIRM_TIMEOUT` (s) | the receiver archives on silence |
-| `cancelWaitTimeout` | 60 000 ms | `ACTIO_CANCEL_WAIT` (s) | after a cancellation, wait for the response, then abandon |
-| `announceDelay` | 100 ms | — | the rule-2 delay between the status write and the announce |
-| `nuntiumDebounce` | 1 000 ms | — | nuntium events coalesce into one scan |
-| `stopGrace` | 30 000 ms | — | `force=false`: in-flight work finishes first |
-| `clock` | `Date.now` | — | injectable for tests |
+| `root` | `~/.actio` | `ACTIO_DIR` | the shared root |
+| `sync` | `none` | `ACTIO_SYNC` | [storage sync](#storage-sync) |
+| `heartbeatInterval` | 30 000 | `ACTIO_HEARTBEAT` | how often `status.json` is republished (the protocol requires at least every 90 s) |
+| `confirmTimeout` | 120 000 | `ACTIO_CONFIRM_TIMEOUT` | the receiver archives a response on confirmation silence |
+| `cancelWaitTimeout` | 60 000 | `ACTIO_CANCEL_WAIT` | after cancelling: wait for the response, then abandon |
+| `announceDelay` | 100 | — | between the status write and the announce |
+| `nuntiumDebounce` | 1 000 | — | `nuntium` events coalesce into one scan |
+| `stopGrace` | 30 000 | — | `stop()` lets in-flight work finish first |
+| `clock` | `Date.now` | — | injectable, for tests |
 
-A bad env value throws at `start()` — never at construction (D-21).
+A bad value throws at `start()`, never at construction — so a misconfigured agent fails loudly instead of
+registering half a team.
 
-## Sync providers (`ACTIO_SYNC`)
+Other `ActioAgent` options: `namespaces` — the namespaces this agent **belongs to**: a peer can reach you
+only if you share one, so absent, `null` and `[]` all mean the void namespace, `null` listed explicitly adds
+it to a filled list, and `["*"]` is every namespace. Then `depends`, `wants`, and `info` (free metadata in
+`spec.json`). Per capability, `actio.disabled` and `actio.accepts_from` narrow who may use it.
 
-The protocol's "signal the storage layer" primitive — pick with `ACTIO_SYNC`:
+## Storage sync
+
+The protocol asks an agent to "signal the storage layer" after a write. Pick with `ACTIO_SYNC` (or
+`config.sync`):
 
 | Value | Behavior | Use when |
 | --- | --- | --- |
-| `none` (default) | no hooks | local file systems with kernel notifications |
-| `delay[:<ms>]` (default 50) | a short pause after every write | the watchers need the events to land before the next step |
-| `fsync+delay[:<ms>]` | fsync the file (and the parent folder) before returning | storages where data or renames may not be visible to other readers yet |
-| `mutagen:<session>` | a debounced (200 ms) `mutagen sync flush <session>` via `execFile` | replicated setups (e.g. Docker ↔ host); the binary is `ACTIO_MUTAGEN_BIN` (default `mutagen`) |
+| `none` (default) | no hooks | a local file system with kernel change notifications |
+| `delay[:<ms>]` (default 50) | a short pause after each write | watchers need events to land before the next step |
+| `fsync+delay[:<ms>]` | fsync the file, and its folder after the rename | storage where data or renames may not be visible to other readers yet |
+| `mutagen:<session>` | a debounced `mutagen sync flush <session>` | replicated setups, e.g. Docker ↔ host (`ACTIO_MUTAGEN_BIN` sets the binary) |
 
-`<ms>` is an integer in 1–10 000. An unknown value is a configuration error at `start()`. **One provider per process** (I-10): all agents of a team share one `.actio` root and therefore one storage behavior; the last-started agent installs it.
+`<ms>` is 1–10 000. **One provider per process**: every agent in a process shares one `.actio` root and
+therefore one storage behavior.
 
-**Requirement:** the storage must deliver local change notifications (local disks, or a sync tool that writes locally). No polling fallback exists (`watch.ts` is event-driven only). Network file systems without notifications are unsupported.
+## Stopping
 
-## The CLI (`npm run actio -- …` or `npx tsx src/cli.ts`)
+`stop()` is graceful: in-flight work gets `stopGrace` to finish (handlers may still issue calls), then the
+remaining inbound exchanges are answered with code 300 and archived, outbound ones are abandoned, and the
+agent publishes `inactive` and announces. `stop({ force: true })` skips only the grace wait, not the order.
+`fail(message)` is terminal (`error` + announce). A stopped agent keeps its `diarium.jsonl` readable.
 
-```
-actio [--json] ls                                  agents, status, health, capabilities
-actio diarium <agent> [-n N]                       the last N diarium lines
-actio call <src-id> <dst> <cap> <json-params> [--timeout s (default 60)]
-                                                   a one-shot requestor (lane B vehicle)
-actio cmd <src-id> <dst> <name> [json-params]      a one-shot command (prints the rid)
-actio broadcast "<text>"                           writes nuntium/nuntium.json (a special tool)
-actio validate <file> [--as spec|status|announce|request|cancellation|response|confirmation|diarium|actio]
-                                                   schema-validate a file (diarium: every line)
-```
+## Not in this version
 
-`--timeout` must be **> 0** seconds (default 60; `0`/negative/non-numeric is a usage error) — a CLI process has no heartbeat, so it never sends `timeout: 0`. `call` exits 1 only when no response arrived (`abandoned`); an error answer from the peer is an answer and exits 0. `cmd` reports only the rid: a peer-side `dropped` is the peer's decision and is not reported back. Exit codes: 0 ok, 1 usage/IO/validation failure.
+- **No security at all**, by profile: no keys, no signing, no `issuer_sign`, no codes 200–299. An encrypted
+  (base64) body received is ignored and logged, never answered.
+- Code **104** (`version_not_supported`) is not implemented; **105–108** are.
+- **No queueing**: at `max_parallel` a request is rejected (107), not held.
+- **No CLI binary**: the package exports the library only.
 
-## API notes
+## Conformance, testing, license
 
-- `scan(root)` is the read-only picture of the root (every valid agent folder, the duplicate ids, the ignored files with a reason) for diagnostics and dashboards; it needs no started agent. A folder without both `spec.json` and `status.json` is skipped silently (discovery rule 2), so it is in neither `agents` nor `ignored`. Only `agmen()` says who is callable, and `request()` still refuses a peer outside the view. The agent's private `discovered` map stays private: it holds specs only, and exists for code 106. `health(status, nowMs)` rates a status at a moment (healthy|online|degraded|zombie; undefined for inactive/error).
-- `readDiarium(folder)` reads `<folder>/diarium.jsonl` into `{ lines, ignored }`: the valid lines in file order, and the ignored lines (1-based) with a reason each ("not valid JSON" or the first Ajv error). A missing file gives the empty result; a last line without a trailing newline is skipped and not reported (an append may be in progress). The schema checks `event_data` for each of the five protocol events, so every line returned has passed that check; the value arrives as `unknown`, and the event names say what to cast it to: `Exchange` after `inreq`/`outreq`, `StatusState` after `status`, `string` after `log`. An event name of an agent's own is not checked. `agent.diarium()` is `readDiarium` on the agent's own folder; both reject before the first `start()`, and both work after `stop()`.
-- `agent.log(message)` appends a `log` event to the agent's own diarium (validated; the sync provider applies it). It emits no `ActioEvent`; there is no API to append any other event name — the mandatory events belong to the library.
-- The protocol types (`Spec`, `Status`, `Rid`, `Header`, `RequestBody`, `ResponseBody`, `ErrorResult`, `DiariumLine`, `Exchange`, …) are all exported from the entry, so a consumer never needs a deep import.
-- `agent.refresh()` runs a full discovery scan now (the same `rescan()` a nuntium event schedules) and returns the new Agmen view; a stopped agent returns its current view without scanning.
-- `checkParams(capability, params)` → the first Ajv error of the capability's `parameters` schema against `params`, as `"<instancePath or (root)> <message>"`; `undefined` when valid, or when the schema does not compile (D-19: the checks are skipped and the peer decides).
-- `agent.request(dst, name, params, options?)` → `{ finalStatus, response? }`; rejects with `ActioCallError` (nothing written) when the callability rules fail, and with `ActioResultError` when a non-error result breaks the peer's published `result` schema (D-12).
-- `agent.on("event", handler)` receives **every protocol event** on both lanes: `status`, `announce`, `inreq`, `outreq`, `ignored` (D-15/D-14), `log`.
-- `agent.capability(cap, handler)` deep-copies the registration (a later mutation of the caller's object changes nothing) and compiles the schemas eagerly (D-19: a non-strict schema throws at registration).
-- `agent.stop({ force })` follows D-9: graceful (default) lets in-flight work finish within `stopGrace` (handlers may still issue requests), then aborts + 300 + archives; `force=true` aborts at once. A stopped agent is `inactive` and announces (C1). `fail(msg)` is terminal (`error` + announce; no recovery).
-- A `restart` command archives the command, runs `stop` (honouring `force`), waits `delay`, then starts fresh in-process (the registrations survive; a `disabled` set by `enable` does not).
-
-## Implementation choices
-
-Where the protocol leaves room, the implementation decided — each choice is observable in behavior:
-
-| Id | Choice |
-| --- | --- |
-| D-1 | the agent folder name is always the agent ID |
-| D-2 | file names: the recommended names; **reads match by `rid` + body key, never by file name**; only `*.json` in an inbox |
-| D-3 | duplicate agent IDs: the first folder in lexical order wins; the rest are logged and ignored |
-| D-4 | pending envelopes at startup are processed as if they had just arrived (requests → A0 incl. 108; commands → D0; bare responses re-tracked with the confirmation timer restarted) |
-| D-5 | duplicate rids are ignored (an in-memory archived set per run) |
-| D-6 | requestor timeout: `> 0` → cancel at expiry, wait up to `cancelWaitTimeout` for the response, then abandon; `0` → wait forever (or until `signal`) |
-| D-7 | optional A0 checks implemented: 105 (parameters), 106 (namespaces — against the requestor's spec as **discovered** by the last scan, before the callability filter; an unknown requestor skips 106), 107 (reject, no queue), 108 (expired); **104 not implemented** |
-| D-8 | busy iff ≥ 1 inbound exchange (A1/A2/A3) or ≥ 1 outbound in B2; written immediately on change; the heartbeat republishes with a fresh `datetime`; the diarium `status` event only on change; the announce file only on active↔non-active changes, `enable`, `ping`, steps 3/C1 |
-| D-9 | stop order: heartbeat/scan off → grace (handlers may still issue requests) → `receiver.stop()` (abort + 300 + archive) → `requestor.stop()` (abandon) → C1 → C2; a stop during `start()` leaves nothing armed |
-| D-10 | restart: archive → stop (honouring `force`) → wait `delay` → start fresh in-process; a `disabled` set by `enable` does not survive |
-| D-11 | a `.can/.res/.con` envelope whose header differs from the tracked request (except `datetime`) is ignored and logged; the same check applies to the responses the requestor captures |
-| D-12 | a non-error result that breaks the peer's `result` schema ends the exchange as `ActioResultError` (the exchange itself is already confirmed on both sides); cancellation responses (`result: null`) are exempt |
-| D-13 | before writing the confirmation, the requestor checks its request file still exists; if not: `outreq` with the final status, no confirmation |
-| D-14 | encrypted (base64) bodies received by a core agent: ignored + logged, never answered (the requestor treats a captured base64 response as received-and-confirmed with `response: undefined`) |
-| D-15 | malformed files: ignored, `log` diarium event `ignored <path>: <first ajv error>` once per (path, mtime) |
-| D-16 | no housekeeping beyond the protocol (no stale-file cleanup, no diarium rotation) |
-| D-17 | any create/update in `nuntium/` schedules one debounced full scan |
-| D-18 | one watcher per destination inbox, reference-counted by outstanding rids; released exactly once per exchange |
-| D-19 | capability schemas are data: compiled at runtime (own registrations eagerly — a non-strict schema throws; peers lazily, cached per (id, spec datetime, capability), a failure logged once and the checks skipped) |
-| D-20 | `src/generated/` is git-ignored, rebuilt by `npm run gen` before every build/test |
-| D-21 | a bad `ACTIO_SYNC`/env value is a configuration error at `start()` — never at construction |
-| D-22 | a watch error on the own inbox or `nuntium` is fatal: `log` (`watch lost <dir>: <code>`) + `fail()`; a destination watch error abandons the requestor's exchanges there (the agent stays up) |
-
-Implementation rules: **I-1** the mutagen `onError` hook; **I-2** every written file is self-validated before writing; **I-3** `CapabilityEntry.compiled` (D-19 registration) and `ReceiverHooks.peerSpec` (I-11); **I-4** D-12 validated in `agent.request()`; **I-5** `announce()` takes two folders; **I-6** exactly 100 s → `degraded`; **I-7** a captured base64 (encrypted) response body is treated as received: the exchange is confirmed and `request()` resolves `confirmed` with `response: undefined`; **I-8** no `dst` check at A0/D0 (the inbox is the address); **I-9** `namespaces` admits `null` items; **I-10** one sync provider per process; **I-11** the `peerSpec` hook. Deferred: a shared protocol-version constant (the version string is written where it is needed).
-
-## Limitations (core profile)
-
-- **No security**: `security_support: []`, posture `trusted`, `signature: null`. Encrypted (base64) bodies received are ignored and logged, never answered (D-14). Codes 200–299 and the `issuer_sign` posture are out of scope. 104 (`version_not_supported`) is not implemented.
-- **No queueing**: at `max_parallel` a request is rejected with 107, not queued.
-- **Custom command handlers must not hang**: commands cannot be cancelled; a hung handler stalls lane D only.
-- **One sync provider per process** (I-10).
-- **The storage must deliver local change notifications**: local disks, or a sync tool writing locally (mutagen). No polling fallback.
-- **A stopped agent's last status**: during lane C an inbound exchange is archived without waiting for the client's confirmation — its final status is `completed` or `confirmed` depending on whether the confirmation had arrived when `receiver.stop()` ran.
-- **Hand-written envelopes** (test/debug tooling) only need to match the schema shapes; the rids need not be decodable ULIDs (nothing decodes them).
-
-## Regenerating the schemas
-
-`npm run gen` re-embeds `../doc/schemas/*.schema.json` into `src/generated/schemas.ts` (unmodified, keyed by `$id`, with a SHA-256 header) and regenerates `src/generated/types.ts` via json-schema-to-typescript with fixed interface names. The generator compiles every schema with Ajv `strict: true` first — a schema that fails strict mode fails the build. The output is deterministic (byte-identical across runs); `src/generated/` is never hand-edited, and `npm run gen:check` exits non-zero if the committed files drift from `doc/schemas/` (it is also how `pack-smoke` proves the *published* schemas are the current ones).
-
-## Packaging & publishing
-
-`npm run check:publish` is the whole gate, in order: `gen:check` → typecheck → 330 tests → the black-box run
-→ build → tarball smoke. It must be green, from this monorepo layout, under `orchestra/env.sh` (real Node —
-the Bun shim cannot run the suite). `package.json` `files` is an allowlist (`dist`, `src`, README,
-CONFORMANCE, CHANGELOG, LICENSE): with no allowlist npm publishes *anything not gitignored*, including the
-whole test tree and its protocol vectors.
-
-Publishing is a **tag, not a command**: push `actio-ts/v<version>` and
-`.github/workflows/publish-actio-ts.yml` runs that gate on Node 22 **and** 24, then publishes with
-provenance (needs the `NPM_TOKEN` secret and a public repository). A repo-wide `v*` tag publishes nothing —
-this is a monorepo, so releases are namespaced per package, the same namespace that carries `protocol/v0.1`
-for the schemas. `prepublishOnly` re-runs the gate for any local publish too.
-
-```sh
-# cut a release: bump "version", add a CHANGELOG entry, then
- git tag -a actio-ts/v0.1.0 -m "actio-ts 0.1.0" && git push origin actio-ts/v0.1.0
-```
-
-## License
-
-BSD 3-Clause — see `LICENSE`. It covers the code **and** the protocol schemas embedded verbatim in
-`src/generated/schemas.ts`, which are part of the published artifact. Two gaps worth knowing for a
-protocol rather than a library: BSD-3-Clause has **no explicit patent grant**, and its third clause only
-bars others from using the copyright holder's name to *endorse* derivatives — it reserves nothing about the
-name **Actio** itself. If the protocol name matters, that has to be handled separately (trademark, and a
-specification license for the schema data with an attribution statement).
+- [`CONFORMANCE.md`](CONFORMANCE.md): every MUST row of the protocol, with the code and the test.
+- [`CHANGELOG.md`](CHANGELOG.md): what each release changed, and the schema digests of the protocol
+  revision it implements.
+- [`internals.md`](internals.md): how the package works, the decisions behind it, and how to run the tests.
+- **License**: BSD 3-Clause — see `LICENSE`. It covers the code **and** the schemas embedded verbatim in it,
+  which are part of the published artifact. Two gaps worth knowing for a protocol rather than a library:
+  BSD-3-Clause has **no explicit patent grant**, and its third clause reserves nothing about the name
+  **Actio** itself.

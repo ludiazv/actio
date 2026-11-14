@@ -27,6 +27,7 @@
     "dist",
     "src",
     "README.md",
+    "internals.md",
     "CONFORMANCE.md",
     "CHANGELOG.md",
     "LICENSE"
