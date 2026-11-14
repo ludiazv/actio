@@ -1,6 +1,6 @@
 # actio-ts
 
-A TypeScript client for the [Actio protocol](https://github.com/ludiazv/actio/blob/main/doc/actio_protocol.md)
+A TypeScript client for the [Actio protocol](https://github.com/ludiazv/actio/blob/master/doc/actio_protocol.md)
 v0.1, **core conformance profile**. Actio is file-based agent coordination: a team of agents shares one
 `.actio` directory, each agent publishes what it can do (`spec.json`) and how it is doing (`status.json`),
 and agents exchange JSON envelopes through each other's `inbox/`. There is no broker, no socket and no
@@ -82,9 +82,9 @@ await echo.stop();
 ```
 
 Two runnable examples are in the repository:
-[`examples/echo-agent.ts`](https://github.com/ludiazv/actio/blob/main/actio-ts/examples/echo-agent.ts) (a
+[`examples/echo-agent.ts`](https://github.com/ludiazv/actio/blob/master/actio-ts/examples/echo-agent.ts) (a
 standalone agent process, the conformance target) and
-[`examples/planner.ts`](https://github.com/ludiazv/actio/blob/main/actio-ts/examples/planner.ts) (a minimal
+[`examples/planner.ts`](https://github.com/ludiazv/actio/blob/master/actio-ts/examples/planner.ts) (a minimal
 caller).
 
 ## Publishing a capability

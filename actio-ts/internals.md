@@ -342,6 +342,10 @@ prints what it resolved. On CI the Node version comes from the workflow instead.
 - **After the first publish**, `pi-actio` switches from its `"actio-ts": "file:../actio-ts"` link to the
   published version — pinned exactly while 0.x — and its `npm run check` and `npm run smoke` re-run against
   the registry artifact rather than the workspace symlink.
+- **The default branch is `master`** (the GitHub repository was created defaulting to `main`: push `master`
+  first, then set the default there — the API requires the branch to exist). Four strings name the branch:
+  `homepage` in `package.json` and the three `blob/master/...` links in the README. Change them together, or
+  use `/blob/HEAD/...`, which follows whatever the default branch turns out to be.
 
 ## 15. The CLI
 
