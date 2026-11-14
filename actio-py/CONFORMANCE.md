@@ -62,7 +62,7 @@ Row by row: what the protocol requires, where this tree implements it, and the t
 | 3.7 | Harness hints have no protocol effect (doc L211). | `src/actio/_spec_builder.py::build_spec` (the `info` mapping is carried through untouched) | unit:tests/test_spec_builder.py::ShapeTest.test_the_optional_fields_are_present_when_set |
 | 3.8 | `info` is not schema-enforced (doc L212). | `src/actio/_spec_builder.py::build_spec` (any JSON value goes into `info`) | unit:tests/test_spec_builder.py::ShapeTest.test_the_optional_fields_are_present_when_set |
 | 3.9 | `accepts_commands_from` is mandatory; an empty array means nobody may send commands (doc L312). | `src/actio/_spec_builder.py::build_spec` (the array is always written); `src/actio/_discovery.py::agent_view` (rule 5.1 reads it) | unit:tests/test_discovery.py::AgentViewTest.test_rule_5_1_the_command_filter; unit:tests/test_protocol_drift.py::DriftTest.test_every_object_shape_is_pinned |
-| 3.10 | `security_support` and `security_posture` are mandatory keys of a conforming spec (doc L315–316). | the schema in `src/actio/schemas/common.schema.json`, pinned verbatim (D-5); `src/actio/_validate.py::validate` enforces it | unit:tests/test_schemas_pin.py::ByteIdenticalCopyTest.test_every_byte_matches; unit:tests/test_protocol_drift.py::DriftTest.test_every_object_shape_is_pinned |
+| 3.10 | `security_support` and `security_posture` are mandatory keys of a conforming spec (doc L315–316). | the schema in `src/actio/schemas/common.schema.json`, pinned verbatim (D-20); `src/actio/_validate.py::validate` enforces it | unit:tests/test_schemas_pin.py::ByteIdenticalCopyTest.test_every_byte_matches; unit:tests/test_protocol_drift.py::DriftTest.test_every_object_shape_is_pinned |
 
 ## 4. Callability
 
