@@ -30,6 +30,7 @@ from actio import ActioAgent, Capability, CapabilityHandler, CommandHandler, Log
 from actio._config import ActioConfig
 from actio._protocol import DiariumEntry
 from actio._receiver import HANDLER_CANCEL_WAIT
+from actio._watch import AUDIT_SECONDS
 from actio._types import AgentView, RequestOutcome
 from actio._util import format_iso
 from helpers import ActioTestCase, actio_tree
@@ -2216,6 +2217,64 @@ class TwoAgentTest(AgentTest):
                 await asyncio.gather(call, return_exceptions=True)
 
     # --- D-18: the exchange is one task, whoever cancels the caller --------------------------------
+
+    async def test_a_giving_up_caller_wakes_its_exchange_and_the_peer_stops_at_once(
+        self,
+    ) -> None:
+        """A caller that gives up with `timeout=0` (no `cancel` event, nothing arriving in the peer's
+        inbox for its exchange) still ends the exchange at once: the give-up wakes the exchange's own
+        watch, `B4` is written immediately, and `beta`'s handler is interrupted within a second — not
+        at the watcher's 5 s audit tick (*Issue a request*, `../doc/actio_protocol.md:859`: "timeout /
+        give up → `B4`"). Measured without the wake: `.can.json` lands at 5.04-5.05 s in 3/3 runs, and
+        `beta`'s handler keeps running five seconds after its caller left."""
+        async with self.tree() as root:
+            stopped = asyncio.Event()
+            when: dict[str, float] = {}
+
+            async def sleepy(params: Any, ctx: Any) -> dict[str, Any]:
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    when["stopped"] = asyncio.get_running_loop().time()
+                    stopped.set()
+                    raise
+                return {"text": "slept"}
+
+            alpha, _ = await self.boot(root, confirm_timeout=0.2, cancel_wait_timeout=10.0)
+            beta, _ = self.build_peer(root, caps={"sleepy": sleepy}, confirm_timeout=0.2)
+            await beta.start()
+            await self._see(alpha, "sleepy")
+            call = asyncio.ensure_future(alpha.request(PEER, "sleepy", {"text": "x"}, timeout=0))
+            # The request is in `beta`'s inbox and its handler is inside its `await`.
+            await wait_for(
+                "the request in beta's inbox",
+                lambda: any(p.name.endswith(".json") for p in inbox_dir(root, PEER).iterdir()),
+                timeout=WATCH_SETTLE,
+            )
+            gone_up = asyncio.get_running_loop().time()
+            call.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await call
+            # The peer's work stops: the only thing that can stop it is the cancellation file.
+            await wait_for(
+                "beta's handler to be interrupted",
+                stopped.is_set,
+                timeout=AUDIT_SECONDS + 2.0,
+            )
+            self.assertLess(
+                when["stopped"] - gone_up,
+                1.0,
+                "the give-up woke the exchange: the cancellation is written at once, not at the audit",
+            )
+            await wait_for(
+                "beta's inreq line to end cancelled",
+                lambda: any(
+                    line["event"] == "inreq"
+                    and cast(dict[str, Any], line["event_data"])["final_status"] == "cancelled"
+                    for line in lines(root, PEER)
+                ),
+                timeout=WATCH_SETTLE,
+            )
 
     async def test_a_caller_cancelled_inside_the_request_s_write_still_ends_the_exchange(
         self,

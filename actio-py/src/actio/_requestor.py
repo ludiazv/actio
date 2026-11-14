@@ -58,6 +58,7 @@ class _Outbound:
     # A caller that went away: the exchange task ends the exchange anyway (semantics 1), and B4 is its way
     # of saying so to the peer.
     give_up: bool = False
+    sub: FolderWatch | None = None  # the exchange's own watch, so a give-up can wake the exchange
     cancel_deadline: float | None = None
     done: bool = False
     outcome: RequestOutcome | None = None
@@ -124,6 +125,8 @@ class Requestor:
             # peer to stop, and the `outreq` line lands when it settles — with the same subscription it has
             # held since before the request was written (D-18).
             ex.give_up = True
+            if ex.sub is not None:
+                ex.sub.changed.set()  # wake the exchange: B4 now, not at the next folder event
             raise
 
     async def _exchange(
@@ -140,7 +143,7 @@ class Requestor:
         # The table knows the exchange before its first write, so `stop()` can reach one whose B1 is still
         # in flight (D-9's step 4 reaches everything owed).
         self._exchanges[ex.rid] = ex
-        sub = self._watch.subscribe(ex.inbox)  # D-18: before the write
+        sub = ex.sub = self._watch.subscribe(ex.inbox)  # D-18: before the write
         try:
             ex.req = await self._begin_outbound(ex, ex.name, params, timeout, attachment_paths)
             self._hooks.on_state_change()
