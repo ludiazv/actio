@@ -1,24 +1,54 @@
 {
   "name": "pi-actio",
   "version": "0.1.0",
-  "private": true,
-  "type": "module",
   "description": "pi extension: makes a pi coding agent a member of an Actio team (actio tool, /actio Explorer, prompt service)",
+  "license": "BSD-3-Clause",
+  "private": false,
+  "type": "module",
   "engines": {
     "node": ">=22"
   },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "actio",
+    "multi-agent"
+  ],
   "pi": {
     "extensions": [
       "./src/index.ts"
     ]
   },
+  "files": [
+    "src",
+    "README.md",
+    "internals.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ludiazv/actio.git",
+    "directory": "pi-actio"
+  },
+  "bugs": {
+    "url": "https://github.com/ludiazv/actio/issues"
+  },
+  "homepage": "https://github.com/ludiazv/actio/tree/master/pi-actio#readme",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "check": "tsc --noEmit && node --import tsx --test \"test/*.test.ts\"",
-    "smoke": "node --import tsx test/smoke.ts"
+    "smoke": "node --import tsx test/smoke.ts",
+    "check:publish": "npm run check && node scripts/pack-smoke.mjs",
+    "prepublishOnly": "npm run check:publish"
   },
   "dependencies": {
-    "actio-ts": "file:../actio-ts"
+    "actio-ts": "0.1.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

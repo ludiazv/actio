@@ -1,0 +1,129 @@
+# Publish `pi-actio` to npmjs, driven by a per-package tag. The shape is publish-actio-ts.yml; what differs
+# is in the comments.
+#
+# Monorepo, so releases are named per package: only pushing `pi-actio/v<version>` publishes anything — never a
+# repo-wide `v*`. The publishing job re-runs the whole gate on the exact checkout of the tag before uploading,
+# and refuses if the tag does not match package.json.
+#
+# GitHub reads the workflow from the ref that triggered the run, so the tag must point at a commit that already
+# contains THIS file. An older tag parses an older workflow: that is how the first `actio-ts/v0.1.0` push
+# produced no run at all (the tag still pointed at a commit whose workflow GitHub rejected).
+#
+# Credentials — npm removes direct publishing with bypass-2FA tokens in January 2027, so both paths exist and
+# the migration is "delete the secret":
+#
+#   * Trusted publishing (the target): no secret at all. npmjs.com → pi-actio → Publishing from CI/CD → Add
+#     trusted publisher → GitHub Actions: user `ludiazv`, repository `actio`, workflow filename
+#     **`publish-pi-actio.yml`** — that filename is a permanent commitment, the configuration cannot be edited,
+#     and a fresh configuration expires unless a first publish succeeds within 2 days. Tick **`npm publish`**
+#     under Allowed actions (a configuration created after 2026-09-03 allows only `npm stage publish` until you
+#     say otherwise). `id-token: write` below is what makes the OIDC exchange work.
+#   * A granular token (the first release only, since a trusted publisher can only be configured for a package
+#     that already exists): the repo secret NPM_TOKEN, "Read and write (publish and stage)", bypass-2FA ticked,
+#     no IP ranges, All Packages — `pi-actio` cannot be selected by name while it does not exist yet. If the
+#     token used for actio-ts is still live, it already covers this package.
+#
+# Public repository, GitHub-hosted runners only, npm >= 11.5.1 and Node >= 22.14 for trusted publishing.
+# `orchestra/env.sh` is not used: it exists to dodge the Bun shims on the build box, and CI gets Node from
+# actions/setup-node.
+name: publish pi-actio
+
+on:
+  push:
+    tags:
+      - "pi-actio/v*"
+
+permissions:
+  contents: read
+  id-token: write # OIDC for npm trusted publishing (and provenance on the token path)
+
+jobs:
+  # The gate on both the floor of engines.node and the version the build box uses. For this package the gate is
+  # typecheck + the 35 tests + pack-smoke; there is no `gen:check` (no generated code here) and no build (pi
+  # loads src/*.ts through jiti). `npm run smoke` is NOT part of it: it spawns the `pi` binary, which exists on
+  # a development box and not on a runner. pack-smoke runs it when a pi binary is present and prints "skip"
+  # otherwise, so one command is honest in both places.
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22.x", "24.x"]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pi-actio
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: pi-actio/package-lock.json
+      - run: npm ci
+      - run: npm run check:publish
+
+  publish:
+    needs: gate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pi-actio
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+          cache-dependency-path: pi-actio/package-lock.json
+
+      - name: the tag must name this package's version
+        run: |
+          pkg=$(node -p "require('./package.json').name")
+          ver=$(node -p "require('./package.json').version")
+          if [ "$GITHUB_REF" != "refs/tags/$pkg/v$ver" ]; then
+            echo "refusing to publish: $GITHUB_REF is not $pkg/v$ver"
+            exit 1
+          fi
+
+      - run: npm ci
+      - name: the gate again, on the publishing checkout
+        run: npm run check:publish
+
+      # Which credential exists decides which publish step below runs. A step-level `if:` cannot mention the
+      # `secrets` context at all — GitHub rejects the whole file with "Unrecognized named-value: 'secrets'" — so
+      # the comparison lives in this step's `env:` (where secrets are allowed) and the answer travels as a step
+      # output. The shell only ever sees "true" or "false", never the token.
+      - name: which credential is available
+        id: credential
+        env:
+          HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+        run: |
+          if [ "$HAS_NPM_TOKEN" = "true" ]; then mode=token; else mode=oidc; fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "publish step will use: $mode"
+
+      # Unscoped is not the same as declared public: provenance refuses a package the registry has never seen
+      # unless the access is declared ("Can't generate provenance for new or private package, you must set
+      # `access` to public"), and package.json carries that as publishConfig.access, which pack-smoke checks.
+      # --ignore-scripts so prepublishOnly does not run the gate a third time. Provenance is automatic under
+      # trusted publishing and explicit on the token path.
+      - name: publish with trusted publishing (no secret; provenance automatic)
+        if: steps.credential.outputs.mode == 'oidc'
+        run: npm publish --ignore-scripts
+
+      - name: publish with a granular token (first release only; ends January 2027)
+        if: steps.credential.outputs.mode == 'token'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --ignore-scripts
+
+      - name: the registry serves it
+        run: |
+          ver=$(node -p "require('./package.json').version")
+          for i in $(seq 1 12); do
+            if npm view "pi-actio@$ver" version; then exit 0; fi
+            sleep 15
+          done
+          echo "pi-actio@$ver is not visible on the registry"
+          exit 1

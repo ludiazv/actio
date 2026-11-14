@@ -196,7 +196,8 @@ package explains itself.
 ## 10. Tests and development
 
 `npm run check` is `tsc --noEmit` plus `node --import tsx --test "test/*.test.ts"`: **35 tests** — 9 config,
-13 format, 9 prompt, 4 Explorer. There is no `npm test` script. `npm run smoke` (`test/smoke.ts`) drives the extension against a real
+13 format, 9 prompt, 4 Explorer. `npm run check:publish` adds `scripts/pack-smoke.mjs` (§11); that is what the
+release workflow runs. There is no `npm test` script. `npm run smoke` (`test/smoke.ts`) drives the extension against a real
 `ActioAgent` in a temporary actio root: register, discover, call, prompt.
 
 - **The runner matters.** `node` on PATH here is a Bun shim, and Bun does not hand Node's quoted
@@ -222,9 +223,11 @@ package explains itself.
   directory.
 - **`keywords: ["pi-package", …]`** is what makes the package eligible for the
   [Pi package gallery](https://pi.dev/packages). Every published Pi package carries it.
-- **`CHANGELOG.md`** at the package root is what Pi shows under *"Extension Updates"* after an update, with
-  headings like `## [0.1.0]` matched against `version`. `pi.changelogPath` points elsewhere; `""` disables it.
-  Optional `pi.image` / `pi.video` add gallery previews.
+- **`CHANGELOG.md`** at the package root is what Pi shows under *"Extension Updates"* after an update,
+  matched against `version`. Pi's parser is `utils/changelog.js`:
+  `/##\s+\[?(\d+)\.(\d+)\.(\d+)\]?/` — so `## [0.1.0]` and `## 0.1.0 — 2026-11-14` both work (anything after
+  the version number is ignored), and a heading without a full `x.y.z` closes no entry. `pi.changelogPath`
+  points elsewhere; `""` disables it. Optional `pi.image` / `pi.video` add gallery previews.
 - **A `files` allowlist is mandatory here.** Without `files`, npm falls back to `.gitignore`, and this
   directory's ignore list (`orchestra/`, `node_modules/`, `spec.md`) does **not** cover the two compaction
   notes sitting here: `compaction-extension.md` and `compaction-proposal.md` would ship to npm as package
@@ -234,9 +237,17 @@ package explains itself.
 - **`publishConfig.access: "public"`** belongs in the manifest, not in a CI flag: provenance refuses a package
   the registry has never seen otherwise (*"Can't generate provenance for new or private package, you must
   set `access` to public"* — learned the hard way with `actio-ts@0.1.0`).
-- **The `actio-ts` pin must become an exact registry version** (`"0.1.0"`, not `^` while 0.x). To develop
-  against the monorepo copy afterwards, re-create the link by hand:
-  `rm -rf node_modules/actio-ts && ln -s ../../actio-ts node_modules/actio-ts`.
+- **The `actio-ts` dependency is an exact registry pin**, `"0.1.0"` — no caret, because a wire-format library
+  must not move underneath a project while it is 0.x. `pi-actio` therefore tests against the **published**
+  `actio-ts`, which is the point: the artifact users get is the one under test.
+- **A pin change does not rewrite the lockfile on its own.** With only the manifest edited, `npm install` kept
+  the old entry — `"node_modules/actio-ts": { "resolved": "../actio-ts", "link": true }` — so the tree still
+  pointed at the sibling directory and CI would have linked it too. Deleting `node_modules` and
+  `package-lock.json` first is what produced `resolved: "https://registry.npmjs.org/actio-ts/-/…tgz"`. Check
+  for `"link": true` after any such change.
+- To develop against the monorepo copy anyway, re-create the link by hand:
+  `rm -rf node_modules/actio-ts && ln -s ../../actio-ts node_modules/actio-ts` — and put it back before a
+  release, or the gate tests something no user can install.
 - **From a checkout**, the dependency must exist before the extension runs: `cd actio-ts && npm ci` (its generated code is committed, so no `gen` step), then `cd ../pi-actio && npm install`. The generated code is committed precisely so that this step needs nothing but an install.
 - **git installs cannot reach this directory.** Pi clones the *repository root*; there is no subdirectory
   package source. npm is therefore the only channel for `pi-actio` in this monorepo.
@@ -254,11 +265,29 @@ package explains itself.
   `--config.auto-install-peers=false` (pnpm), which is why the peers stay unbundled; a local path install does
   **not** install dependencies at all.
 
-**Status: `pi-actio` is not published.** The checklist before a first release is: `private: false`, the exact
-`actio-ts` pin, `keywords`, `files`, `publishConfig.access`, `repository`/`bugs`/`homepage`, a `LICENSE`
-(the same BSD-3-Clause as `actio-ts`), a `CHANGELOG.md`, the README's npm install line, a pack-smoke
-(`pi.extensions[0]` present in the tarball, no local specifiers, a temp-dir install resolving `actio-ts` and
-`ajv`), and `publish-pi-actio.yml`.
+- **The gate, and why `smoke` is not in it.** `check:publish` = typecheck + the 35 tests + `pack-smoke`, and
+  `pack-smoke` is the part that can only be done after a pack: no local specifier in the manifest;
+  `publishConfig.access`; the `pi-package` keyword; **the `pi.extensions` entry present in the tarball**; the
+  eight `src/` modules, `README.md`, `internals.md`, `CHANGELOG.md`, `LICENSE` present; `test/`, `scripts/`,
+  `orchestra/`, `tsconfig`, `dist`, `spec.md` and the two compaction notes absent; **every import in the
+  published `src/*.ts` declared** in `dependencies` or `peerDependencies`; an install with `--legacy-peer-deps`
+  (Pi's own flag) that gets `pi-actio`, `actio-ts` and `ajv` and **no** `@earendil-works/*` or `typebox` — a
+  bundled host package is what Pi warns about; and `import('actio-ts')` from plain Node in that consumer.
+  `npm run smoke` spawns the `pi` binary, which a GitHub runner does not have, so `pack-smoke` runs it **when a
+  `pi` binary is on PATH** and prints `skip` when not — one command stays honest on both a laptop and CI.
+- **A tag must contain the workflow it triggers.** GitHub Actions reads the workflow from the ref that
+  triggered the run: `actio-ts/v0.1.0` first pointed at a commit whose workflow file GitHub rejected, and the
+  push produced no run at all. Before pushing a release tag: `git ls-tree --name-only <tag> .github/workflows/`.
+
+**Status: publish-ready, not yet published.** In place: `private: false`, the exact `actio-ts` pin and a
+lockfile that resolves it from the registry, `keywords`, the `files` allowlist, `publishConfig.access`,
+`repository`/`bugs`/`homepage`, `LICENSE` (the same BSD-3-Clause as `actio-ts`), `CHANGELOG.md`, the README's
+npm install line, `scripts/pack-smoke.mjs` (35 checks) and `publish-pi-actio.yml`. Left is the outside world:
+commit, `git tag -a pi-actio/v0.1.0 master`, make sure the `NPM_TOKEN` secret holds a live
+*Read and write (publish and stage)* bypass-2FA granular token scoped to *All Packages* (the `actio-ts` token
+already covers this package if it is still valid), push the branch and the tag, then configure `pi-actio`'s
+trusted publisher against `publish-pi-actio.yml` and prove it with `0.1.1` — within 2 days of creating the
+configuration.
 
 ## 12. Links
 
