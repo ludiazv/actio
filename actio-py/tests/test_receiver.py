@@ -623,6 +623,29 @@ class LaneATest(ReceiverTest):
             res = await self.read_res(root, r)
             self.assertEqual(res["response"]["work_time"], 5)
 
+    async def test_the_inreq_line_is_on_disk_before_the_envelope_deletions(self) -> None:
+        """*Archive* (`A4`) and the reason D-11 gives for its order: the `inreq` line is on disk
+        before the exchange's envelope files disappear, so whoever watches the inbox and sees the
+        exchange gone reads a diarium that already holds the line. The order is visible without racing:
+        the diarium's last append predates the inbox directory's last change. `actio-go` shipped the
+        reverse order, and only a black-box run caught it. Control: move the deletions before the
+        append — the two mtimes swap and this row fails."""
+        with actio_tree() as root:
+            await self.boot(root)
+            r = rid(44)
+            await self.files(root, **{f"{r}.json": request_file(r)})
+            await wait_for("the response file", lambda: self.res_path(root, r).exists())
+            await self.files(root, **{f"{r}.con.json": confirmation_file(r)})
+            await wait_until("the archive", archived_check(root, r))
+            await wait_inbox_empty(root)  # the deletions are done
+            append = (agent_dir(root) / "diarium.jsonl").stat().st_mtime_ns
+            removed = inbox(root).stat().st_mtime_ns
+            self.assertLess(
+                append,
+                removed,
+                "the `inreq` append precedes the envelope deletions (*Archive*, `A4`)",
+            )
+
 
 class AcceptanceTest(ReceiverTest):
     async def _expect_code(self, root: Path, file: dict[str, Any], code: int, what: str) -> None:
