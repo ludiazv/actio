@@ -23,6 +23,16 @@ interface ActioParams {
   params?: unknown;
 }
 
+/** Some models send the parameters of a call as a JSON string instead of an object: accept it. */
+export function parseParams(params: unknown): unknown {
+  if (typeof params !== "string") return params;
+  try {
+    return JSON.parse(params);
+  } catch {
+    throw new Error(`params must be a JSON object, not the text ${JSON.stringify(params.slice(0, 60))}`);
+  }
+}
+
 export function actioTool(team: Team, config: Config): ToolDefinition {
   return {
     name: "actio",
@@ -51,7 +61,7 @@ export function actioTool(team: Team, config: Config): ToolDefinition {
       }
       // p.command === "call"
       if (p.target === undefined) throw new Error('call needs "target"');
-      const outcome = await team.call(p.target, p.params, signal);
+      const outcome = await team.call(p.target, parseParams(p.params), signal);
       return { content: [{ type: "text", text: formatCall(p.target, outcome, config.json) }], details: undefined };
     },
   };
