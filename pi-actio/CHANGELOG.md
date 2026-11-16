@@ -7,6 +7,11 @@ The extension speaks **Actio protocol v0.1, core conformance profile**, and hold
 everything protocol-shaped comes from [`actio-ts`](https://www.npmjs.com/package/actio-ts), whose changelog
 carries the SHA-256 digests that fix a protocol revision.
 
+## 0.1.1 - 2026-11-16
+
+- Fix parsing using parameters as strings.
+
+
 ## 0.1.0 — 2026-11-14
 
 First publishable release: install it with `pi install npm:pi-actio@0.1.0`.

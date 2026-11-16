@@ -1,6 +1,6 @@
 {
   "name": "pi-actio",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "pi extension: makes a pi coding agent a member of an Actio team (actio tool, /actio Explorer, prompt service)",
   "license": "BSD-3-Clause",
   "private": false,
